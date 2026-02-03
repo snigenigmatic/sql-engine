@@ -15,6 +15,7 @@ namespace sql
             : values_(std::move(values)), schema_(schema) {}
 
         const Value &GetValue(size_t index) const { return values_.at(index); }
+        size_t GetValueCount() const { return values_.size(); }
         std::string ToString() const;
 
     private:
