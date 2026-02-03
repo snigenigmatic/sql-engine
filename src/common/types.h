@@ -2,13 +2,15 @@
 
 #include <cstdint>
 
-namespace sql {
+namespace sql
+{
 
-enum class DataType {
-    INTEGER,
-    FLOAT,
-    VARCHAR,
-    BOOLEAN
-};
+    enum class DataType
+    {
+        INTEGER,
+        FLOAT,
+        VARCHAR,
+        BOOLEAN
+    };
 
 } // namespace sql

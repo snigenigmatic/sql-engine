@@ -1,7 +1,8 @@
 #include "parser/ast.h"
 
-namespace sql {
+namespace sql
+{
 
-// AST implementation
+    // AST implementation
 
 } // namespace sql

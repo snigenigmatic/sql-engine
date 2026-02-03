@@ -1,18 +1,22 @@
 #include "execution/filter.h"
 
-namespace sql {
+namespace sql
+{
 
-void Filter::Open() {
-    // Implementation
-}
+    void Filter::Open()
+    {
+        // Implementation
+    }
 
-bool Filter::Next(Tuple* tuple) {
-    // Implementation
-    return false;
-}
+    bool Filter::Next(Tuple *tuple)
+    {
+        // Implementation
+        return false;
+    }
 
-void Filter::Close() {
-    // Implementation
-}
+    void Filter::Close()
+    {
+        // Implementation
+    }
 
 } // namespace sql

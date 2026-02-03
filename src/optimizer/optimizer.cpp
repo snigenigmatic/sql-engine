@@ -1,7 +1,8 @@
 #include "optimizer/optimizer.h"
 
-namespace sql {
+namespace sql
+{
 
-// Optimizer implementation
+    // Optimizer implementation
 
 } // namespace sql

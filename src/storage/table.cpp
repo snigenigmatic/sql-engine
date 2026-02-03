@@ -1,7 +1,8 @@
 #include "storage/table.h"
 
-namespace sql {
+namespace sql
+{
 
-// Table implementation
+    // Table implementation
 
 } // namespace sql

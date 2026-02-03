@@ -2,13 +2,15 @@
 
 #include "parser/ast.h"
 
-namespace sql {
+namespace sql
+{
 
-class Optimizer {
-public:
-    Optimizer() = default;
-    
-    // Optimization methods
-};
+    class Optimizer
+    {
+    public:
+        Optimizer() = default;
+
+        // Optimization methods
+    };
 
 } // namespace sql

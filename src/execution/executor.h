@@ -1,12 +1,14 @@
 #pragma once
 
-namespace sql {
+namespace sql
+{
 
-class Executor {
-public:
-    Executor() = default;
-    
-    // Execution methods
-};
+    class Executor
+    {
+    public:
+        Executor() = default;
+
+        // Execution methods
+    };
 
 } // namespace sql

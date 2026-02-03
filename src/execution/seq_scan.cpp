@@ -1,18 +1,22 @@
 #include "execution/seq_scan.h"
 
-namespace sql {
+namespace sql
+{
 
-void SeqScan::Open() {
-    // Implementation
-}
+    void SeqScan::Open()
+    {
+        // Implementation
+    }
 
-bool SeqScan::Next(Tuple* tuple) {
-    // Implementation
-    return false;
-}
+    bool SeqScan::Next(Tuple *tuple)
+    {
+        // Implementation
+        return false;
+    }
 
-void SeqScan::Close() {
-    // Implementation
-}
+    void SeqScan::Close()
+    {
+        // Implementation
+    }
 
 } // namespace sql

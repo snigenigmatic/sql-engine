@@ -1,7 +1,8 @@
 #include "catalog/catalog.h"
 
-namespace sql {
+namespace sql
+{
 
-// Catalog implementation
+    // Catalog implementation
 
 } // namespace sql

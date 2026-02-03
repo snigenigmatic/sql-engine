@@ -1,7 +1,8 @@
 #include "execution/executor.h"
 
-namespace sql {
+namespace sql
+{
 
-// Executor implementation
+    // Executor implementation
 
 } // namespace sql

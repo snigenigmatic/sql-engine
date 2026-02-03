@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 #include "common/schema.h"
 
-namespace sql {
+namespace sql
+{
 
-TEST(SchemaTest, BasicAssertion) {
-  // Test content
-}
+    TEST(SchemaTest, BasicAssertion)
+    {
+        // Test content
+    }
 
 } // namespace sql

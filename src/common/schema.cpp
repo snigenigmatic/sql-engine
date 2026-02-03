@@ -1,7 +1,8 @@
 #include "common/schema.h"
 
-namespace sql {
+namespace sql
+{
 
-// Implementation of Schema class
+    // Implementation of Schema class
 
 } // namespace sql

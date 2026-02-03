@@ -1,18 +1,22 @@
 #include "execution/projection.h"
 
-namespace sql {
+namespace sql
+{
 
-void Projection::Open() {
-    // Implementation
-}
+    void Projection::Open()
+    {
+        // Implementation
+    }
 
-bool Projection::Next(Tuple* tuple) {
-    // Implementation
-    return false;
-}
+    bool Projection::Next(Tuple *tuple)
+    {
+        // Implementation
+        return false;
+    }
 
-void Projection::Close() {
-    // Implementation
-}
+    void Projection::Close()
+    {
+        // Implementation
+    }
 
 } // namespace sql

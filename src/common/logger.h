@@ -2,11 +2,13 @@
 
 #include <string>
 
-namespace sql {
+namespace sql
+{
 
-class Logger {
-public:
-    static void Log(const std::string& message);
-};
+    class Logger
+    {
+    public:
+        static void Log(const std::string &message);
+    };
 
 } // namespace sql

@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
-namespace sql {
+namespace sql
+{
 
-TEST(IntegrationTest, BasicQuery) {
-  // Test content
-}
+    TEST(IntegrationTest, BasicQuery)
+    {
+        // Test content
+    }
 
 } // namespace sql

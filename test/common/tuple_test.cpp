@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 #include "common/tuple.h"
 
-namespace sql {
+namespace sql
+{
 
-TEST(TupleTest, BasicAssertion) {
-  // Test content
-}
+    TEST(TupleTest, BasicAssertion)
+    {
+        // Test content
+    }
 
 } // namespace sql
