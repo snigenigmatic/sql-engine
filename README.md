@@ -104,9 +104,9 @@ id | name  | age
 ## Development Phases
 
 - [x] **Phase 0**: Project setup and core data structures
-- [ ] **Phase 1**: Lexer and basic parser
-- [ ] **Phase 2**: In-memory query execution
-- [ ] **Phase 3**: Disk-based storage
+- [x] **Phase 1**: Lexer and basic parser
+- [x] **Phase 2**: In-memory query execution
+- [x] **Phase 3**: Disk-based storage
 - [ ] **Phase 4**: B-tree indexes
 - [ ] **Phase 5**: JOIN operations
 - [ ] **Phase 6**: Transactions
