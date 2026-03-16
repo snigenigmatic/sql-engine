@@ -153,7 +153,9 @@ namespace sql
             plan->Open();
             Tuple tuple;
             while (plan->Next(&tuple))
+            {
                 result.tuples.push_back(tuple);
+            }
             plan->Close();
             result.success = true;
         }
@@ -298,15 +300,15 @@ namespace sql
             if (!table)
                 throw std::runtime_error("Table not found: " + update->table);
 
-            auto &tuples = table->GetMutableTuples();
-            size_t updated = 0;
+            std::vector<std::pair<size_t, Tuple>> updates; // (index, new tuple)
+            size_t idx = 0;
 
-            for (size_t i = 0; i < tuples.size(); ++i)
+            for (auto &existing_tuple : *table)
             {
                 bool matches = true;
                 if (update->where)
                 {
-                    Value v = EvaluateExpr(update->where.get(), &tuples[i], table);
+                    Value v = EvaluateExpr(update->where.get(), &existing_tuple, table);
                     matches = v.GetAsBool();
                 }
 
@@ -315,24 +317,28 @@ namespace sql
                     // Build new values from existing tuple
                     std::vector<Value> new_values;
                     for (size_t c = 0; c < table->GetSchema().GetColumnCount(); ++c)
-                        new_values.push_back(tuples[i].GetValue(c));
+                        new_values.push_back(existing_tuple.GetValue(c));
 
                     // Apply SET assignments
                     for (const auto &assign : update->assignments)
                     {
-                        int idx = table->GetColumnIndex(assign.first);
-                        if (idx < 0)
+                        int col_idx = table->GetColumnIndex(assign.first);
+                        if (col_idx < 0)
                             throw std::runtime_error("Unknown column: " + assign.first);
-                        new_values[static_cast<size_t>(idx)] = EvaluateExpr(assign.second.get(), &tuples[i], table);
+                        new_values[static_cast<size_t>(col_idx)] = EvaluateExpr(assign.second.get(), &existing_tuple, table);
                     }
 
-                    table->UpdateTuple(i, Tuple(std::move(new_values)));
-                    updated++;
+                    updates.push_back({idx, Tuple(std::move(new_values))});
                 }
+                ++idx;
             }
 
+            // Apply all updates
+            for (const auto &update_pair : updates)
+                table->UpdateTuple(update_pair.first, update_pair.second);
+
             result.success = true;
-            result.message = std::to_string(updated) + " row(s) updated.";
+            result.message = std::to_string(updates.size()) + " row(s) updated.";
         }
         catch (const std::exception &e)
         {

@@ -209,4 +209,32 @@ namespace sql
         EXPECT_TRUE(result.success);
     }
 
+    // ── NEGATIVE LITERALS ──────────────────────────────────────────────────────
+
+    TEST(IntegrationTest, SelectWithNegativeLiterals)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, score INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (1, -100), (2, 50), (3, -25);");
+
+        auto result = RunSQL(catalog, "SELECT * FROM t WHERE score < 0;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 2);
+        EXPECT_EQ(result.tuples[0].GetValue(1).GetAsInt(), -100);
+        EXPECT_EQ(result.tuples[1].GetValue(1).GetAsInt(), -25);
+    }
+
+    TEST(IntegrationTest, InsertAndFilterNegativeFloats)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE prices (id INTEGER, price FLOAT);");
+        RunSQL(catalog, "INSERT INTO prices VALUES (1, -1.5), (2, 2.5), (3, -3.75);");
+
+        auto result = RunSQL(catalog, "SELECT * FROM prices WHERE price < -2.0;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 1);
+        EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), 3);
+        EXPECT_EQ(result.tuples[0].GetValue(1).GetAsFloat(), -3.75f);
+    }
+
 } // namespace sql

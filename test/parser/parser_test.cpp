@@ -125,6 +125,8 @@ namespace sql
         Parser parser(lexer);
 
         auto stmt = parser.ParseStatement();
+        ASSERT_NE(stmt, nullptr);
+        ASSERT_EQ(stmt->GetType(), StatementType::INSERT);
         auto insert = static_cast<InsertStatement *>(stmt.get());
 
         ASSERT_EQ(insert->rows.size(), 2);
@@ -139,6 +141,7 @@ namespace sql
         Parser parser(lexer);
 
         auto stmt = parser.ParseStatement();
+        ASSERT_NE(stmt, nullptr);
         ASSERT_EQ(stmt->GetType(), StatementType::DELETE);
 
         auto del = static_cast<DeleteStatement *>(stmt.get());
@@ -153,6 +156,8 @@ namespace sql
         Parser parser(lexer);
 
         auto stmt = parser.ParseStatement();
+        ASSERT_NE(stmt, nullptr);
+        ASSERT_EQ(stmt->GetType(), StatementType::DELETE);
         auto del = static_cast<DeleteStatement *>(stmt.get());
 
         EXPECT_EQ(del->table, "users");
@@ -168,6 +173,7 @@ namespace sql
         Parser parser(lexer);
 
         auto stmt = parser.ParseStatement();
+        ASSERT_NE(stmt, nullptr);
         ASSERT_EQ(stmt->GetType(), StatementType::UPDATE);
 
         auto update = static_cast<UpdateStatement *>(stmt.get());
@@ -184,6 +190,8 @@ namespace sql
         Parser parser(lexer);
 
         auto stmt = parser.ParseStatement();
+        ASSERT_NE(stmt, nullptr);
+        ASSERT_EQ(stmt->GetType(), StatementType::UPDATE);
         auto update = static_cast<UpdateStatement *>(stmt.get());
 
         ASSERT_EQ(update->assignments.size(), 2);
@@ -203,6 +211,34 @@ namespace sql
 
         auto drop = static_cast<DropTableStatement *>(stmt.get());
         EXPECT_EQ(drop->table, "users");
+    }
+
+    TEST(ParserTest, ParseNegativeLiterals)
+    {
+        std::string sql = "SELECT * FROM t WHERE age > -25 AND balance >= -1.5;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+
+        auto stmt = parser.ParseStatement();
+        ASSERT_NE(stmt, nullptr);
+        ASSERT_EQ(stmt->GetType(), StatementType::SELECT);
+
+        auto select = static_cast<SelectStatement *>(stmt.get());
+        ASSERT_NE(select->where, nullptr);
+
+        // Top level AND
+        auto top = static_cast<BinaryExpression *>(select->where.get());
+        EXPECT_EQ(top->op, TokenType::AND);
+
+        // Left side: age > -25
+        auto left = static_cast<BinaryExpression *>(top->left.get());
+        EXPECT_EQ(left->op, TokenType::GT);
+        EXPECT_EQ(left->right->GetType(), ExpressionType::LITERAL);
+
+        // Right side: balance >= -1.5
+        auto right = static_cast<BinaryExpression *>(top->right.get());
+        EXPECT_EQ(right->op, TokenType::GEQ);
+        EXPECT_EQ(right->right->GetType(), ExpressionType::LITERAL);
     }
 
 } // namespace sql

@@ -11,15 +11,30 @@ namespace sql
 
     void Table::DeleteByIndices(std::vector<size_t> indices)
     {
-        // Sort descending so we remove from the back first
-        std::sort(indices.begin(), indices.end(), std::greater<size_t>());
-        for (size_t idx : indices)
+        if (indices.empty() || tuples_.empty())
+            return;
+
+        // Sort and remove duplicates to avoid deleting the same row multiple times
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+
+        // Rebuild vector in one pass (O(n) instead of O(k*n))
+        std::vector<Tuple> new_tuples;
+        const std::size_t max_deletions = std::min(tuples_.size(), indices.size());
+        new_tuples.reserve(tuples_.size() - max_deletions);
+
+        std::size_t delete_pos = 0;
+        for (std::size_t i = 0; i < tuples_.size(); ++i)
         {
-            if (idx < tuples_.size())
+            // Skip tuple if its index matches the next delete index
+            if (delete_pos < indices.size() && i == indices[delete_pos])
             {
-                tuples_.erase(tuples_.begin() + static_cast<long>(idx));
+                ++delete_pos;
+                continue;
             }
+            new_tuples.push_back(std::move(tuples_[i]));
         }
+        tuples_ = std::move(new_tuples);
     }
 
     void Table::UpdateTuple(size_t index, const Tuple &tuple)

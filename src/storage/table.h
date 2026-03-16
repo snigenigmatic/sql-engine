@@ -24,11 +24,20 @@ namespace sql
         void UpdateTuple(size_t index, const Tuple &tuple);
 
         const std::vector<Tuple> &GetTuples() const { return tuples_; }
-        std::vector<Tuple> &GetMutableTuples() { return tuples_; }
         const Schema &GetSchema() const { return schema_; }
         const std::string &GetName() const { return name_; }
         size_t GetTupleCount() const { return tuples_.size(); }
         int GetColumnIndex(const std::string &column_name) const;
+
+        // Controlled access to individual tuples
+        Tuple &GetTuple(size_t index) { return tuples_.at(index); }
+        const Tuple &GetTuple(size_t index) const { return tuples_.at(index); }
+
+        // Iterators for traversing tuples without exposing container internals
+        std::vector<Tuple>::iterator begin() { return tuples_.begin(); }
+        std::vector<Tuple>::iterator end() { return tuples_.end(); }
+        std::vector<Tuple>::const_iterator begin() const { return tuples_.cbegin(); }
+        std::vector<Tuple>::const_iterator end() const { return tuples_.cend(); }
 
     private:
         std::string name_;
