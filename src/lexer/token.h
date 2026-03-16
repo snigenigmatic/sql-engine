@@ -19,6 +19,7 @@ namespace sql
         UPDATE,
         SET,
         CREATE,
+        DROP,
         TABLE,
         INTEGER,
         VARCHAR,

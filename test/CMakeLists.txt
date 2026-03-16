@@ -26,5 +26,5 @@ add_sqlengine_test(lexer_test lexer/lexer_test.cpp)
 # Parser tests
 add_sqlengine_test(parser_test parser/parser_test.cpp)
 
-# Integration tests (add later)
-# add_sqlengine_test(query_test integration/query_test.cpp)
+# Integration tests
+add_sqlengine_test(query_test integration/query_test.cpp)

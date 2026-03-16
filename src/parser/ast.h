@@ -45,7 +45,7 @@ namespace sql
     {
         std::unique_ptr<Expression> left;
         std::unique_ptr<Expression> right;
-        TokenType op; // PLUS, MINUS, EQ, GT, etc.
+        TokenType op;
 
         BinaryExpression(std::unique_ptr<Expression> l, TokenType o, std::unique_ptr<Expression> r)
             : left(std::move(l)), right(std::move(r)), op(o) {}
@@ -58,7 +58,10 @@ namespace sql
     {
         SELECT,
         CREATE_TABLE,
-        INSERT
+        INSERT,
+        DELETE,
+        UPDATE,
+        DROP_TABLE
     };
 
     struct Statement
@@ -75,6 +78,53 @@ namespace sql
         std::unique_ptr<Expression> where;
 
         StatementType GetType() const override { return StatementType::SELECT; }
+    };
+
+    struct ColumnDef
+    {
+        std::string name;
+        TokenType type_token; // INTEGER, VARCHAR, FLOAT, BOOLEAN
+        int length = 0;       // For VARCHAR(n)
+    };
+
+    struct CreateTableStatement : public Statement
+    {
+        std::string table;
+        std::vector<ColumnDef> columns;
+
+        StatementType GetType() const override { return StatementType::CREATE_TABLE; }
+    };
+
+    struct InsertStatement : public Statement
+    {
+        std::string table;
+        std::vector<std::vector<std::unique_ptr<Expression>>> rows; // VALUES (...), (...)
+
+        StatementType GetType() const override { return StatementType::INSERT; }
+    };
+
+    struct DeleteStatement : public Statement
+    {
+        std::string table;
+        std::unique_ptr<Expression> where;
+
+        StatementType GetType() const override { return StatementType::DELETE; }
+    };
+
+    struct UpdateStatement : public Statement
+    {
+        std::string table;
+        std::vector<std::pair<std::string, std::unique_ptr<Expression>>> assignments; // SET col = expr
+        std::unique_ptr<Expression> where;
+
+        StatementType GetType() const override { return StatementType::UPDATE; }
+    };
+
+    struct DropTableStatement : public Statement
+    {
+        std::string table;
+
+        StatementType GetType() const override { return StatementType::DROP_TABLE; }
     };
 
 } // namespace sql
