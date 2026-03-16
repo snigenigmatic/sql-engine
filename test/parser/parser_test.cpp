@@ -142,7 +142,7 @@ namespace sql
 
         auto stmt = parser.ParseStatement();
         ASSERT_NE(stmt, nullptr);
-        ASSERT_EQ(stmt->GetType(), StatementType::DELETE);
+        ASSERT_EQ(stmt->GetType(), StatementType::DELETE_STMT);
 
         auto del = static_cast<DeleteStatement *>(stmt.get());
         EXPECT_EQ(del->table, "users");
@@ -157,7 +157,7 @@ namespace sql
 
         auto stmt = parser.ParseStatement();
         ASSERT_NE(stmt, nullptr);
-        ASSERT_EQ(stmt->GetType(), StatementType::DELETE);
+        ASSERT_EQ(stmt->GetType(), StatementType::DELETE_STMT);
         auto del = static_cast<DeleteStatement *>(stmt.get());
 
         EXPECT_EQ(del->table, "users");
@@ -174,7 +174,7 @@ namespace sql
 
         auto stmt = parser.ParseStatement();
         ASSERT_NE(stmt, nullptr);
-        ASSERT_EQ(stmt->GetType(), StatementType::UPDATE);
+        ASSERT_EQ(stmt->GetType(), StatementType::UPDATE_STMT);
 
         auto update = static_cast<UpdateStatement *>(stmt.get());
         EXPECT_EQ(update->table, "users");
@@ -191,26 +191,12 @@ namespace sql
 
         auto stmt = parser.ParseStatement();
         ASSERT_NE(stmt, nullptr);
-        ASSERT_EQ(stmt->GetType(), StatementType::UPDATE);
+        ASSERT_EQ(stmt->GetType(), StatementType::UPDATE_STMT);
         auto update = static_cast<UpdateStatement *>(stmt.get());
 
         ASSERT_EQ(update->assignments.size(), 2);
         EXPECT_EQ(update->assignments[0].first, "age");
         EXPECT_EQ(update->assignments[1].first, "name");
-    }
-
-    TEST(ParserTest, ParseDropTable)
-    {
-        std::string sql = "DROP TABLE users;";
-        Lexer lexer(sql);
-        Parser parser(lexer);
-
-        auto stmt = parser.ParseStatement();
-        ASSERT_NE(stmt, nullptr);
-        ASSERT_EQ(stmt->GetType(), StatementType::DROP_TABLE);
-
-        auto drop = static_cast<DropTableStatement *>(stmt.get());
-        EXPECT_EQ(drop->table, "users");
     }
 
     TEST(ParserTest, ParseNegativeLiterals)

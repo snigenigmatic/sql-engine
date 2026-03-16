@@ -20,8 +20,10 @@ namespace sql
         bool Match(TokenType type);
         Token Peek() const { return current_token_; }
 
+        std::unique_ptr<Statement> ParseCreate();
         std::unique_ptr<SelectStatement> ParseSelect();
         std::unique_ptr<CreateTableStatement> ParseCreateTable();
+        std::unique_ptr<CreateIndexStatement> ParseCreateIndex();
         std::unique_ptr<DropTableStatement> ParseDropTable();
         std::unique_ptr<InsertStatement> ParseInsert();
         std::unique_ptr<DeleteStatement> ParseDelete();

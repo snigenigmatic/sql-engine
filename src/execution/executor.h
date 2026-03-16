@@ -4,6 +4,7 @@
 #include "execution/seq_scan.h"
 #include "execution/filter.h"
 #include "execution/projection.h"
+#include "execution/index_scan.h"
 #include "parser/ast.h"
 #include "catalog/catalog.h"
 #include <memory>
@@ -35,6 +36,7 @@ namespace sql
         ExecutionResult ExecuteInsert(InsertStatement *insert);
         ExecutionResult ExecuteDelete(DeleteStatement *del);
         ExecutionResult ExecuteUpdate(UpdateStatement *update);
+        ExecutionResult ExecuteCreateIndex(CreateIndexStatement *create);
         ExecutionResult ExecuteDropTable(DropTableStatement *drop);
 
         // Evaluate an expression (reused for INSERT values, UPDATE SET, etc.)

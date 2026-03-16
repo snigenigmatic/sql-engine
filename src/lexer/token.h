@@ -19,8 +19,9 @@ namespace sql
         UPDATE,
         SET,
         CREATE,
-        DROP,
         TABLE,
+        INDEX,
+        ON,
         INTEGER,
         VARCHAR,
         FLOAT,
@@ -29,30 +30,32 @@ namespace sql
         FALSE,
         AND,
         OR,
+        NOT,
+        DROP,
 
         // Identifiers and Literals
         IDENTIFIER,
         STRING_LITERAL,
         INTEGER_LITERAL,
-        FLOAT_LITERAL, // 3.14
+        FLOAT_LITERAL,
 
         // Operators
-        PLUS,  // +
-        MINUS, // -
-        STAR,  // *
-        SLASH, // /
-        EQ,    // =
-        NEQ,   // !=
-        LT,    // <
-        GT,    // >
-        LEQ,   // <=
-        GEQ,   // >=
+        PLUS,
+        MINUS,
+        STAR,
+        SLASH,
+        EQ,
+        NEQ,
+        LT,
+        GT,
+        LEQ,
+        GEQ,
 
         // Delimiters
-        LPAREN,    // (
-        RPAREN,    // )
-        COMMA,     // ,
-        SEMICOLON, // ;
+        LPAREN,
+        RPAREN,
+        COMMA,
+        SEMICOLON,
 
         // System
         END_OF_FILE,
@@ -67,9 +70,7 @@ namespace sql
         size_t column = 0;
     };
 
-    // Helper to convert TokenType to string for debugging
     std::string TokenToString(TokenType type);
-
     std::ostream &operator<<(std::ostream &os, TokenType type);
 
 } // namespace sql

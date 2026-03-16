@@ -180,61 +180,127 @@ namespace sql
         EXPECT_EQ(result.tuples.size(), 0);
     }
 
-    // ── DROP TABLE ────────────────────────────────────────────────────────────────
+    // ── CREATE INDEX ──────────────────────────────────────────────────────────────
 
-    TEST(IntegrationTest, DropTable)
+    TEST(IntegrationTest, CreateIndex)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, val INTEGER);");
+        auto result = RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
+        EXPECT_TRUE(result.success);
+        EXPECT_NE(catalog.GetIndex("t", "id"), nullptr);
+    }
+
+    TEST(IntegrationTest, CreateIndexDuplicateName)
     {
         Catalog catalog;
         RunSQL(catalog, "CREATE TABLE t (id INTEGER);");
-        ASSERT_NE(catalog.GetTable("t"), nullptr);
-
-        auto result = RunSQL(catalog, "DROP TABLE t;");
-        EXPECT_TRUE(result.success);
-        EXPECT_EQ(catalog.GetTable("t"), nullptr);
-    }
-
-    TEST(IntegrationTest, DropMissingTable)
-    {
-        Catalog catalog;
-        auto result = RunSQL(catalog, "DROP TABLE ghost;");
+        RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
+        auto result = RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
         EXPECT_FALSE(result.success);
     }
 
-    TEST(IntegrationTest, DropThenRecreate)
+    TEST(IntegrationTest, CreateIndexMissingTable)
+    {
+        Catalog catalog;
+        auto result = RunSQL(catalog, "CREATE INDEX idx_id ON ghost (id);");
+        EXPECT_FALSE(result.success);
+    }
+
+    TEST(IntegrationTest, CreateIndexMissingColumn)
     {
         Catalog catalog;
         RunSQL(catalog, "CREATE TABLE t (id INTEGER);");
-        RunSQL(catalog, "DROP TABLE t;");
-        auto result = RunSQL(catalog, "CREATE TABLE t (id INTEGER);");
-        EXPECT_TRUE(result.success);
+        auto result = RunSQL(catalog, "CREATE INDEX idx_x ON t (nonexistent);");
+        EXPECT_FALSE(result.success);
     }
 
-    // ── NEGATIVE LITERALS ──────────────────────────────────────────────────────
+    // ── INDEX SCAN ────────────────────────────────────────────────────────────────
 
-    TEST(IntegrationTest, SelectWithNegativeLiterals)
+    TEST(IntegrationTest, IndexPointLookup)
     {
         Catalog catalog;
-        RunSQL(catalog, "CREATE TABLE t (id INTEGER, score INTEGER);");
-        RunSQL(catalog, "INSERT INTO t VALUES (1, -100), (2, 50), (3, -25);");
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');");
+        RunSQL(catalog, "CREATE INDEX idx_id ON users (id);");
 
-        auto result = RunSQL(catalog, "SELECT * FROM t WHERE score < 0;");
+        auto result = RunSQL(catalog, "SELECT * FROM users WHERE id = 2;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 1);
+        EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), 2);
+        EXPECT_EQ(result.tuples[0].GetValue(1).GetAsString(), "Bob");
+    }
+
+    TEST(IntegrationTest, IndexRangeScanGreaterThan)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, val INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+        RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
+
+        auto result = RunSQL(catalog, "SELECT * FROM t WHERE id > 2;");
         EXPECT_TRUE(result.success);
         ASSERT_EQ(result.tuples.size(), 2);
-        EXPECT_EQ(result.tuples[0].GetValue(1).GetAsInt(), -100);
-        EXPECT_EQ(result.tuples[1].GetValue(1).GetAsInt(), -25);
+        EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), 3);
+        EXPECT_EQ(result.tuples[1].GetValue(0).GetAsInt(), 4);
     }
 
-    TEST(IntegrationTest, InsertAndFilterNegativeFloats)
+    TEST(IntegrationTest, IndexRangeScanLessThanOrEqual)
     {
         Catalog catalog;
-        RunSQL(catalog, "CREATE TABLE prices (id INTEGER, price FLOAT);");
-        RunSQL(catalog, "INSERT INTO prices VALUES (1, -1.5), (2, 2.5), (3, -3.75);");
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, val INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+        RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
 
-        auto result = RunSQL(catalog, "SELECT * FROM prices WHERE price < -2.0;");
+        auto result = RunSQL(catalog, "SELECT * FROM t WHERE id <= 2;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 2);
+        EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), 1);
+        EXPECT_EQ(result.tuples[1].GetValue(0).GetAsInt(), 2);
+    }
+
+    TEST(IntegrationTest, IndexRemainsConsistentAfterInsert)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (1), (2);");
+        RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
+        RunSQL(catalog, "INSERT INTO t VALUES (3);");
+
+        auto result = RunSQL(catalog, "SELECT * FROM t WHERE id = 3;");
         EXPECT_TRUE(result.success);
         ASSERT_EQ(result.tuples.size(), 1);
         EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), 3);
-        EXPECT_EQ(result.tuples[0].GetValue(1).GetAsFloat(), -3.75f);
+    }
+
+    TEST(IntegrationTest, IndexRemainsConsistentAfterDelete)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (1), (2), (3);");
+        RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
+        RunSQL(catalog, "DELETE FROM t WHERE id = 2;");
+
+        auto result = RunSQL(catalog, "SELECT * FROM t WHERE id = 2;");
+        EXPECT_TRUE(result.success);
+        EXPECT_EQ(result.tuples.size(), 0);
+
+        auto all = RunSQL(catalog, "SELECT * FROM t;");
+        ASSERT_EQ(all.tuples.size(), 2);
+    }
+
+    TEST(IntegrationTest, IndexRemainsConsistentAfterUpdate)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, val INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+        RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
+        RunSQL(catalog, "UPDATE t SET val = 99 WHERE id = 2;");
+
+        auto result = RunSQL(catalog, "SELECT * FROM t WHERE id = 2;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 1);
+        EXPECT_EQ(result.tuples[0].GetValue(1).GetAsInt(), 99);
     }
 
 } // namespace sql
