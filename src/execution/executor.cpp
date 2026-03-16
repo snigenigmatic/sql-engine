@@ -90,10 +90,12 @@ namespace sql
             return ExecuteCreateTable(static_cast<CreateTableStatement *>(stmt));
         case StatementType::INSERT:
             return ExecuteInsert(static_cast<InsertStatement *>(stmt));
-        case StatementType::DELETE:
+        case StatementType::DELETE_STMT:
             return ExecuteDelete(static_cast<DeleteStatement *>(stmt));
-        case StatementType::UPDATE:
+        case StatementType::UPDATE_STMT:
             return ExecuteUpdate(static_cast<UpdateStatement *>(stmt));
+        case StatementType::CREATE_INDEX:
+            return ExecuteCreateIndex(static_cast<CreateIndexStatement *>(stmt));
         case StatementType::DROP_TABLE:
             return ExecuteDropTable(static_cast<DropTableStatement *>(stmt));
         default:
@@ -107,10 +109,60 @@ namespace sql
         if (!table)
             throw std::runtime_error("Table not found: " + select->table);
 
-        std::unique_ptr<Operator> plan = std::make_unique<SeqScan>(table);
+        std::unique_ptr<Operator> plan;
 
-        if (select->where)
-            plan = std::make_unique<Filter>(std::move(plan), select->where.get(), table);
+        // Try to use an index if WHERE is a simple column op literal comparison
+        if (select->where && select->where->GetType() == ExpressionType::BINARY_OP)
+        {
+            const auto *bin = static_cast<const BinaryExpression *>(select->where.get());
+            if (bin->left->GetType() == ExpressionType::COLUMN_REF &&
+                bin->right->GetType() == ExpressionType::LITERAL)
+            {
+                const auto *col_expr = static_cast<const ColumnExpression *>(bin->left.get());
+                const auto *lit_expr = static_cast<const LiteralExpression *>(bin->right.get());
+                BTree *index = catalog_->GetIndex(select->table, col_expr->name);
+                if (index)
+                {
+                    const Value &val = lit_expr->value;
+                    switch (bin->op)
+                    {
+                    case TokenType::EQ:
+                        plan = std::make_unique<IndexScan>(table, index, val);
+                        break;
+                    case TokenType::GT:
+                        plan = std::make_unique<IndexScan>(table, index,
+                                                           std::optional<Value>(val), false,
+                                                           std::nullopt, false);
+                        break;
+                    case TokenType::GEQ:
+                        plan = std::make_unique<IndexScan>(table, index,
+                                                           std::optional<Value>(val), true,
+                                                           std::nullopt, false);
+                        break;
+                    case TokenType::LT:
+                        plan = std::make_unique<IndexScan>(table, index,
+                                                           std::nullopt, false,
+                                                           std::optional<Value>(val), false);
+                        break;
+                    case TokenType::LEQ:
+                        plan = std::make_unique<IndexScan>(table, index,
+                                                           std::nullopt, false,
+                                                           std::optional<Value>(val), true);
+                        break;
+                    default:
+                        break; // NEQ and others fall through to SeqScan
+                    }
+                }
+            }
+        }
+
+        // Fall back to SeqScan + Filter if no index plan was built
+        if (!plan)
+        {
+            plan = std::make_unique<SeqScan>(table);
+            if (select->where)
+                plan = std::make_unique<Filter>(std::move(plan), select->where.get(), table);
+        }
 
         if (select->select_star)
         {
@@ -244,6 +296,7 @@ namespace sql
 
             result.success = true;
             result.message = std::to_string(rows_inserted) + " row(s) inserted.";
+            catalog_->RebuildIndexesForTable(insert->table);
         }
         catch (const std::exception &e)
         {
@@ -280,6 +333,7 @@ namespace sql
             }
 
             table->DeleteByIndices(to_delete);
+            catalog_->RebuildIndexesForTable(del->table);
             result.success = true;
             result.message = std::to_string(to_delete.size()) + " row(s) deleted.";
         }
@@ -337,6 +391,7 @@ namespace sql
             for (const auto &update_pair : updates)
                 table->UpdateTuple(update_pair.first, update_pair.second);
 
+            catalog_->RebuildIndexesForTable(update->table);
             result.success = true;
             result.message = std::to_string(updates.size()) + " row(s) updated.";
         }
@@ -348,18 +403,27 @@ namespace sql
         return result;
     }
 
-    ExecutionResult Executor::ExecuteDropTable(DropTableStatement *drop)
+    ExecutionResult Executor::ExecuteCreateIndex(CreateIndexStatement *create)
     {
         ExecutionResult result;
-        if (!catalog_->DropTable(drop->table))
+        if (!catalog_->CreateIndex(create->index_name, create->table, create->column))
         {
             result.success = false;
-            result.message = "Table '" + drop->table + "' does not exist.";
+            result.message = "Failed to create index '" + create->index_name +
+                             "'. Table or column may not exist, or index name is already taken.";
             return result;
         }
         result.success = true;
-        result.message = "Table '" + drop->table + "' dropped.";
+        result.message = "Index '" + create->index_name + "' created on " +
+                         create->table + "(" + create->column + ").";
         return result;
+    }
+
+    ExecutionResult Executor::ExecuteDropTable(DropTableStatement *drop)
+    {
+        if (!catalog_->DropTable(drop->table))
+            return {false, "Table '" + drop->table + "' does not exist.", {}, {}};
+        return {true, "Table '" + drop->table + "' dropped.", {}, {}};
     }
 
 } // namespace sql

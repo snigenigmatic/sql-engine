@@ -241,7 +241,7 @@ namespace sql
         std::string upper_ident = ident;
         std::transform(upper_ident.begin(), upper_ident.end(), upper_ident.begin(), ::toupper);
 
-        static const std::map<std::string, TokenType> keywords = {
+                static const std::map<std::string, TokenType> keywords = {
             {"SELECT", TokenType::SELECT},
             {"FROM", TokenType::FROM},
             {"WHERE", TokenType::WHERE},
@@ -252,8 +252,9 @@ namespace sql
             {"UPDATE", TokenType::UPDATE},
             {"SET", TokenType::SET},
             {"CREATE", TokenType::CREATE},
-            {"DROP", TokenType::DROP},
             {"TABLE", TokenType::TABLE},
+            {"INDEX", TokenType::INDEX},
+            {"ON", TokenType::ON},
             {"INT", TokenType::INTEGER},
             {"INTEGER", TokenType::INTEGER},
             {"VARCHAR", TokenType::VARCHAR},
@@ -261,8 +262,11 @@ namespace sql
             {"BOOLEAN", TokenType::BOOLEAN},
             {"AND", TokenType::AND},
             {"OR", TokenType::OR},
+            {"NOT", TokenType::NOT},
+            {"DROP", TokenType::DROP},
             {"TRUE", TokenType::TRUE},
             {"FALSE", TokenType::FALSE}};
+
 
         auto it = keywords.find(upper_ident);
         if (it != keywords.end())

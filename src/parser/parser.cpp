@@ -44,15 +44,15 @@ namespace sql
         case TokenType::SELECT:
             return ParseSelect();
         case TokenType::CREATE:
-            return ParseCreateTable();
-        case TokenType::DROP:
-            return ParseDropTable();
+            return ParseCreate();
         case TokenType::INSERT:
             return ParseInsert();
         case TokenType::DELETE:
             return ParseDelete();
         case TokenType::UPDATE:
             return ParseUpdate();
+        case TokenType::DROP:
+            return ParseDropTable();
         default:
             throw std::runtime_error("Unexpected token at start of statement: " + current_token_.value);
         }
@@ -89,10 +89,19 @@ namespace sql
         return stmt;
     }
 
+    std::unique_ptr<Statement> Parser::ParseCreate()
+    {
+        Expect(TokenType::CREATE);
+        if (current_token_.type == TokenType::TABLE)
+            return ParseCreateTable();
+        if (current_token_.type == TokenType::INDEX)
+            return ParseCreateIndex();
+        throw std::runtime_error("Expected TABLE or INDEX after CREATE");
+    }
+
     std::unique_ptr<CreateTableStatement> Parser::ParseCreateTable()
     {
         auto stmt = std::make_unique<CreateTableStatement>();
-        Expect(TokenType::CREATE);
         Expect(TokenType::TABLE);
 
         Token name = Expect(TokenType::IDENTIFIER);
@@ -136,13 +145,19 @@ namespace sql
         return stmt;
     }
 
-    std::unique_ptr<DropTableStatement> Parser::ParseDropTable()
+    std::unique_ptr<CreateIndexStatement> Parser::ParseCreateIndex()
     {
-        auto stmt = std::make_unique<DropTableStatement>();
-        Expect(TokenType::DROP);
-        Expect(TokenType::TABLE);
+        auto stmt = std::make_unique<CreateIndexStatement>();
+        Expect(TokenType::INDEX);
         Token name = Expect(TokenType::IDENTIFIER);
-        stmt->table = name.value;
+        stmt->index_name = name.value;
+        Expect(TokenType::ON);
+        Token table = Expect(TokenType::IDENTIFIER);
+        stmt->table = table.value;
+        Expect(TokenType::LPAREN);
+        Token col = Expect(TokenType::IDENTIFIER);
+        stmt->column = col.value;
+        Expect(TokenType::RPAREN);
         Expect(TokenType::SEMICOLON);
         return stmt;
     }
@@ -216,6 +231,17 @@ namespace sql
             stmt->where = ParseExpression();
         }
 
+        Expect(TokenType::SEMICOLON);
+        return stmt;
+    }
+
+    std::unique_ptr<DropTableStatement> Parser::ParseDropTable()
+    {
+        auto stmt = std::make_unique<DropTableStatement>();
+        Expect(TokenType::DROP);
+        Expect(TokenType::TABLE);
+        Token name = Expect(TokenType::IDENTIFIER);
+        stmt->table = name.value;
         Expect(TokenType::SEMICOLON);
         return stmt;
     }

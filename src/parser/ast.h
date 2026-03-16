@@ -28,7 +28,6 @@ namespace sql
     struct LiteralExpression : public Expression
     {
         Value value;
-
         explicit LiteralExpression(Value v) : value(std::move(v)) {}
         ExpressionType GetType() const override { return ExpressionType::LITERAL; }
     };
@@ -36,7 +35,6 @@ namespace sql
     struct ColumnExpression : public Expression
     {
         std::string name;
-
         explicit ColumnExpression(std::string n) : name(std::move(n)) {}
         ExpressionType GetType() const override { return ExpressionType::COLUMN_REF; }
     };
@@ -46,7 +44,6 @@ namespace sql
         std::unique_ptr<Expression> left;
         std::unique_ptr<Expression> right;
         TokenType op;
-
         BinaryExpression(std::unique_ptr<Expression> l, TokenType o, std::unique_ptr<Expression> r)
             : left(std::move(l)), right(std::move(r)), op(o) {}
         ExpressionType GetType() const override { return ExpressionType::BINARY_OP; }
@@ -58,10 +55,11 @@ namespace sql
     {
         SELECT,
         CREATE_TABLE,
+        DROP_TABLE,
         INSERT,
-        DELETE,
-        UPDATE,
-        DROP_TABLE
+        CREATE_INDEX,
+        DELETE_STMT,
+        UPDATE_STMT
     };
 
     struct Statement
@@ -76,7 +74,6 @@ namespace sql
         std::vector<std::string> columns;
         bool select_star = false;
         std::unique_ptr<Expression> where;
-
         StatementType GetType() const override { return StatementType::SELECT; }
     };
 
@@ -91,24 +88,35 @@ namespace sql
     {
         std::string table;
         std::vector<ColumnDef> columns;
-
         StatementType GetType() const override { return StatementType::CREATE_TABLE; }
+    };
+
+    struct DropTableStatement : public Statement
+    {
+        std::string table;
+        StatementType GetType() const override { return StatementType::DROP_TABLE; }
     };
 
     struct InsertStatement : public Statement
     {
         std::string table;
         std::vector<std::vector<std::unique_ptr<Expression>>> rows; // VALUES (...), (...)
-
         StatementType GetType() const override { return StatementType::INSERT; }
+    };
+
+    struct CreateIndexStatement : public Statement
+    {
+        std::string index_name;
+        std::string table;
+        std::string column;
+        StatementType GetType() const override { return StatementType::CREATE_INDEX; }
     };
 
     struct DeleteStatement : public Statement
     {
         std::string table;
         std::unique_ptr<Expression> where;
-
-        StatementType GetType() const override { return StatementType::DELETE; }
+        StatementType GetType() const override { return StatementType::DELETE_STMT; }
     };
 
     struct UpdateStatement : public Statement
@@ -116,15 +124,7 @@ namespace sql
         std::string table;
         std::vector<std::pair<std::string, std::unique_ptr<Expression>>> assignments; // SET col = expr
         std::unique_ptr<Expression> where;
-
-        StatementType GetType() const override { return StatementType::UPDATE; }
-    };
-
-    struct DropTableStatement : public Statement
-    {
-        std::string table;
-
-        StatementType GetType() const override { return StatementType::DROP_TABLE; }
+        StatementType GetType() const override { return StatementType::UPDATE_STMT; }
     };
 
 } // namespace sql
