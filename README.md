@@ -4,18 +4,22 @@ An educational SQL database engine built from scratch in C++ to understand datab
 
 ## Features
 
-### Current (Phase 0-1)
 - Core data structures (Value, Schema, Tuple)
-- Basic type system (INTEGER, FLOAT, VARCHAR, BOOLEAN)
-- Lexer for SQL tokenization
-- Simple SELECT query parsing
+- Type system: `INTEGER`, `FLOAT`, `VARCHAR`, `BOOLEAN`
+- Lexer and full SQL parser
+- Volcano/iterator query execution model
+- Full DML/DDL: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
+- `WHERE` clause with comparison and logical operators
+- Column projection (`SELECT col1, col2 ...`)
+- BTree index support: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`)
+- Query planner: automatically uses index scan when an index exists on the filtered column
+- Disk-based persistence via `DiskManager`
+- Interactive REPL
 
 ### Planned
-- Query optimizer
-- Disk-based storage with buffer pool
-- B-tree indexes
 - JOIN operations
 - Transaction support (ACID)
+- Query optimizer
 
 ## Building
 
@@ -31,109 +35,118 @@ An educational SQL database engine built from scratch in C++ to understand datab
 git clone <repository-url>
 cd sql-engine
 
-# Initialize and update git submodules (for Google Test)
-git submodule update --init --recursive
-
-# Create build directory
-mkdir build
-cd build
-
-# Configure
-cmake ..
-
-# Build
-cmake --build .
+# Configure and build (from repo root)
+cmake -B build
+cmake --build build
 
 # Run tests
-ctest --output-on-failure
+ctest --test-dir build --output-on-failure
 
 # Run the REPL
-./sqlengine
+./build/src/sqlengine
 ```
 
 ### Build Options
 
-```bash
-# Debug build (default)
-cmake -DCMAKE_BUILD_TYPE=Debug ..
+| Option | Default | Description |
+|---|---|---|
+| `CMAKE_BUILD_TYPE` | `Debug` | Build type (`Debug` / `Release`) |
+| `BUILD_TESTS` | `ON` | Build Google Test suites |
+| `ENABLE_LOGGING` | `ON` | Enable internal logging |
 
+```bash
 # Release build
-cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 
 # Disable tests
-cmake -DBUILD_TESTS=OFF ..
+cmake -B build -DBUILD_TESTS=OFF
 
 # Disable logging
-cmake -DENABLE_LOGGING=OFF ..
+cmake -B build -DENABLE_LOGGING=OFF
 ```
 
 ## Project Structure
 
 ```
 sql-engine/
-├── src/           # Source code
-│   ├── common/    # Core data structures
+├── src/
+│   ├── common/    # Value, Schema, Tuple
 │   ├── lexer/     # Tokenizer
-│   ├── parser/    # SQL parser
-│   ├── execution/ # Query execution
-│   ├── storage/   # Storage engine
-│   └── catalog/   # Metadata management
-├── test/          # Unit tests
-├── docs/          # Documentation
-└── third_party/   # External dependencies
+│   ├── parser/    # SQL parser + AST
+│   ├── catalog/   # Table and index registry
+│   ├── execution/ # Operators: SeqScan, Filter, Projection, IndexScan, Executor
+│   ├── storage/   # Table, BTree, DiskManager, BufferPool
+│   └── optimizer/ # (stub, planned)
+├── test/
+│   ├── integration/  # End-to-end SQL tests
+│   └── parser/       # Parser unit tests
+├── docs/
+└── third_party/
 ```
 
 ## Usage
 
-### REPL Mode
+### REPL
 
 ```bash
-$ ./sqlengine
-sql> CREATE TABLE users (id INTEGER, name VARCHAR(50), age INTEGER);
-Table created.
+./build/src/sqlengine
+```
 
-sql> INSERT INTO users VALUES (1, 'Alice', 25);
-1 row inserted.
+```sql
+-- DDL
+CREATE TABLE users (id INTEGER, name VARCHAR(50), age INTEGER);
+DROP TABLE users;
 
-sql> SELECT * FROM users WHERE age > 20;
-id | name  | age
----|-------|----
-1  | Alice | 25
+-- DML
+INSERT INTO users VALUES (1, 'Alice', 25), (2, 'Bob', 30);
+SELECT * FROM users WHERE age > 25;
+SELECT name, age FROM users;
+UPDATE users SET age = 99 WHERE id = 1;
+DELETE FROM users WHERE id = 2;
+
+-- Indexes
+CREATE INDEX idx_id ON users (id);
+SELECT * FROM users WHERE id = 1;    -- uses index point lookup
+SELECT * FROM users WHERE id > 1;   -- uses index range scan
+```
+
+### REPL Commands
+
+| Command | Description |
+|---|---|
+| `tables` | List all tables and their columns |
+| `save` | Persist all tables to disk |
+| `help` | Show SQL syntax reference |
+| `quit` / `exit` | Save and exit |
+
+## Testing
+
+```bash
+# Build and run all tests
+cmake --build build && ctest --test-dir build --output-on-failure
+
+# Run a specific test binary
+./build/test/query_test
+./build/test/parser_test
+
+# Verbose output
+ctest --test-dir build --output-on-failure --verbose
 ```
 
 ## Development Phases
 
 - [x] **Phase 0**: Project setup and core data structures
-- [x] **Phase 1**: Lexer and basic parser
-- [x] **Phase 2**: In-memory query execution
-- [x] **Phase 3**: Disk-based storage
-- [ ] **Phase 4**: B-tree indexes
+- [x] **Phase 1**: Lexer and parser
+- [x] **Phase 2**: In-memory query execution (SeqScan, Filter, Projection)
+- [x] **Phase 3**: Disk-based storage with buffer pool
+- [x] **Phase 4**: BTree indexes with query planner integration
 - [ ] **Phase 5**: JOIN operations
 - [ ] **Phase 6**: Transactions
 
 ## Architecture
 
 See [docs/design.md](docs/design.md) for detailed architecture documentation.
-
-## Testing
-
-```bash
-# Run all tests
-ctest
-
-# Run specific test
-./value_test
-
-# Run tests with verbose output
-ctest --output-on-failure --verbose
-```
-
-## Contributing
-
-This is an educational project. Feel free to:
-- Report bugs
-- Suggest features
-- Submit pull requests
 
 ## Resources
 
