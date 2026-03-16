@@ -15,20 +15,22 @@ namespace sql
         std::unique_ptr<Statement> ParseStatement();
 
     private:
-        // Helper methods
         void NextToken();
         Token Expect(TokenType type);
         bool Match(TokenType type);
         Token Peek() const { return current_token_; }
 
-        // Parsing methods
         std::unique_ptr<SelectStatement> ParseSelect();
+        std::unique_ptr<CreateTableStatement> ParseCreateTable();
+        std::unique_ptr<DropTableStatement> ParseDropTable();
+        std::unique_ptr<InsertStatement> ParseInsert();
+        std::unique_ptr<DeleteStatement> ParseDelete();
+        std::unique_ptr<UpdateStatement> ParseUpdate();
 
-        // Expression parsing (Precedence climbing)
-        std::unique_ptr<Expression> ParseExpression(); // Handles OR
-        std::unique_ptr<Expression> ParseTerm();       // Handles AND
-        std::unique_ptr<Expression> ParseComparison(); // Handles <, >, =
-        std::unique_ptr<Expression> ParsePrimary();    // Literals, Columns, ()
+        std::unique_ptr<Expression> ParseExpression();
+        std::unique_ptr<Expression> ParseTerm();
+        std::unique_ptr<Expression> ParseComparison();
+        std::unique_ptr<Expression> ParsePrimary();
 
         Lexer &lexer_;
         Token current_token_;

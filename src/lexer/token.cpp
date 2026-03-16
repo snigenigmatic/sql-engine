@@ -27,6 +27,8 @@ namespace sql
             return "SET";
         case TokenType::CREATE:
             return "CREATE";
+        case TokenType::DROP:
+            return "DROP";
         case TokenType::TABLE:
             return "TABLE";
         case TokenType::INTEGER:

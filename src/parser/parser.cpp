@@ -7,7 +7,7 @@ namespace sql
 
     Parser::Parser(Lexer &lexer) : lexer_(lexer)
     {
-        NextToken(); // Prime the pump
+        NextToken();
     }
 
     void Parser::NextToken()
@@ -39,11 +39,23 @@ namespace sql
 
     std::unique_ptr<Statement> Parser::ParseStatement()
     {
-        if (current_token_.type == TokenType::SELECT)
+        switch (current_token_.type)
         {
+        case TokenType::SELECT:
             return ParseSelect();
+        case TokenType::CREATE:
+            return ParseCreateTable();
+        case TokenType::DROP:
+            return ParseDropTable();
+        case TokenType::INSERT:
+            return ParseInsert();
+        case TokenType::DELETE:
+            return ParseDelete();
+        case TokenType::UPDATE:
+            return ParseUpdate();
+        default:
+            throw std::runtime_error("Unexpected token at start of statement: " + current_token_.value);
         }
-        throw std::runtime_error("Unexpected token at start of statement: " + current_token_.value);
     }
 
     std::unique_ptr<SelectStatement> Parser::ParseSelect()
@@ -51,7 +63,6 @@ namespace sql
         auto stmt = std::make_unique<SelectStatement>();
         Expect(TokenType::SELECT);
 
-        // Parse columns
         if (Match(TokenType::STAR))
         {
             stmt->select_star = true;
@@ -78,11 +89,140 @@ namespace sql
         return stmt;
     }
 
-    // Expression: OR
+    std::unique_ptr<CreateTableStatement> Parser::ParseCreateTable()
+    {
+        auto stmt = std::make_unique<CreateTableStatement>();
+        Expect(TokenType::CREATE);
+        Expect(TokenType::TABLE);
+
+        Token name = Expect(TokenType::IDENTIFIER);
+        stmt->table = name.value;
+
+        Expect(TokenType::LPAREN);
+
+        do
+        {
+            ColumnDef col;
+            Token col_name = Expect(TokenType::IDENTIFIER);
+            col.name = col_name.value;
+
+            // Type
+            Token type_tok = current_token_;
+            if (type_tok.type == TokenType::INTEGER || type_tok.type == TokenType::FLOAT ||
+                type_tok.type == TokenType::BOOLEAN || type_tok.type == TokenType::VARCHAR)
+            {
+                col.type_token = type_tok.type;
+                NextToken();
+            }
+            else
+            {
+                throw std::runtime_error("Expected data type, got: " + type_tok.value);
+            }
+
+            // VARCHAR(n)
+            if (col.type_token == TokenType::VARCHAR && current_token_.type == TokenType::LPAREN)
+            {
+                NextToken(); // consume (
+                Token len = Expect(TokenType::INTEGER_LITERAL);
+                col.length = std::stoi(len.value);
+                Expect(TokenType::RPAREN);
+            }
+
+            stmt->columns.push_back(std::move(col));
+        } while (Match(TokenType::COMMA));
+
+        Expect(TokenType::RPAREN);
+        Expect(TokenType::SEMICOLON);
+        return stmt;
+    }
+
+    std::unique_ptr<DropTableStatement> Parser::ParseDropTable()
+    {
+        auto stmt = std::make_unique<DropTableStatement>();
+        Expect(TokenType::DROP);
+        Expect(TokenType::TABLE);
+        Token name = Expect(TokenType::IDENTIFIER);
+        stmt->table = name.value;
+        Expect(TokenType::SEMICOLON);
+        return stmt;
+    }
+
+    std::unique_ptr<InsertStatement> Parser::ParseInsert()
+    {
+        auto stmt = std::make_unique<InsertStatement>();
+        Expect(TokenType::INSERT);
+        Expect(TokenType::INTO);
+
+        Token table = Expect(TokenType::IDENTIFIER);
+        stmt->table = table.value;
+
+        Expect(TokenType::VALUES);
+
+        // Parse one or more value lists: (v1, v2), (v3, v4)
+        do
+        {
+            Expect(TokenType::LPAREN);
+            std::vector<std::unique_ptr<Expression>> row;
+            do
+            {
+                row.push_back(ParseExpression());
+            } while (Match(TokenType::COMMA));
+            Expect(TokenType::RPAREN);
+            stmt->rows.push_back(std::move(row));
+        } while (Match(TokenType::COMMA));
+
+        Expect(TokenType::SEMICOLON);
+        return stmt;
+    }
+
+    std::unique_ptr<DeleteStatement> Parser::ParseDelete()
+    {
+        auto stmt = std::make_unique<DeleteStatement>();
+        Expect(TokenType::DELETE);
+        Expect(TokenType::FROM);
+
+        Token table = Expect(TokenType::IDENTIFIER);
+        stmt->table = table.value;
+
+        if (Match(TokenType::WHERE))
+        {
+            stmt->where = ParseExpression();
+        }
+
+        Expect(TokenType::SEMICOLON);
+        return stmt;
+    }
+
+    std::unique_ptr<UpdateStatement> Parser::ParseUpdate()
+    {
+        auto stmt = std::make_unique<UpdateStatement>();
+        Expect(TokenType::UPDATE);
+
+        Token table = Expect(TokenType::IDENTIFIER);
+        stmt->table = table.value;
+
+        Expect(TokenType::SET);
+
+        do
+        {
+            Token col = Expect(TokenType::IDENTIFIER);
+            Expect(TokenType::EQ);
+            auto expr = ParseExpression();
+            stmt->assignments.emplace_back(col.value, std::move(expr));
+        } while (Match(TokenType::COMMA));
+
+        if (Match(TokenType::WHERE))
+        {
+            stmt->where = ParseExpression();
+        }
+
+        Expect(TokenType::SEMICOLON);
+        return stmt;
+    }
+
     std::unique_ptr<Expression> Parser::ParseExpression()
     {
         auto left = ParseTerm();
-
         while (current_token_.type == TokenType::OR)
         {
             TokenType op = current_token_.type;
@@ -93,11 +233,9 @@ namespace sql
         return left;
     }
 
-    // Term: AND
     std::unique_ptr<Expression> Parser::ParseTerm()
     {
         auto left = ParseComparison();
-
         while (current_token_.type == TokenType::AND)
         {
             TokenType op = current_token_.type;
@@ -108,12 +246,9 @@ namespace sql
         return left;
     }
 
-    // Comparison: =, <, >, etc.
     std::unique_ptr<Expression> Parser::ParseComparison()
     {
         auto left = ParsePrimary();
-
-        // Check for comparison operators
         if (current_token_.type == TokenType::EQ ||
             current_token_.type == TokenType::NEQ ||
             current_token_.type == TokenType::LT ||
@@ -121,7 +256,6 @@ namespace sql
             current_token_.type == TokenType::LEQ ||
             current_token_.type == TokenType::GEQ)
         {
-
             TokenType op = current_token_.type;
             NextToken();
             auto right = ParsePrimary();
@@ -151,10 +285,20 @@ namespace sql
             return std::make_unique<LiteralExpression>(Value(std::stod(t.value)));
         case TokenType::LPAREN:
         {
-            // We already consumed LPAREN, so now parse expression inside
             auto expr = ParseExpression();
             Expect(TokenType::RPAREN);
             return expr;
+        }
+        // Allow negative number literals
+        case TokenType::MINUS:
+        {
+            Token num = current_token_;
+            NextToken();
+            if (num.type == TokenType::INTEGER_LITERAL)
+                return std::make_unique<LiteralExpression>(Value(-std::stoi(num.value)));
+            if (num.type == TokenType::FLOAT_LITERAL)
+                return std::make_unique<LiteralExpression>(Value(-std::stod(num.value)));
+            throw std::runtime_error("Expected number after '-'");
         }
         default:
             throw std::runtime_error("Unexpected token in expression: " + t.value);

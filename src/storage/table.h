@@ -15,22 +15,19 @@ namespace sql
         explicit Table(std::string name, Schema schema)
             : name_(std::move(name)), schema_(std::move(schema)) {}
 
-        // Insert a tuple into the table
         void Insert(const Tuple &tuple);
 
-        // Get all tuples (for sequential scan)
+        // Delete tuples by indices (sorted descending to avoid shifting issues)
+        void DeleteByIndices(std::vector<size_t> indices);
+
+        // Update a tuple at a given index
+        void UpdateTuple(size_t index, const Tuple &tuple);
+
         const std::vector<Tuple> &GetTuples() const { return tuples_; }
-
-        // Get the schema
+        std::vector<Tuple> &GetMutableTuples() { return tuples_; }
         const Schema &GetSchema() const { return schema_; }
-
-        // Get table name
         const std::string &GetName() const { return name_; }
-
-        // Get tuple count
         size_t GetTupleCount() const { return tuples_.size(); }
-
-        // Get column index by name (-1 if not found)
         int GetColumnIndex(const std::string &column_name) const;
 
     private:

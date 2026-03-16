@@ -252,6 +252,7 @@ namespace sql
             {"UPDATE", TokenType::UPDATE},
             {"SET", TokenType::SET},
             {"CREATE", TokenType::CREATE},
+            {"DROP", TokenType::DROP},
             {"TABLE", TokenType::TABLE},
             {"INT", TokenType::INTEGER},
             {"INTEGER", TokenType::INTEGER},

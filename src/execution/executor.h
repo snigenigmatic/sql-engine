@@ -13,13 +13,12 @@
 namespace sql
 {
 
-    // Result of executing a query
     struct ExecutionResult
     {
         bool success = false;
-        std::string error_message;
+        std::string message;
         std::vector<Tuple> tuples;
-        std::vector<std::string> column_names; // For display
+        std::vector<std::string> column_names;
     };
 
     class Executor
@@ -27,15 +26,19 @@ namespace sql
     public:
         explicit Executor(Catalog *catalog) : catalog_(catalog) {}
 
-        // Execute a statement and return results
         ExecutionResult Execute(Statement *stmt);
 
     private:
-        // Build an execution plan for a SELECT statement
         std::unique_ptr<Operator> BuildPlan(SelectStatement *select);
-
-        // Execute a SELECT statement
         ExecutionResult ExecuteSelect(SelectStatement *select);
+        ExecutionResult ExecuteCreateTable(CreateTableStatement *create);
+        ExecutionResult ExecuteInsert(InsertStatement *insert);
+        ExecutionResult ExecuteDelete(DeleteStatement *del);
+        ExecutionResult ExecuteUpdate(UpdateStatement *update);
+        ExecutionResult ExecuteDropTable(DropTableStatement *drop);
+
+        // Evaluate an expression (reused for INSERT values, UPDATE SET, etc.)
+        Value EvaluateExpr(const Expression *expr, const Tuple *tuple = nullptr, Table *table = nullptr) const;
 
         Catalog *catalog_;
     };
