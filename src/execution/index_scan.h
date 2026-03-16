@@ -19,9 +19,9 @@ namespace sql{
                   std::optional<Value> low, bool low_inclusive,
                   std::optional<Value> high, bool high_inclusive)
             : table_(table), index_(index),
+              is_point_(false),
               low_(std::move(low)), low_inclusive_(low_inclusive),
-              high_(std::move(high)), high_inclusive_(high_inclusive),
-              is_point_(false) {}
+              high_(std::move(high)), high_inclusive_(high_inclusive) {}
 
         void Open() override;
         bool Next(Tuple *tuple) override;

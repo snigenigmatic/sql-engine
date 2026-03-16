@@ -10,7 +10,7 @@ namespace sql
         while (!node->is_leaf)
         {
             size_t i = 0;
-            while (i < node->keys.size() && !(key < node->keys[i]))
+            while (i < node->keys.size() && node->keys[i] < key)
                 i++;
             node = node->children[i];
         }
@@ -121,18 +121,29 @@ namespace sql
         // Simple removal: find leaf, remove all matching entries
         // (No rebalancing for simplicity - educational project)
         auto leaf = FindLeaf(key);
-        size_t i = 0;
-        while (i < leaf->keys.size())
+        auto node = leaf;
+
+        while (node)
         {
-            if (leaf->keys[i] == key)
+            size_t i = 0;
+            while (i < node->keys.size())
             {
-                leaf->keys.erase(leaf->keys.begin() + static_cast<long>(i));
-                leaf->row_indices.erase(leaf->row_indices.begin() + static_cast<long>(i));
+                                 if (node->keys[i] == key)
+                 {
+                     node->keys.erase(node->keys.begin() + static_cast<long>(i));
+                     node->row_indices.erase(node->row_indices.begin() + static_cast<long>(i));
+                 }
+                 else if (key < node->keys[i])
+                 {
+                     // Keys are ordered; once we pass 'key', no further matches exist
+                     return;
+                 }
+                 else
+                 {
+                     ++i;
+                 }
             }
-            else
-            {
-                i++;
-            }
+            node = node->next_leaf;
         }
     }
 

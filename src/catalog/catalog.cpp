@@ -70,7 +70,14 @@ namespace sql
         std::vector<std::pair<Value, size_t>> entries;
         entries.reserve(tuples.size());
         for (size_t i = 0; i < tuples.size(); ++i)
-            entries.push_back({tuples[i].GetValue(static_cast<size_t>(col_idx)), i});
+        {
+            Value value = tuples[i].GetValue(static_cast<size_t>(col_idx));
+            // Skip NULL values to avoid undefined behavior in sorting/comparison
+            if (!value.IsNull())
+            {
+                entries.push_back({value, i});
+            }
+        }
         btree.BulkLoad(entries);
 
         index_registry_[index_name] = {table_name, column_name};
@@ -108,7 +115,14 @@ namespace sql
             std::vector<std::pair<Value, size_t>> entries;
             entries.reserve(tuples.size());
             for (size_t i = 0; i < tuples.size(); ++i)
-                entries.push_back({tuples[i].GetValue(static_cast<size_t>(col_idx)), i});
+            {
+                Value value = tuples[i].GetValue(static_cast<size_t>(col_idx));
+                // Skip NULL values to avoid undefined behavior in sorting/comparison
+                if (!value.IsNull())
+                {
+                    entries.push_back({value, i});
+                }
+            }
             btree.BulkLoad(entries);
         }
     }
