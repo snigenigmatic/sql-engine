@@ -42,6 +42,7 @@ All notable repository changes for this implementation cycle are listed below.
   - `HashJoin` (`src/execution/hash_join.h/.cpp`)
 - GitHub Actions workflow:
   - `.github/workflows/ci.yml` for automated configure/build/test on push and pull request.
+  - CI checkout now initializes git submodules so `third_party/googletest` is available during configure.
 - JOIN tests:
   - Lexer tokenization for JOIN + qualified columns.
   - Parser JOIN AST test.
