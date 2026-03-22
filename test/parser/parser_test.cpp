@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 #include "parser/parser.h"
+#include "optimizer/optimizer.h"
+#include "catalog/catalog.h"
+#include "common/schema.h"
 
 namespace sql
 {
@@ -225,6 +228,149 @@ namespace sql
         auto right = static_cast<BinaryExpression *>(top->right.get());
         EXPECT_EQ(right->op, TokenType::GEQ);
         EXPECT_EQ(right->right->GetType(), ExpressionType::LITERAL);
+    }
+
+    TEST(ParserTest, DumpSelectAst)
+    {
+        std::string sql = "SELECT id, name FROM users WHERE id = 1 OR name = 'Alice';";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+
+        auto stmt = parser.ParseStatement();
+        auto dump = DumpStatement(stmt.get());
+
+        EXPECT_NE(dump.find("SelectStatement(table=users"), std::string::npos);
+        EXPECT_NE(dump.find("columns=[id, name]"), std::string::npos);
+        EXPECT_NE(dump.find("BinaryOp(OR)"), std::string::npos);
+        EXPECT_NE(dump.find("BinaryOp(EQ)"), std::string::npos);
+        EXPECT_NE(dump.find("Column(id)"), std::string::npos);
+        EXPECT_NE(dump.find("Literal(1)"), std::string::npos);
+        EXPECT_NE(dump.find("Column(name)"), std::string::npos);
+        EXPECT_NE(dump.find("Literal(Alice)"), std::string::npos);
+    }
+
+    TEST(ParserTest, DumpUpdateAst)
+    {
+        std::string sql = "UPDATE users SET age = 30, name = 'Bob' WHERE id = 1;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+
+        auto stmt = parser.ParseStatement();
+        auto dump = DumpStatement(stmt.get());
+
+        EXPECT_NE(dump.find("UpdateStatement(table=users)"), std::string::npos);
+        EXPECT_NE(dump.find("assignments:"), std::string::npos);
+        EXPECT_NE(dump.find("- age ="), std::string::npos);
+        EXPECT_NE(dump.find("- name ="), std::string::npos);
+        EXPECT_NE(dump.find("Literal(30)"), std::string::npos);
+        EXPECT_NE(dump.find("Literal(Bob)"), std::string::npos);
+        EXPECT_NE(dump.find("where:"), std::string::npos);
+        EXPECT_NE(dump.find("Column(id)"), std::string::npos);
+        EXPECT_NE(dump.find("Literal(1)"), std::string::npos);
+    }
+
+    TEST(ParserTest, BuildLogicalPlanForSelect)
+    {
+        std::string sql = "SELECT id, name FROM users WHERE age > 30;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildLogicalPlan(stmt.get());
+        auto explain = optimizer.ExplainLogicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Projection(columns=[id, name])"), std::string::npos);
+        EXPECT_NE(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("BinaryOp(GT)"), std::string::npos);
+        EXPECT_NE(explain.find("SeqScan(table=users)"), std::string::npos);
+    }
+
+    TEST(ParserTest, BuildLogicalPlanForSelectStarWithoutWhere)
+    {
+        std::string sql = "SELECT * FROM users;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildLogicalPlan(stmt.get());
+        auto explain = optimizer.ExplainLogicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Projection(columns=*)"), std::string::npos);
+        EXPECT_EQ(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("SeqScan(table=users)"), std::string::npos);
+    }
+
+    TEST(ParserTest, BuildPhysicalPlanUsesIndexWhenAvailable)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                                 Column("name", DataType::VARCHAR, 50),
+                                             })));
+        ASSERT_TRUE(catalog.CreateIndex("idx_users_id", "users", "id"));
+
+        std::string sql = "SELECT * FROM users WHERE id = 2;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Projection(columns=*)"), std::string::npos);
+        EXPECT_NE(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("IndexScan(table=users, column=id, point=2)"), std::string::npos);
+        EXPECT_EQ(explain.find("SeqScan(table=users)"), std::string::npos);
+    }
+
+    TEST(ParserTest, BuildPhysicalPlanFallsBackToSeqScanWithoutIndex)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                                 Column("age", DataType::INTEGER),
+                                             })));
+
+        std::string sql = "SELECT id FROM users WHERE age > 30;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Projection(columns=[id])"), std::string::npos);
+        EXPECT_NE(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("SeqScan(table=users)"), std::string::npos);
+        EXPECT_EQ(explain.find("IndexScan("), std::string::npos);
+    }
+
+    TEST(ParserTest, BuildPhysicalPlanFallsBackToSeqScanOnTypeMismatch)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                                 Column("name", DataType::VARCHAR, 50),
+                                             })));
+        ASSERT_TRUE(catalog.CreateIndex("idx_users_id", "users", "id"));
+
+        std::string sql = "SELECT * FROM users WHERE id = '2';";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Projection(columns=*)"), std::string::npos);
+        EXPECT_NE(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("SeqScan(table=users)"), std::string::npos);
+        EXPECT_EQ(explain.find("IndexScan("), std::string::npos);
     }
 
 } // namespace sql

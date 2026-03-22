@@ -103,85 +103,81 @@ namespace sql
         }
     }
 
+    std::vector<int> Executor::ResolveProjectionIndices(const PhysicalPlanNode *node, Table *table) const
+    {
+        std::vector<int> column_indices;
+        if (node == nullptr || table == nullptr || node->project_all)
+        {
+            return column_indices;
+        }
+
+        for (const auto &col_name : node->projected_columns)
+        {
+            int idx = table->GetColumnIndex(col_name);
+            if (idx < 0)
+                throw std::runtime_error("Unknown column: " + col_name);
+            column_indices.push_back(idx);
+        }
+        return column_indices;
+    }
+
+    std::unique_ptr<Operator> Executor::BuildOperatorTree(const PhysicalPlanNode *node, Table *table)
+    {
+        if (node == nullptr)
+        {
+            throw std::runtime_error("Null physical plan node");
+        }
+
+        switch (node->type)
+        {
+        case PhysicalPlanType::SEQ_SCAN:
+            return std::make_unique<SeqScan>(table);
+        case PhysicalPlanType::INDEX_SCAN:
+        {
+            BTree *index = catalog_->GetIndex(node->table_name, node->index_column);
+            if (!index)
+                throw std::runtime_error("Expected index not found on " + node->table_name + "." + node->index_column);
+
+            if (node->is_point_lookup)
+            {
+                if (!node->point_key.has_value())
+                    throw std::runtime_error("Point lookup index scan missing key");
+                return std::make_unique<IndexScan>(table, index, *node->point_key);
+            }
+            return std::make_unique<IndexScan>(
+                table, index,
+                node->low_key, node->low_inclusive,
+                node->high_key, node->high_inclusive);
+        }
+        case PhysicalPlanType::FILTER:
+        {
+            if (node->children.empty())
+                throw std::runtime_error("Filter node missing child");
+            auto child = BuildOperatorTree(node->children[0].get(), table);
+            return std::make_unique<Filter>(std::move(child), node->predicate, table);
+        }
+        case PhysicalPlanType::PROJECTION:
+        {
+            if (node->children.empty())
+                throw std::runtime_error("Projection node missing child");
+            auto child = BuildOperatorTree(node->children[0].get(), table);
+            auto column_indices = ResolveProjectionIndices(node, table);
+            return std::make_unique<Projection>(std::move(child), std::move(column_indices), node->project_all);
+        }
+        default:
+            throw std::runtime_error("Unknown physical plan node type");
+        }
+    }
+
     std::unique_ptr<Operator> Executor::BuildPlan(SelectStatement *select)
     {
         Table *table = catalog_->GetTable(select->table);
         if (!table)
             throw std::runtime_error("Table not found: " + select->table);
 
-        std::unique_ptr<Operator> plan;
-
-        // Try to use an index if WHERE is a simple column op literal comparison
-        if (select->where && select->where->GetType() == ExpressionType::BINARY_OP)
-        {
-            const auto *bin = static_cast<const BinaryExpression *>(select->where.get());
-            if (bin->left->GetType() == ExpressionType::COLUMN_REF &&
-                bin->right->GetType() == ExpressionType::LITERAL)
-            {
-                const auto *col_expr = static_cast<const ColumnExpression *>(bin->left.get());
-                const auto *lit_expr = static_cast<const LiteralExpression *>(bin->right.get());
-                BTree *index = catalog_->GetIndex(select->table, col_expr->name);
-                if (index)
-                {
-                    const Value &val = lit_expr->value;
-                    switch (bin->op)
-                    {
-                    case TokenType::EQ:
-                        plan = std::make_unique<IndexScan>(table, index, val);
-                        break;
-                    case TokenType::GT:
-                        plan = std::make_unique<IndexScan>(table, index,
-                                                           std::optional<Value>(val), false,
-                                                           std::nullopt, false);
-                        break;
-                    case TokenType::GEQ:
-                        plan = std::make_unique<IndexScan>(table, index,
-                                                           std::optional<Value>(val), true,
-                                                           std::nullopt, false);
-                        break;
-                    case TokenType::LT:
-                        plan = std::make_unique<IndexScan>(table, index,
-                                                           std::nullopt, false,
-                                                           std::optional<Value>(val), false);
-                        break;
-                    case TokenType::LEQ:
-                        plan = std::make_unique<IndexScan>(table, index,
-                                                           std::nullopt, false,
-                                                           std::optional<Value>(val), true);
-                        break;
-                    default:
-                        break; // NEQ and others fall through to SeqScan
-                    }
-                }
-            }
-        }
-
-        // Fall back to SeqScan + Filter if no index plan was built
-        if (!plan)
-        {
-            plan = std::make_unique<SeqScan>(table);
-            if (select->where)
-                plan = std::make_unique<Filter>(std::move(plan), select->where.get(), table);
-        }
-
-        if (select->select_star)
-        {
-            plan = std::make_unique<Projection>(std::move(plan), std::vector<int>{}, true);
-        }
-        else
-        {
-            std::vector<int> column_indices;
-            for (const auto &col_name : select->columns)
-            {
-                int idx = table->GetColumnIndex(col_name);
-                if (idx < 0)
-                    throw std::runtime_error("Unknown column: " + col_name);
-                column_indices.push_back(idx);
-            }
-            plan = std::make_unique<Projection>(std::move(plan), column_indices, false);
-        }
-
-        return plan;
+        Optimizer optimizer;
+        auto physical_plan = optimizer.BuildPhysicalPlan(select, catalog_);
+        return BuildOperatorTree(physical_plan.get(), table);
     }
 
     ExecutionResult Executor::ExecuteSelect(SelectStatement *select)

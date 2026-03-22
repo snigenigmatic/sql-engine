@@ -127,4 +127,9 @@ namespace sql
         StatementType GetType() const override { return StatementType::UPDATE_STMT; }
     };
 
+    std::string ExpressionTypeToString(ExpressionType type);
+    std::string StatementTypeToString(StatementType type);
+    std::string DumpExpression(const Expression *expr, int indent = 0);
+    std::string DumpStatement(const Statement *stmt);
+
 } // namespace sql
