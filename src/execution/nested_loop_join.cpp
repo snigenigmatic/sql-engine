@@ -45,24 +45,32 @@ namespace sql
         const auto &left_rows = left_table_->GetTuples();
         const auto &right_rows = right_table_->GetTuples();
 
-        while (left_cursor_ < left_rows.size())
+        while ((!right_as_outer_ && left_cursor_ < left_rows.size()) ||
+               (right_as_outer_ && right_cursor_ < right_rows.size()))
         {
-            const auto &left_row = left_rows[left_cursor_];
-            Value left_key = left_row.GetValue(static_cast<size_t>(left_column_index_));
+            const auto &outer_row = right_as_outer_ ? right_rows[right_cursor_] : left_rows[left_cursor_];
+            Value outer_key = right_as_outer_
+                                  ? outer_row.GetValue(static_cast<size_t>(right_column_index_))
+                                  : outer_row.GetValue(static_cast<size_t>(left_column_index_));
 
-            while (right_cursor_ < right_rows.size())
+            const size_t inner_size = right_as_outer_ ? left_rows.size() : right_rows.size();
+            while ((right_as_outer_ ? left_cursor_ : right_cursor_) < inner_size)
             {
-                const auto &right_row = right_rows[right_cursor_++];
-                Value right_key = right_row.GetValue(static_cast<size_t>(right_column_index_));
+                const auto &inner_row = right_as_outer_ ? left_rows[left_cursor_++] : right_rows[right_cursor_++];
+                Value inner_key = right_as_outer_
+                                      ? inner_row.GetValue(static_cast<size_t>(left_column_index_))
+                                      : inner_row.GetValue(static_cast<size_t>(right_column_index_));
 
-                if (left_key.GetType() != right_key.GetType())
+                if (outer_key.GetType() != inner_key.GetType())
                 {
                     continue;
                 }
 
-                if (left_key == right_key)
+                if (outer_key == inner_key)
                 {
                     std::vector<Value> joined_values;
+                    const auto &left_row = right_as_outer_ ? inner_row : outer_row;
+                    const auto &right_row = right_as_outer_ ? outer_row : inner_row;
                     joined_values.reserve(left_row.GetValueCount() + right_row.GetValueCount());
 
                     for (size_t i = 0; i < left_row.GetValueCount(); ++i)
@@ -79,8 +87,16 @@ namespace sql
                 }
             }
 
-            ++left_cursor_;
-            right_cursor_ = 0;
+            if (right_as_outer_)
+            {
+                ++right_cursor_;
+                left_cursor_ = 0;
+            }
+            else
+            {
+                ++left_cursor_;
+                right_cursor_ = 0;
+            }
         }
 
         return false;

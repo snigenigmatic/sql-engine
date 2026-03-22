@@ -420,7 +420,40 @@ namespace sql
 
         EXPECT_NE(explain.find("Projection(columns=[users.id, orders.amount])"), std::string::npos);
         EXPECT_NE(explain.find("Filter"), std::string::npos);
-        EXPECT_NE(explain.find("NestedLoopJoin(left=users, right=orders, on=users.id = orders.user_id)"), std::string::npos);
+        EXPECT_NE(explain.find("NestedLoopJoin(left=users, right=orders, on=users.id = orders.user_id"), std::string::npos);
+    }
+
+    TEST(ParserTest, BuildPhysicalPlanForJoinChoosesSmallerOuter)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                             })));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
+                                                  Column("id", DataType::INTEGER),
+                                                  Column("user_id", DataType::INTEGER),
+                                              })));
+
+        auto *users = catalog.GetTable("users");
+        auto *orders = catalog.GetTable("orders");
+        ASSERT_NE(users, nullptr);
+        ASSERT_NE(orders, nullptr);
+        users->Insert(Tuple({Value(1)}));
+        users->Insert(Tuple({Value(2)}));
+        users->Insert(Tuple({Value(3)}));
+        users->Insert(Tuple({Value(4)}));
+        orders->Insert(Tuple({Value(10), Value(1)}));
+
+        std::string sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("outer=right"), std::string::npos);
     }
 
 } // namespace sql

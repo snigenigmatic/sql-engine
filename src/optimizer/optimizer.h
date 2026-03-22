@@ -67,6 +67,7 @@ namespace sql
         // NESTED_LOOP_JOIN
         std::string join_left_column;
         std::string join_right_column;
+        bool join_right_as_outer = false;
 
         // FILTER
         const Expression *predicate = nullptr; // non-owning, refers to AST owned by Statement

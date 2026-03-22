@@ -291,7 +291,7 @@ namespace sql
             }
             const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
             EnsureJoinContextTable(left, right);
-            return std::make_unique<NestedLoopJoin>(left, right, left_col, right_col);
+            return std::make_unique<NestedLoopJoin>(left, right, left_col, right_col, node->join_right_as_outer);
         }
         case PhysicalPlanType::FILTER:
         {

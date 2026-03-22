@@ -74,6 +74,11 @@ All notable repository changes for this implementation cycle are listed below.
 - `src/execution/executor.cpp`
   - Removed JOIN special-casing from `BuildPlan(...)`.
   - Executor now consumes optimizer JOIN physical plan nodes.
+  - Applies rule-based nested-loop choice from planner (`outer=left|right`).
+- `src/optimizer/optimizer.cpp`
+  - Added rule-based join planning heuristic: pick smaller table as outer loop for nested loop join.
+- `src/execution/nested_loop_join.cpp`
+  - Supports planner-driven outer-loop side while preserving output tuple order.
 - `src/execution/CMakeLists.txt`
   - Execution CMake wiring updated to compile `nested_loop_join.cpp`.
 - `src/execution/filter.cpp`

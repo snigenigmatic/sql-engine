@@ -185,6 +185,8 @@ namespace sql
             join->right_table_name = *select->join_table;
             join->join_left_column = *select->join_left_column;
             join->join_right_column = *select->join_right_column;
+            // Rule-based choice: iterate smaller table in outer loop.
+            join->join_right_as_outer = right_table->GetTupleCount() < table->GetTupleCount();
             current = std::move(join);
         }
         else
@@ -307,7 +309,9 @@ namespace sql
             out << pad << "NestedLoopJoin(left=" << node->table_name
                 << ", right=" << node->right_table_name
                 << ", on=" << node->join_left_column
-                << " = " << node->join_right_column << ")";
+                << " = " << node->join_right_column
+                << ", outer=" << (node->join_right_as_outer ? "right" : "left")
+                << ")";
             break;
         case PhysicalPlanType::FILTER:
             out << pad << "Filter";
