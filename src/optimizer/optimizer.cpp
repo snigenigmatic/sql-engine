@@ -6,6 +6,110 @@ namespace sql
 {
     namespace
     {
+        enum class PredicateTableSide
+        {
+            NONE,
+            LEFT,
+            RIGHT,
+            BOTH
+        };
+
+        std::string StripQualifier(const std::string &name)
+        {
+            size_t dot = name.find('.');
+            if (dot == std::string::npos)
+            {
+                return name;
+            }
+            return name.substr(dot + 1);
+        }
+
+        PredicateTableSide ResolveColumnSide(const std::string &column_name,
+                                             const std::string &left_table_name,
+                                             const std::string &right_table_name,
+                                             Table *left_table,
+                                             Table *right_table)
+        {
+            const size_t dot = column_name.find('.');
+            if (dot != std::string::npos)
+            {
+                const std::string qualifier = column_name.substr(0, dot);
+                const std::string unqualified = column_name.substr(dot + 1);
+                if (qualifier == left_table_name && left_table->GetColumnIndex(unqualified) >= 0)
+                {
+                    return PredicateTableSide::LEFT;
+                }
+                if (qualifier == right_table_name && right_table->GetColumnIndex(unqualified) >= 0)
+                {
+                    return PredicateTableSide::RIGHT;
+                }
+                return PredicateTableSide::NONE;
+            }
+
+            const bool in_left = left_table->GetColumnIndex(column_name) >= 0;
+            const bool in_right = right_table->GetColumnIndex(column_name) >= 0;
+            if (in_left && in_right)
+            {
+                return PredicateTableSide::BOTH;
+            }
+            if (in_left)
+            {
+                return PredicateTableSide::LEFT;
+            }
+            if (in_right)
+            {
+                return PredicateTableSide::RIGHT;
+            }
+            return PredicateTableSide::NONE;
+        }
+
+        PredicateTableSide ResolvePredicateSingleTable(const Expression *expr,
+                                                       const std::string &left_table_name,
+                                                       const std::string &right_table_name,
+                                                       Table *left_table,
+                                                       Table *right_table)
+        {
+            if (expr == nullptr)
+            {
+                return PredicateTableSide::NONE;
+            }
+
+            switch (expr->GetType())
+            {
+            case ExpressionType::LITERAL:
+                return PredicateTableSide::NONE;
+            case ExpressionType::COLUMN_REF:
+            {
+                const auto *col = static_cast<const ColumnExpression *>(expr);
+                return ResolveColumnSide(col->name, left_table_name, right_table_name, left_table, right_table);
+            }
+            case ExpressionType::BINARY_OP:
+            {
+                const auto *bin = static_cast<const BinaryExpression *>(expr);
+                const PredicateTableSide left = ResolvePredicateSingleTable(
+                    bin->left.get(), left_table_name, right_table_name, left_table, right_table);
+                const PredicateTableSide right = ResolvePredicateSingleTable(
+                    bin->right.get(), left_table_name, right_table_name, left_table, right_table);
+
+                if (left == PredicateTableSide::BOTH || right == PredicateTableSide::BOTH)
+                {
+                    return PredicateTableSide::BOTH;
+                }
+                if (left == PredicateTableSide::NONE)
+                {
+                    return right;
+                }
+                if (right == PredicateTableSide::NONE)
+                {
+                    return left;
+                }
+                return left == right ? left : PredicateTableSide::BOTH;
+            }
+            default:
+                return PredicateTableSide::BOTH;
+            }
+        }
+
         bool IsIndexableComparison(const Expression *expr,
                                    std::string *column_name,
                                    TokenType *op,
@@ -167,57 +271,25 @@ namespace sql
             throw std::runtime_error("Table not found: " + select->table);
         }
 
-        std::unique_ptr<PhysicalPlanNode> current;
-        if (select->join_table.has_value())
+        auto build_base_access_path = [&](const std::string &table_name, Table *target_table, const Expression *predicate) -> std::unique_ptr<PhysicalPlanNode>
         {
-            Table *right_table = catalog->GetTable(*select->join_table);
-            if (right_table == nullptr)
-            {
-                throw std::runtime_error("Join table not found: " + *select->join_table);
-            }
-            if (!select->join_left_column.has_value() || !select->join_right_column.has_value())
-            {
-                throw std::runtime_error("JOIN requires ON left_col = right_col");
-            }
-
-            const size_t left_count = table->GetTupleCount();
-            const size_t right_count = right_table->GetTupleCount();
-
-            // Rule-based join choice:
-            // - HASH_JOIN for larger equi-joins
-            // - NESTED_LOOP_JOIN for small inputs
-            const size_t total_rows = left_count + right_count;
-            const bool use_hash_join = total_rows >= 16;
-
-            auto join = std::make_unique<PhysicalPlanNode>(
-                use_hash_join ? PhysicalPlanType::HASH_JOIN : PhysicalPlanType::NESTED_LOOP_JOIN);
-            join->table_name = select->table;
-            join->right_table_name = *select->join_table;
-            join->join_left_column = *select->join_left_column;
-            join->join_right_column = *select->join_right_column;
-            // Rule-based choice: iterate smaller table in outer loop for nested loop.
-            join->join_right_as_outer = right_count < left_count;
-            // Rule-based choice: build hash table on smaller side for hash join.
-            join->join_build_right = right_count <= left_count;
-            current = std::move(join);
-        }
-        else
-        {
+            std::unique_ptr<PhysicalPlanNode> access_path;
             std::string column_name;
             TokenType op = TokenType::ILLEGAL;
             Value literal_value;
-            if (IsIndexableComparison(select->where.get(), &column_name, &op, &literal_value))
+            if (IsIndexableComparison(predicate, &column_name, &op, &literal_value))
             {
-                BTree *index = catalog->GetIndex(select->table, column_name);
+                const std::string unqualified = StripQualifier(column_name);
+                BTree *index = catalog->GetIndex(table_name, unqualified);
                 if (index != nullptr)
                 {
-                    int col_idx = table->GetColumnIndex(column_name);
+                    int col_idx = target_table->GetColumnIndex(unqualified);
                     if (col_idx < 0)
                     {
-                        throw std::runtime_error("Indexed column not found in table schema: " + column_name);
+                        throw std::runtime_error("Indexed column not found in table schema: " + unqualified);
                     }
 
-                    const Column &column = table->GetSchema().GetColumn(static_cast<size_t>(col_idx));
+                    const Column &column = target_table->GetSchema().GetColumn(static_cast<size_t>(col_idx));
                     if (column.type != literal_value.GetType())
                     {
                         index = nullptr;
@@ -226,11 +298,9 @@ namespace sql
 
                 if (index != nullptr)
                 {
-                    (void)index; // Existence check is enough for plan construction
-
                     auto index_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_SCAN);
-                    index_scan->table_name = select->table;
-                    index_scan->index_column = column_name;
+                    index_scan->table_name = table_name;
+                    index_scan->index_column = unqualified;
 
                     switch (op)
                     {
@@ -257,24 +327,105 @@ namespace sql
                     default:
                         break;
                     }
-                    current = std::move(index_scan);
+                    access_path = std::move(index_scan);
                 }
             }
 
-            if (!current)
+            if (!access_path)
             {
                 auto seq_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SEQ_SCAN);
-                seq_scan->table_name = select->table;
-                current = std::move(seq_scan);
+                seq_scan->table_name = table_name;
+                access_path = std::move(seq_scan);
+            }
+            return access_path;
+        };
+
+        std::unique_ptr<PhysicalPlanNode> current;
+        if (select->join_table.has_value())
+        {
+            Table *right_table = catalog->GetTable(*select->join_table);
+            if (right_table == nullptr)
+            {
+                throw std::runtime_error("Join table not found: " + *select->join_table);
+            }
+            if (!select->join_left_column.has_value() || !select->join_right_column.has_value())
+            {
+                throw std::runtime_error("JOIN requires ON left_col = right_col");
+            }
+
+            std::unique_ptr<PhysicalPlanNode> left_input = build_base_access_path(select->table, table, nullptr);
+            std::unique_ptr<PhysicalPlanNode> right_input = build_base_access_path(*select->join_table, right_table, nullptr);
+            const Expression *remaining_predicate = select->where.get();
+            if (remaining_predicate != nullptr)
+            {
+                const PredicateTableSide side = ResolvePredicateSingleTable(
+                    remaining_predicate, select->table, *select->join_table, table, right_table);
+                if (side == PredicateTableSide::LEFT || side == PredicateTableSide::RIGHT)
+                {
+                    const std::string target_table_name = (side == PredicateTableSide::LEFT) ? select->table : *select->join_table;
+                    Table *target_table = (side == PredicateTableSide::LEFT) ? table : right_table;
+                    std::unique_ptr<PhysicalPlanNode> side_input = build_base_access_path(target_table_name, target_table, remaining_predicate);
+                    auto side_filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
+                    side_filter->table_name = target_table_name;
+                    side_filter->predicate = remaining_predicate;
+                    side_filter->children.push_back(std::move(side_input));
+                    side_input = std::move(side_filter);
+
+                    if (side == PredicateTableSide::LEFT)
+                    {
+                        left_input = std::move(side_input);
+                    }
+                    else
+                    {
+                        right_input = std::move(side_input);
+                    }
+                    remaining_predicate = nullptr;
+                }
+            }
+
+            const size_t left_count = table->GetTupleCount();
+            const size_t right_count = right_table->GetTupleCount();
+
+            // Rule-based join choice:
+            // - HASH_JOIN for larger equi-joins
+            // - NESTED_LOOP_JOIN for small inputs
+            const size_t total_rows = left_count + right_count;
+            const bool use_hash_join = total_rows >= 16;
+
+            auto join = std::make_unique<PhysicalPlanNode>(
+                use_hash_join ? PhysicalPlanType::HASH_JOIN : PhysicalPlanType::NESTED_LOOP_JOIN);
+            join->table_name = select->table;
+            join->right_table_name = *select->join_table;
+            join->join_left_column = *select->join_left_column;
+            join->join_right_column = *select->join_right_column;
+            // Rule-based choice: iterate smaller table in outer loop for nested loop.
+            join->join_right_as_outer = right_count < left_count;
+            // Rule-based choice: build hash table on smaller side for hash join.
+            join->join_build_right = right_count <= left_count;
+            join->children.push_back(std::move(left_input));
+            join->children.push_back(std::move(right_input));
+            current = std::move(join);
+
+            if (remaining_predicate != nullptr)
+            {
+                auto filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
+                filter->table_name = "__join_context__";
+                filter->predicate = remaining_predicate;
+                filter->children.push_back(std::move(current));
+                current = std::move(filter);
             }
         }
-
-        if (select->where != nullptr)
+        else
         {
-            auto filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
-            filter->predicate = select->where.get();
-            filter->children.push_back(std::move(current));
-            current = std::move(filter);
+            current = build_base_access_path(select->table, table, select->where.get());
+            if (select->where != nullptr)
+            {
+                auto filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
+                filter->table_name = select->table;
+                filter->predicate = select->where.get();
+                filter->children.push_back(std::move(current));
+                current = std::move(filter);
+            }
         }
 
         auto projection = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::PROJECTION);

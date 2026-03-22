@@ -94,7 +94,18 @@ namespace sql
                     }
                     if (!qualifier.empty() && ExtractQualifier(schema_col) != qualifier)
                     {
-                        continue;
+                        const std::string schema_qualifier = ExtractQualifier(schema_col);
+                        if (!schema_qualifier.empty())
+                        {
+                            if (schema_qualifier != qualifier)
+                            {
+                                continue;
+                            }
+                        }
+                        else if (qualifier != table_->GetName())
+                        {
+                            continue;
+                        }
                     }
                     if (matched_idx >= 0)
                     {

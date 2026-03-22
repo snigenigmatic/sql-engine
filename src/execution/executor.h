@@ -50,9 +50,11 @@ namespace sql
         int ResolveColumnIndexForSelect(const std::string &name, Table *base_table, Table *join_table, bool *from_join_table = nullptr) const;
         void EnsureJoinContextTable(Table *left, Table *right);
         std::pair<std::string, std::string> ResolveJoinColumns(const PhysicalPlanNode *node, Table *left, Table *right) const;
+        Table *MaterializeOperatorToTable(std::unique_ptr<Operator> op, Table *source_table, const std::string &name_suffix);
 
         Catalog *catalog_;
         std::unique_ptr<Table> join_context_table_;
+        std::vector<std::unique_ptr<Table>> materialized_tables_;
     };
 
 } // namespace sql

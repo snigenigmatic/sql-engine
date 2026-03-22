@@ -135,6 +135,16 @@ namespace sql
         EXPECT_EQ(unchanged.tuples[0].GetValue(1).GetAsInt(), 30);
     }
 
+    TEST(IntegrationTest, UpdateWithWrongQualifiedColumnFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, age INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 25), (2, 30);");
+
+        auto upd = RunSQL(catalog, "UPDATE users SET age = 99 WHERE orders.id = 1;");
+        EXPECT_FALSE(upd.success);
+    }
+
     TEST(IntegrationTest, UpdateAllRows)
     {
         Catalog catalog;
@@ -165,6 +175,16 @@ namespace sql
         auto result = RunSQL(catalog, "SELECT * FROM users;");
         ASSERT_EQ(result.tuples.size(), 1);
         EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), 1);
+    }
+
+    TEST(IntegrationTest, DeleteWithWrongQualifiedColumnFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, age INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 25), (2, 30);");
+
+        auto del = RunSQL(catalog, "DELETE FROM users WHERE orders.id = 1;");
+        EXPECT_FALSE(del.success);
     }
 
     TEST(IntegrationTest, DeleteAllRows)

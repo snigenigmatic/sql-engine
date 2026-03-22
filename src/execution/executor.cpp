@@ -126,7 +126,38 @@ namespace sql
             if (!tuple || !table)
                 throw std::runtime_error("Column reference without tuple context");
             const auto *col = static_cast<const ColumnExpression *>(expr);
-            int idx = table->GetColumnIndex(col->name);
+            const size_t dot = col->name.find('.');
+            int idx = -1;
+            if (dot != std::string::npos)
+            {
+                const std::string qualifier = col->name.substr(0, dot);
+                const std::string unqualified = col->name.substr(dot + 1);
+
+                // Join context stores qualified column names directly.
+                if (table->GetName() == "__join_context__")
+                {
+                    idx = table->GetColumnIndex(col->name);
+                    if (idx < 0)
+                    {
+                        throw std::runtime_error("Unknown column: " + col->name);
+                    }
+                    return tuple->GetValue(static_cast<size_t>(idx));
+                }
+
+                if (qualifier != table->GetName())
+                {
+                    throw std::runtime_error("Unknown table qualifier in column: " + col->name);
+                }
+
+                idx = table->GetColumnIndex(unqualified);
+                if (idx < 0)
+                {
+                    throw std::runtime_error("Unknown column: " + col->name);
+                }
+                return tuple->GetValue(static_cast<size_t>(idx));
+            }
+
+            idx = table->GetColumnIndex(col->name);
             if (idx < 0)
             {
                 const std::string stripped = StripQualifier(col->name);
@@ -253,6 +284,28 @@ namespace sql
         return column_indices;
     }
 
+    Table *Executor::MaterializeOperatorToTable(std::unique_ptr<Operator> op, Table *source_table, const std::string &name_suffix)
+    {
+        if (op == nullptr || source_table == nullptr)
+        {
+            throw std::runtime_error("Cannot materialize null operator or source table");
+        }
+
+        (void)name_suffix;
+        auto materialized = std::make_unique<Table>(
+            source_table->GetName(),
+            source_table->GetSchema());
+        op->Open();
+        Tuple row;
+        while (op->Next(&row))
+        {
+            materialized->Insert(row);
+        }
+        op->Close();
+        materialized_tables_.push_back(std::move(materialized));
+        return materialized_tables_.back().get();
+    }
+
     std::unique_ptr<Operator> Executor::BuildOperatorTree(const PhysicalPlanNode *node, Table *table, Table *join_table)
     {
         if (node == nullptr)
@@ -289,6 +342,21 @@ namespace sql
             {
                 throw std::runtime_error("JOIN table not found while building operator tree");
             }
+            if (node->children.size() == 2)
+            {
+                auto left_access = BuildOperatorTree(node->children[0].get(), left, nullptr);
+                auto right_access = BuildOperatorTree(node->children[1].get(), right, nullptr);
+                Table *left_materialized = MaterializeOperatorToTable(std::move(left_access), left, "__left_input__");
+                Table *right_materialized = MaterializeOperatorToTable(std::move(right_access), right, "__right_input__");
+                const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
+                EnsureJoinContextTable(left, right);
+                return std::make_unique<NestedLoopJoin>(
+                    left_materialized,
+                    right_materialized,
+                    left_col,
+                    right_col,
+                    node->join_right_as_outer);
+            }
             const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
             EnsureJoinContextTable(left, right);
             return std::make_unique<NestedLoopJoin>(left, right, left_col, right_col, node->join_right_as_outer);
@@ -301,6 +369,21 @@ namespace sql
             {
                 throw std::runtime_error("JOIN table not found while building operator tree");
             }
+            if (node->children.size() == 2)
+            {
+                auto left_access = BuildOperatorTree(node->children[0].get(), left, nullptr);
+                auto right_access = BuildOperatorTree(node->children[1].get(), right, nullptr);
+                Table *left_materialized = MaterializeOperatorToTable(std::move(left_access), left, "__left_input__");
+                Table *right_materialized = MaterializeOperatorToTable(std::move(right_access), right, "__right_input__");
+                const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
+                EnsureJoinContextTable(left, right);
+                return std::make_unique<HashJoin>(
+                    left_materialized,
+                    right_materialized,
+                    left_col,
+                    right_col,
+                    node->join_build_right);
+            }
             const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
             EnsureJoinContextTable(left, right);
             return std::make_unique<HashJoin>(left, right, left_col, right_col, node->join_build_right);
@@ -310,7 +393,12 @@ namespace sql
             if (node->children.empty())
                 throw std::runtime_error("Filter node missing child");
             auto child = BuildOperatorTree(node->children[0].get(), table, join_table);
-            Table *filter_table = (join_context_table_ ? join_context_table_.get() : table);
+            Table *filter_table = table;
+            if (join_context_table_ &&
+                node->table_name == "__join_context__")
+            {
+                filter_table = join_context_table_.get();
+            }
             return std::make_unique<Filter>(std::move(child), node->predicate, filter_table);
         }
         case PhysicalPlanType::PROJECTION:
@@ -338,6 +426,7 @@ namespace sql
         if (!table)
             throw std::runtime_error("Table not found: " + select->table);
 
+        materialized_tables_.clear();
         join_context_table_.reset();
         Optimizer optimizer;
         auto physical_plan = optimizer.BuildPhysicalPlan(select, catalog_);

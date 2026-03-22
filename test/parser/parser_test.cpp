@@ -493,4 +493,29 @@ namespace sql
         EXPECT_NE(explain.find("HashJoin(left=users, right=orders, on=users.id = orders.user_id"), std::string::npos);
     }
 
+    TEST(ParserTest, BuildPhysicalPlanForJoinAddsPushdownFilterOnSingleSidePredicate)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                             })));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
+                                                  Column("id", DataType::INTEGER),
+                                                  Column("user_id", DataType::INTEGER),
+                                              })));
+
+        std::string sql = "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE orders.id > 10;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("NestedLoopJoin("), std::string::npos);
+        EXPECT_NE(explain.find("SeqScan(table=orders)"), std::string::npos);
+    }
+
 } // namespace sql

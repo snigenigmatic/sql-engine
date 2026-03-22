@@ -1,9 +1,83 @@
 #include "execution/hash_join.h"
+#include <functional>
 #include <stdexcept>
 #include <utility>
 
 namespace sql
 {
+    namespace
+    {
+        std::string StripQualifier(const std::string &name)
+        {
+            size_t dot = name.find('.');
+            if (dot == std::string::npos)
+            {
+                return name;
+            }
+            return name.substr(dot + 1);
+        }
+    } // namespace
+
+    size_t HashJoin::JoinKeyHasher::operator()(const JoinKey &key) const
+    {
+        size_t seed = std::hash<int>{}(static_cast<int>(key.type));
+        seed ^= std::hash<bool>{}(key.is_null) + 0x9e3779b9 + (seed << 6U) + (seed >> 2U);
+        if (key.is_null)
+        {
+            return seed;
+        }
+
+        size_t payload_hash = 0;
+        switch (key.type)
+        {
+        case DataType::INTEGER:
+            payload_hash = std::hash<int32_t>{}(key.int_value);
+            break;
+        case DataType::FLOAT:
+            payload_hash = std::hash<double>{}(key.float_value);
+            break;
+        case DataType::BOOLEAN:
+            payload_hash = std::hash<bool>{}(key.bool_value);
+            break;
+        case DataType::VARCHAR:
+            payload_hash = std::hash<std::string>{}(key.string_value);
+            break;
+        default:
+            break;
+        }
+        seed ^= payload_hash + 0x9e3779b9 + (seed << 6U) + (seed >> 2U);
+        return seed;
+    }
+
+    HashJoin::JoinKey HashJoin::MakeJoinKey(const Value &value)
+    {
+        JoinKey key;
+        key.type = value.GetType();
+        key.is_null = value.IsNull();
+        if (key.is_null)
+        {
+            return key;
+        }
+
+        switch (key.type)
+        {
+        case DataType::INTEGER:
+            key.int_value = value.GetAsInt();
+            break;
+        case DataType::FLOAT:
+            key.float_value = value.GetAsFloat();
+            break;
+        case DataType::BOOLEAN:
+            key.bool_value = value.GetAsBool();
+            break;
+        case DataType::VARCHAR:
+            key.string_value = value.GetAsString();
+            break;
+        default:
+            break;
+        }
+        return key;
+    }
 
     HashJoin::HashJoin(Table *left_table, Table *right_table, std::string left_column, std::string right_column, bool build_right)
         : left_table_(left_table), right_table_(right_table),
@@ -19,8 +93,8 @@ namespace sql
             throw std::runtime_error("HashJoin requires valid input tables");
         }
 
-        left_column_index_ = left_table_->GetColumnIndex(left_column_);
-        right_column_index_ = right_table_->GetColumnIndex(right_column_);
+        left_column_index_ = left_table_->GetColumnIndex(StripQualifier(left_column_));
+        right_column_index_ = right_table_->GetColumnIndex(StripQualifier(right_column_));
         if (left_column_index_ < 0 || right_column_index_ < 0)
         {
             throw std::runtime_error("HashJoin column not found in schema");
@@ -34,6 +108,7 @@ namespace sql
         int build_index = build_right_ ? right_column_index_ : left_column_index_;
 
         hash_table_.clear();
+        hash_table_.reserve(build_rows->size());
         for (size_t i = 0; i < build_rows->size(); ++i)
         {
             const Tuple &build_tuple = (*build_rows)[i];
@@ -42,7 +117,7 @@ namespace sql
                 continue;
             }
             const Value &key = build_tuple.GetValue(static_cast<size_t>(build_index));
-            hash_table_[key.ToString()].push_back(i);
+            hash_table_[MakeJoinKey(key)].push_back(i);
         }
 
         build_rows_ = build_rows;
@@ -77,7 +152,7 @@ namespace sql
             if (current_matches_.empty() && match_cursor_ == 0)
             {
                 const Value &probe_key = probe_tuple.GetValue(static_cast<size_t>(probe_key_index));
-                auto it = hash_table_.find(probe_key.ToString());
+                auto it = hash_table_.find(MakeJoinKey(probe_key));
                 if (it != hash_table_.end())
                 {
                     current_matches_ = it->second;

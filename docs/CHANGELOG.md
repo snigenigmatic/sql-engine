@@ -99,12 +99,32 @@ All notable repository changes for this implementation cycle are listed below.
   - Ambiguous unqualified filter references now fail explicitly.
 - `src/execution/nested_loop_join.cpp`
   - Join-key type mismatch now safely skips non-comparable pairs.
+- `src/execution/executor.cpp`
+  - Tightened `EvaluateExpr` qualifier handling for non-join tables:
+    - qualified references now require matching table qualifier,
+    - wrong qualifiers now fail explicitly instead of falling back silently.
+- `src/execution/hash_join.cpp`
+  - Hash join now supports qualified join columns (strips qualifiers before index lookup).
+  - Replaced stringified hash keys with typed join keys to avoid `ToString()` hot-path conversions/collisions.
+  - Reserved hash table buckets from build-side row count to reduce rehashing.
+- `src/optimizer/optimizer.cpp`
+  - JOIN physical plans now include explicit left/right child access paths (composable join inputs).
+  - Added safe single-side predicate pushdown for JOIN `WHERE`:
+    - pushes single-table predicates under the corresponding join input,
+    - keeps mixed predicates above join in join-context filter.
+- `src/execution/executor.h` and `src/execution/executor.cpp`
+  - Added materialization support for join input child plans so join operators can consume planned access paths.
+- `src/execution/filter.cpp`
+  - Enhanced qualifier matching to treat unqualified schema columns as belonging to the current table for qualified predicates in single-table filters.
 
 ### Tests
 - `test/parser/parser_test.cpp`
   - Added `BuildPhysicalPlanForJoinChoosesHashJoinForLargerInputs`.
+  - Added `BuildPhysicalPlanForJoinAddsPushdownFilterOnSingleSidePredicate`.
 - `test/integration/query_test.cpp`
   - Added `HashJoinPathReturnsCorrectRows`.
+  - Added `UpdateWithWrongQualifiedColumnFails`.
+  - Added `DeleteWithWrongQualifiedColumnFails`.
 
 ### Fixed
 - Added a type-compatibility guard in physical index planning:
@@ -117,6 +137,4 @@ All notable repository changes for this implementation cycle are listed below.
 - Result: all tests passing.
 
 ### Notes
-- Current JOIN support is `INNER JOIN ... ON left_col = right_col` for one join table.
-- JOIN planning is still executor-driven; optimizer JOIN nodes are the next step.
-- JOIN planning now flows through optimizer physical plans; next step is join algorithm selection and cost-based choices.
+- JOIN planning now flows through optimizer physical plan nodes; next steps are richer join shapes and cost-based algorithm selection.
