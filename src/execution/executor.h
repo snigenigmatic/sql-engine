@@ -6,6 +6,7 @@
 #include "execution/projection.h"
 #include "execution/index_scan.h"
 #include "parser/ast.h"
+#include "optimizer/optimizer.h"
 #include "catalog/catalog.h"
 #include <memory>
 #include <vector>
@@ -31,6 +32,8 @@ namespace sql
 
     private:
         std::unique_ptr<Operator> BuildPlan(SelectStatement *select);
+        std::unique_ptr<Operator> BuildOperatorTree(const PhysicalPlanNode *node, Table *table);
+        std::vector<int> ResolveProjectionIndices(const PhysicalPlanNode *node, Table *table) const;
         ExecutionResult ExecuteSelect(SelectStatement *select);
         ExecutionResult ExecuteCreateTable(CreateTableStatement *create);
         ExecutionResult ExecuteInsert(InsertStatement *insert);

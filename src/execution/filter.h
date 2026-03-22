@@ -11,7 +11,7 @@ namespace sql
     class Filter : public Operator
     {
     public:
-        Filter(std::unique_ptr<Operator> child, Expression *predicate, Table *table)
+        Filter(std::unique_ptr<Operator> child, const Expression *predicate, Table *table)
             : child_(std::move(child)), predicate_(predicate), table_(table) {}
 
         void Open() override;
@@ -26,7 +26,7 @@ namespace sql
         bool EvaluatePredicate(const Tuple &tuple) const;
 
         std::unique_ptr<Operator> child_;
-        Expression *predicate_; // The WHERE expression (not owned)
+        const Expression *predicate_; // The WHERE expression (not owned)
         Table *table_;          // For schema access (column name lookups)
     };
 
