@@ -40,6 +40,7 @@ namespace sql
         SEQ_SCAN,
         INDEX_SCAN,
         NESTED_LOOP_JOIN,
+        HASH_JOIN,
         FILTER,
         PROJECTION
     };
@@ -68,6 +69,9 @@ namespace sql
         std::string join_left_column;
         std::string join_right_column;
         bool join_right_as_outer = false;
+
+        // HASH_JOIN
+        bool join_build_right = true;
 
         // FILTER
         const Expression *predicate = nullptr; // non-owning, refers to AST owned by Statement

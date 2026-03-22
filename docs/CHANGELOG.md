@@ -38,6 +38,8 @@ All notable repository changes for this implementation cycle are listed below.
   - Qualified columns like `users.id`.
 - New execution operator:
   - `NestedLoopJoin` (`src/execution/nested_loop_join.h/.cpp`)
+- New execution operator:
+  - `HashJoin` (`src/execution/hash_join.h/.cpp`)
 - JOIN tests:
   - Lexer tokenization for JOIN + qualified columns.
   - Parser JOIN AST test.
@@ -77,15 +79,32 @@ All notable repository changes for this implementation cycle are listed below.
   - Applies rule-based nested-loop choice from planner (`outer=left|right`).
 - `src/optimizer/optimizer.cpp`
   - Added rule-based join planning heuristic: pick smaller table as outer loop for nested loop join.
+- `src/optimizer/optimizer.cpp`
+  - Added rule-based join algorithm selection: choose `HASH_JOIN` for larger equi-joins and keep `NESTED_LOOP_JOIN` for smaller joins.
+  - Added hash build-side heuristic: build hash table on smaller side.
 - `src/execution/nested_loop_join.cpp`
   - Supports planner-driven outer-loop side while preserving output tuple order.
 - `src/execution/CMakeLists.txt`
   - Execution CMake wiring updated to compile `nested_loop_join.cpp`.
+  - Execution CMake wiring updated to compile `hash_join.cpp`.
+- `src/optimizer/optimizer.h`
+  - Added `HASH_JOIN` physical plan type and hash-join metadata in `PhysicalPlanNode`.
+- `src/execution/executor.h`
+  - Added `HashJoin` include for physical-plan execution.
+- `src/execution/executor.cpp`
+  - Added `HASH_JOIN` operator-tree translation path.
+  - Projection planning over joins now supports both `NESTED_LOOP_JOIN` and `HASH_JOIN` children.
 - `src/execution/filter.cpp`
   - Added stricter qualified/unqualified column resolution over joined schemas.
   - Ambiguous unqualified filter references now fail explicitly.
 - `src/execution/nested_loop_join.cpp`
   - Join-key type mismatch now safely skips non-comparable pairs.
+
+### Tests
+- `test/parser/parser_test.cpp`
+  - Added `BuildPhysicalPlanForJoinChoosesHashJoinForLargerInputs`.
+- `test/integration/query_test.cpp`
+  - Added `HashJoinPathReturnsCorrectRows`.
 
 ### Fixed
 - Added a type-compatibility guard in physical index planning:

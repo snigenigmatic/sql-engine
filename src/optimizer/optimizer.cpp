@@ -180,13 +180,25 @@ namespace sql
                 throw std::runtime_error("JOIN requires ON left_col = right_col");
             }
 
-            auto join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::NESTED_LOOP_JOIN);
+            const size_t left_count = table->GetTupleCount();
+            const size_t right_count = right_table->GetTupleCount();
+
+            // Rule-based join choice:
+            // - HASH_JOIN for larger equi-joins
+            // - NESTED_LOOP_JOIN for small inputs
+            const size_t total_rows = left_count + right_count;
+            const bool use_hash_join = total_rows >= 16;
+
+            auto join = std::make_unique<PhysicalPlanNode>(
+                use_hash_join ? PhysicalPlanType::HASH_JOIN : PhysicalPlanType::NESTED_LOOP_JOIN);
             join->table_name = select->table;
             join->right_table_name = *select->join_table;
             join->join_left_column = *select->join_left_column;
             join->join_right_column = *select->join_right_column;
-            // Rule-based choice: iterate smaller table in outer loop.
-            join->join_right_as_outer = right_table->GetTupleCount() < table->GetTupleCount();
+            // Rule-based choice: iterate smaller table in outer loop for nested loop.
+            join->join_right_as_outer = right_count < left_count;
+            // Rule-based choice: build hash table on smaller side for hash join.
+            join->join_build_right = right_count <= left_count;
             current = std::move(join);
         }
         else
@@ -311,6 +323,14 @@ namespace sql
                 << ", on=" << node->join_left_column
                 << " = " << node->join_right_column
                 << ", outer=" << (node->join_right_as_outer ? "right" : "left")
+                << ")";
+            break;
+        case PhysicalPlanType::HASH_JOIN:
+            out << pad << "HashJoin(left=" << node->table_name
+                << ", right=" << node->right_table_name
+                << ", on=" << node->join_left_column
+                << " = " << node->join_right_column
+                << ", build=" << (node->join_build_right ? "right" : "left")
                 << ")";
             break;
         case PhysicalPlanType::FILTER:

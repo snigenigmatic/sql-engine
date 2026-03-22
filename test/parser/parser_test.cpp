@@ -456,4 +456,41 @@ namespace sql
         EXPECT_NE(explain.find("outer=right"), std::string::npos);
     }
 
+    TEST(ParserTest, BuildPhysicalPlanForJoinChoosesHashJoinForLargerInputs)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                             })));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
+                                                  Column("id", DataType::INTEGER),
+                                                  Column("user_id", DataType::INTEGER),
+                                              })));
+
+        auto *users = catalog.GetTable("users");
+        auto *orders = catalog.GetTable("orders");
+        ASSERT_NE(users, nullptr);
+        ASSERT_NE(orders, nullptr);
+
+        for (int i = 1; i <= 10; ++i)
+        {
+            users->Insert(Tuple({Value(i)}));
+        }
+        for (int i = 1; i <= 10; ++i)
+        {
+            orders->Insert(Tuple({Value(100 + i), Value(i)}));
+        }
+
+        std::string sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("HashJoin(left=users, right=orders, on=users.id = orders.user_id"), std::string::npos);
+    }
+
 } // namespace sql

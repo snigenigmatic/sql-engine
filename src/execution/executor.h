@@ -6,6 +6,7 @@
 #include "execution/projection.h"
 #include "execution/index_scan.h"
 #include "execution/nested_loop_join.h"
+#include "execution/hash_join.h"
 #include "parser/ast.h"
 #include "optimizer/optimizer.h"
 #include "catalog/catalog.h"

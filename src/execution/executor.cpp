@@ -293,6 +293,18 @@ namespace sql
             EnsureJoinContextTable(left, right);
             return std::make_unique<NestedLoopJoin>(left, right, left_col, right_col, node->join_right_as_outer);
         }
+        case PhysicalPlanType::HASH_JOIN:
+        {
+            Table *left = catalog_->GetTable(node->table_name);
+            Table *right = catalog_->GetTable(node->right_table_name);
+            if (left == nullptr || right == nullptr)
+            {
+                throw std::runtime_error("JOIN table not found while building operator tree");
+            }
+            const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
+            EnsureJoinContextTable(left, right);
+            return std::make_unique<HashJoin>(left, right, left_col, right_col, node->join_build_right);
+        }
         case PhysicalPlanType::FILTER:
         {
             if (node->children.empty())
@@ -307,7 +319,8 @@ namespace sql
                 throw std::runtime_error("Projection node missing child");
             auto child = BuildOperatorTree(node->children[0].get(), table, join_table);
             Table *projection_join_table = join_table;
-            if (node->children[0]->type == PhysicalPlanType::NESTED_LOOP_JOIN)
+            if (node->children[0]->type == PhysicalPlanType::NESTED_LOOP_JOIN ||
+                node->children[0]->type == PhysicalPlanType::HASH_JOIN)
             {
                 projection_join_table = catalog_->GetTable(node->children[0]->right_table_name);
             }
