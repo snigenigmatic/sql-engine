@@ -163,4 +163,4 @@ See [docs/design.md](docs/design.md) for detailed architecture documentation.
 
 ## License
 
-MIT License - see LICENSE file for details
+MIT License - see [LICENSE](LICENSE) file for details
