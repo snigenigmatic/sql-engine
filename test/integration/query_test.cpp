@@ -259,6 +259,19 @@ namespace sql
         EXPECT_EQ(result.tuples[1].GetValue(0).GetAsInt(), 2);
     }
 
+    TEST(IntegrationTest, IndexedPredicateTypeMismatchFallsBackSafely)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, val INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+        RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
+
+        // Mismatched literal type should avoid index plan and evaluate safely.
+        auto result = RunSQL(catalog, "SELECT * FROM t WHERE id = '2';");
+        EXPECT_TRUE(result.success);
+        EXPECT_EQ(result.tuples.size(), 0);
+    }
+
     TEST(IntegrationTest, IndexRemainsConsistentAfterInsert)
     {
         Catalog catalog;

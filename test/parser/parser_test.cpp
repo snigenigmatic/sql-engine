@@ -349,4 +349,28 @@ namespace sql
         EXPECT_EQ(explain.find("IndexScan("), std::string::npos);
     }
 
+    TEST(ParserTest, BuildPhysicalPlanFallsBackToSeqScanOnTypeMismatch)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                                 Column("name", DataType::VARCHAR, 50),
+                                             })));
+        ASSERT_TRUE(catalog.CreateIndex("idx_users_id", "users", "id"));
+
+        std::string sql = "SELECT * FROM users WHERE id = '2';";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Projection(columns=*)"), std::string::npos);
+        EXPECT_NE(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("SeqScan(table=users)"), std::string::npos);
+        EXPECT_EQ(explain.find("IndexScan("), std::string::npos);
+    }
+
 } // namespace sql

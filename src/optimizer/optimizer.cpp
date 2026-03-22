@@ -177,6 +177,21 @@ namespace sql
             BTree *index = catalog->GetIndex(select->table, column_name);
             if (index != nullptr)
             {
+                int col_idx = table->GetColumnIndex(column_name);
+                if (col_idx < 0)
+                {
+                    throw std::runtime_error("Indexed column not found in table schema: " + column_name);
+                }
+
+                const Column &column = table->GetSchema().GetColumn(static_cast<size_t>(col_idx));
+                if (column.type != literal_value.GetType())
+                {
+                    index = nullptr;
+                }
+            }
+
+            if (index != nullptr)
+            {
                 (void)index; // Existence check is enough for plan construction
 
                 auto index_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_SCAN);

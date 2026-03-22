@@ -45,6 +45,24 @@ All notable repository changes for this implementation cycle are listed below.
 - `src/execution/filter.h`
   - Predicate pointer changed from mutable `Expression*` to `const Expression*` for safer non-owning use.
 
+### Fixed
+- Added a type-compatibility guard in physical index planning:
+  - `src/optimizer/optimizer.cpp`
+  - Planner now validates `literal_value.GetType()` against indexed column `DataType` before choosing `INDEX_SCAN`.
+  - On mismatch (for example `WHERE id = '2'` when `id` is `INTEGER`), planner now falls back to `SEQ_SCAN + FILTER` instead of building an index plan that can throw during BTree comparisons.
+
+### Added Tests
+- `test/parser/parser_test.cpp`
+  - `BuildPhysicalPlanFallsBackToSeqScanOnTypeMismatch`
+- `test/integration/query_test.cpp`
+  - `IndexedPredicateTypeMismatchFallsBackSafely`
+
+### Validation
+- `cmake --build build && ctest --test-dir build --output-on-failure`
+- Result: all tests passing.
+
+
+
 ### Deleted
 - No files deleted in this cycle.
 
