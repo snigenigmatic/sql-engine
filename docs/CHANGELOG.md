@@ -40,6 +40,8 @@ All notable repository changes for this implementation cycle are listed below.
   - `NestedLoopJoin` (`src/execution/nested_loop_join.h/.cpp`)
 - New execution operator:
   - `HashJoin` (`src/execution/hash_join.h/.cpp`)
+- GitHub Actions workflow:
+  - `.github/workflows/ci.yml` for automated configure/build/test on push and pull request.
 - JOIN tests:
   - Lexer tokenization for JOIN + qualified columns.
   - Parser JOIN AST test.
