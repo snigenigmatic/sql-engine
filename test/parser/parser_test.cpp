@@ -373,4 +373,149 @@ namespace sql
         EXPECT_EQ(explain.find("IndexScan("), std::string::npos);
     }
 
+    TEST(ParserTest, ParseSelectWithJoin)
+    {
+        std::string sql = "SELECT users.id, orders.amount FROM users JOIN orders ON users.id = orders.user_id;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+
+        auto stmt = parser.ParseStatement();
+        ASSERT_NE(stmt, nullptr);
+        ASSERT_EQ(stmt->GetType(), StatementType::SELECT);
+        auto select = static_cast<SelectStatement *>(stmt.get());
+
+        EXPECT_EQ(select->table, "users");
+        ASSERT_TRUE(select->join_table.has_value());
+        EXPECT_EQ(*select->join_table, "orders");
+        ASSERT_TRUE(select->join_left_column.has_value());
+        ASSERT_TRUE(select->join_right_column.has_value());
+        EXPECT_EQ(*select->join_left_column, "users.id");
+        EXPECT_EQ(*select->join_right_column, "orders.user_id");
+        ASSERT_EQ(select->columns.size(), 2);
+        EXPECT_EQ(select->columns[0], "users.id");
+        EXPECT_EQ(select->columns[1], "orders.amount");
+    }
+
+    TEST(ParserTest, BuildPhysicalPlanForJoin)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                                 Column("name", DataType::VARCHAR, 50),
+                                             })));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
+                                                  Column("id", DataType::INTEGER),
+                                                  Column("user_id", DataType::INTEGER),
+                                                  Column("amount", DataType::FLOAT),
+                                              })));
+
+        std::string sql = "SELECT users.id, orders.amount FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 60.0;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Projection(columns=[users.id, orders.amount])"), std::string::npos);
+        EXPECT_NE(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("NestedLoopJoin(left=users, right=orders, on=users.id = orders.user_id"), std::string::npos);
+    }
+
+    TEST(ParserTest, BuildPhysicalPlanForJoinChoosesSmallerOuter)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                             })));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
+                                                  Column("id", DataType::INTEGER),
+                                                  Column("user_id", DataType::INTEGER),
+                                              })));
+
+        auto *users = catalog.GetTable("users");
+        auto *orders = catalog.GetTable("orders");
+        ASSERT_NE(users, nullptr);
+        ASSERT_NE(orders, nullptr);
+        users->Insert(Tuple({Value(1)}));
+        users->Insert(Tuple({Value(2)}));
+        users->Insert(Tuple({Value(3)}));
+        users->Insert(Tuple({Value(4)}));
+        orders->Insert(Tuple({Value(10), Value(1)}));
+
+        std::string sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("outer=right"), std::string::npos);
+    }
+
+    TEST(ParserTest, BuildPhysicalPlanForJoinChoosesHashJoinForLargerInputs)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                             })));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
+                                                  Column("id", DataType::INTEGER),
+                                                  Column("user_id", DataType::INTEGER),
+                                              })));
+
+        auto *users = catalog.GetTable("users");
+        auto *orders = catalog.GetTable("orders");
+        ASSERT_NE(users, nullptr);
+        ASSERT_NE(orders, nullptr);
+
+        for (int i = 1; i <= 10; ++i)
+        {
+            users->Insert(Tuple({Value(i)}));
+        }
+        for (int i = 1; i <= 10; ++i)
+        {
+            orders->Insert(Tuple({Value(100 + i), Value(i)}));
+        }
+
+        std::string sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("HashJoin(left=users, right=orders, on=users.id = orders.user_id"), std::string::npos);
+    }
+
+    TEST(ParserTest, BuildPhysicalPlanForJoinAddsPushdownFilterOnSingleSidePredicate)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                             })));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
+                                                  Column("id", DataType::INTEGER),
+                                                  Column("user_id", DataType::INTEGER),
+                                              })));
+
+        std::string sql = "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE orders.id > 10;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("NestedLoopJoin("), std::string::npos);
+        EXPECT_NE(explain.find("SeqScan(table=orders)"), std::string::npos);
+    }
+
 } // namespace sql

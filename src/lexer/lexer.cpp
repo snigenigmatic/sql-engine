@@ -89,6 +89,9 @@ namespace sql
         case ',':
             token = MakeToken(TokenType::COMMA, literal);
             break;
+        case '.':
+            token = MakeToken(TokenType::DOT, literal);
+            break;
         case '+':
             token = MakeToken(TokenType::PLUS, literal);
             break;
@@ -241,7 +244,7 @@ namespace sql
         std::string upper_ident = ident;
         std::transform(upper_ident.begin(), upper_ident.end(), upper_ident.begin(), ::toupper);
 
-                static const std::map<std::string, TokenType> keywords = {
+        static const std::map<std::string, TokenType> keywords = {
             {"SELECT", TokenType::SELECT},
             {"FROM", TokenType::FROM},
             {"WHERE", TokenType::WHERE},
@@ -262,10 +265,11 @@ namespace sql
             {"BOOLEAN", TokenType::BOOLEAN},
             {"AND", TokenType::AND},
             {"OR", TokenType::OR},
-            {"NOT", TokenType::NOT},
-            {"DROP", TokenType::DROP},
-            {"TRUE", TokenType::TRUE},
-            {"FALSE", TokenType::FALSE}};
+             {"NOT", TokenType::NOT},
+             {"DROP", TokenType::DROP},
+             {"JOIN", TokenType::JOIN},
+             {"TRUE", TokenType::TRUE},
+             {"FALSE", TokenType::FALSE}};
 
 
         auto it = keywords.find(upper_ident);

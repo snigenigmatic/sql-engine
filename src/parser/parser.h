@@ -33,6 +33,7 @@ namespace sql
         std::unique_ptr<Expression> ParseTerm();
         std::unique_ptr<Expression> ParseComparison();
         std::unique_ptr<Expression> ParsePrimary();
+        std::string ParseQualifiedColumnName();
 
         Lexer &lexer_;
         Token current_token_;

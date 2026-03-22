@@ -135,6 +135,16 @@ namespace sql
         EXPECT_EQ(unchanged.tuples[0].GetValue(1).GetAsInt(), 30);
     }
 
+    TEST(IntegrationTest, UpdateWithWrongQualifiedColumnFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, age INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 25), (2, 30);");
+
+        auto upd = RunSQL(catalog, "UPDATE users SET age = 99 WHERE orders.id = 1;");
+        EXPECT_FALSE(upd.success);
+    }
+
     TEST(IntegrationTest, UpdateAllRows)
     {
         Catalog catalog;
@@ -165,6 +175,16 @@ namespace sql
         auto result = RunSQL(catalog, "SELECT * FROM users;");
         ASSERT_EQ(result.tuples.size(), 1);
         EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), 1);
+    }
+
+    TEST(IntegrationTest, DeleteWithWrongQualifiedColumnFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, age INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 25), (2, 30);");
+
+        auto del = RunSQL(catalog, "DELETE FROM users WHERE orders.id = 1;");
+        EXPECT_FALSE(del.success);
     }
 
     TEST(IntegrationTest, DeleteAllRows)
@@ -270,6 +290,132 @@ namespace sql
         auto result = RunSQL(catalog, "SELECT * FROM t WHERE id = '2';");
         EXPECT_TRUE(result.success);
         EXPECT_EQ(result.tuples.size(), 0);
+    }
+
+    TEST(IntegrationTest, InnerJoinBasic)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount FLOAT);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (101, 1, 100.0), (102, 1, 50.0), (103, 2, 75.0), (104, 4, 200.0);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.amount FROM users JOIN orders ON users.id = orders.user_id;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 3);
+        ASSERT_EQ(result.column_names.size(), 2);
+        EXPECT_EQ(result.column_names[0], "id");
+        EXPECT_EQ(result.column_names[1], "amount");
+    }
+
+    TEST(IntegrationTest, InnerJoinSelectStar)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1), (20, 2), (30, 2);");
+
+        auto result = RunSQL(catalog, "SELECT * FROM users JOIN orders ON users.id = orders.user_id;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 3);
+        ASSERT_EQ(result.column_names.size(), 4);
+    }
+
+    TEST(IntegrationTest, InnerJoinWithWhereOnRightColumn)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount FLOAT);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (101, 1, 100.0), (102, 1, 50.0), (103, 2, 75.0), (104, 2, 10.0);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.amount FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 60.0;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 2);
+    }
+
+    TEST(IntegrationTest, InnerJoinWithWhereOnLeftColumn)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1), (20, 2), (30, 2);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE users.id = 2;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 2);
+    }
+
+    TEST(IntegrationTest, InnerJoinSwappedOnSides)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1), (20, 2), (30, 2);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.id FROM users JOIN orders ON orders.user_id = users.id;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 3);
+    }
+
+    TEST(IntegrationTest, InnerJoinAmbiguousProjectionColumnFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1);");
+
+        auto result = RunSQL(catalog, "SELECT id FROM users JOIN orders ON users.id = orders.user_id;");
+        EXPECT_FALSE(result.success);
+    }
+
+    TEST(IntegrationTest, InnerJoinAmbiguousWhereColumnFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE id = 1;");
+        EXPECT_FALSE(result.success);
+    }
+
+    TEST(IntegrationTest, InnerJoinOnTypeMismatchReturnsNoRows)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id VARCHAR(50));");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, '1'), (20, '2');");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id;");
+        EXPECT_TRUE(result.success);
+        EXPECT_EQ(result.tuples.size(), 0);
+    }
+
+    TEST(IntegrationTest, HashJoinPathReturnsCorrectRows)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount FLOAT);");
+
+        // total rows >= 16 to trigger hash-join rule in planner
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'u1'), (2, 'u2'), (3, 'u3'), (4, 'u4'), (5, 'u5'), (6, 'u6'), (7, 'u7'), (8, 'u8');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (101, 1, 10.0), (102, 2, 20.0), (103, 2, 30.0), (104, 4, 40.0), (105, 8, 80.0), (106, 9, 90.0), (107, 10, 100.0), (108, 1, 11.0);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE users.id >= 2;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 4);
+
+        EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), 2);
+        EXPECT_EQ(result.tuples[1].GetValue(0).GetAsInt(), 2);
+        EXPECT_EQ(result.tuples[2].GetValue(0).GetAsInt(), 4);
+        EXPECT_EQ(result.tuples[3].GetValue(0).GetAsInt(), 8);
     }
 
     TEST(IntegrationTest, IndexRemainsConsistentAfterInsert)

@@ -99,4 +99,32 @@ namespace sql
         TestTokens(input, expected);
     }
 
+    TEST(LexerTest, TestJoinTokens)
+    {
+        std::string input = "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id;";
+        std::vector<ExpectedToken> expected = {
+            {TokenType::SELECT, "SELECT"},
+            {TokenType::IDENTIFIER, "users"},
+            {TokenType::DOT, "."},
+            {TokenType::IDENTIFIER, "id"},
+            {TokenType::COMMA, ","},
+            {TokenType::IDENTIFIER, "orders"},
+            {TokenType::DOT, "."},
+            {TokenType::IDENTIFIER, "id"},
+            {TokenType::FROM, "FROM"},
+            {TokenType::IDENTIFIER, "users"},
+            {TokenType::JOIN, "JOIN"},
+            {TokenType::IDENTIFIER, "orders"},
+            {TokenType::ON, "ON"},
+            {TokenType::IDENTIFIER, "users"},
+            {TokenType::DOT, "."},
+            {TokenType::IDENTIFIER, "id"},
+            {TokenType::EQ, "="},
+            {TokenType::IDENTIFIER, "orders"},
+            {TokenType::DOT, "."},
+            {TokenType::IDENTIFIER, "user_id"},
+            {TokenType::SEMICOLON, ";"}};
+        TestTokens(input, expected);
+    }
+
 } // namespace sql
