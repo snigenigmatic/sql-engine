@@ -142,6 +142,13 @@ ctest --test-dir build --output-on-failure --verbose
 - [x] **Phase 3**: Disk-based storage with buffer pool
 - [x] **Phase 4**: BTree indexes with query planner integration
 - [ ] **Phase 5**: JOIN operations
+  - [x] Parse `INNER JOIN ... ON ...` with qualified column references
+  - [x] Execute joins via `NestedLoopJoin`
+  - [x] Add rule-based join algorithm choice (`NestedLoopJoin` vs `HashJoin`)
+  - [x] Support `JOIN + WHERE` (single-table pushdown + post-join filter)
+  - [x] Add correctness checks (ambiguous columns, swapped `ON` sides, type-mismatch safety)
+  - [ ] Add `EXPLAIN` command in REPL to print physical plan (`SeqScan`/`IndexScan`/`Join` path)
+  - [ ] Add join-condition index matching (index-aware join access path, e.g. index nested-loop opportunities)
 - [ ] **Phase 6**: Transactions
 
 ## Architecture
