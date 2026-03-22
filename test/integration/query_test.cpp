@@ -328,6 +328,56 @@ namespace sql
         ASSERT_EQ(result.tuples.size(), 2);
     }
 
+    TEST(IntegrationTest, InnerJoinSwappedOnSides)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1), (20, 2), (30, 2);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.id FROM users JOIN orders ON orders.user_id = users.id;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 3);
+    }
+
+    TEST(IntegrationTest, InnerJoinAmbiguousProjectionColumnFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1);");
+
+        auto result = RunSQL(catalog, "SELECT id FROM users JOIN orders ON users.id = orders.user_id;");
+        EXPECT_FALSE(result.success);
+    }
+
+    TEST(IntegrationTest, InnerJoinAmbiguousWhereColumnFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE id = 1;");
+        EXPECT_FALSE(result.success);
+    }
+
+    TEST(IntegrationTest, InnerJoinOnTypeMismatchReturnsNoRows)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id VARCHAR(50));");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, '1'), (20, '2');");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id;");
+        EXPECT_TRUE(result.success);
+        EXPECT_EQ(result.tuples.size(), 0);
+    }
+
     TEST(IntegrationTest, IndexRemainsConsistentAfterInsert)
     {
         Catalog catalog;

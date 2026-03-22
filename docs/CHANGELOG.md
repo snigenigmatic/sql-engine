@@ -43,6 +43,7 @@ All notable repository changes for this implementation cycle are listed below.
   - Parser JOIN AST test.
   - Integration tests for basic INNER JOIN and `SELECT *` JOIN.
   - Integration tests for `JOIN + WHERE` on left/right table columns.
+  - Integration tests for swapped `ON` sides, ambiguous columns, and join-key type mismatch.
 
 ### Changed
 - `src/execution/executor.h`
@@ -67,9 +68,19 @@ All notable repository changes for this implementation cycle are listed below.
 - `src/parser/ast.cpp`
   - AST dump now includes JOIN metadata in `SelectStatement` output.
 - `src/optimizer/optimizer.cpp`
-  - Optimizer currently rejects JOIN statements explicitly with clear errors (JOIN execution is handled directly in executor for now).
+  - Optimizer now builds JOIN physical plans via a `NestedLoopJoin` node.
+- `src/optimizer/optimizer.h`
+  - Added `NESTED_LOOP_JOIN` physical plan type and JOIN metadata fields in `PhysicalPlanNode`.
+- `src/execution/executor.cpp`
+  - Removed JOIN special-casing from `BuildPlan(...)`.
+  - Executor now consumes optimizer JOIN physical plan nodes.
 - `src/execution/CMakeLists.txt`
   - Execution CMake wiring updated to compile `nested_loop_join.cpp`.
+- `src/execution/filter.cpp`
+  - Added stricter qualified/unqualified column resolution over joined schemas.
+  - Ambiguous unqualified filter references now fail explicitly.
+- `src/execution/nested_loop_join.cpp`
+  - Join-key type mismatch now safely skips non-comparable pairs.
 
 ### Fixed
 - Added a type-compatibility guard in physical index planning:
@@ -84,3 +95,4 @@ All notable repository changes for this implementation cycle are listed below.
 ### Notes
 - Current JOIN support is `INNER JOIN ... ON left_col = right_col` for one join table.
 - JOIN planning is still executor-driven; optimizer JOIN nodes are the next step.
+- JOIN planning now flows through optimizer physical plans; next step is join algorithm selection and cost-based choices.

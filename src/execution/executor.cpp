@@ -1,5 +1,6 @@
 #include "execution/executor.h"
 #include <stdexcept>
+#include <utility>
 
 namespace sql
 {
@@ -50,6 +51,16 @@ namespace sql
         }
 
         int base_idx = base_table->GetColumnIndex(name);
+        int join_idx = -1;
+        if (join_table)
+        {
+            join_idx = join_table->GetColumnIndex(name);
+        }
+
+        if (base_idx >= 0 && join_idx >= 0)
+        {
+            throw std::runtime_error("Ambiguous column reference: " + name);
+        }
         if (base_idx >= 0)
         {
             if (from_join_table)
@@ -57,18 +68,48 @@ namespace sql
             return base_idx;
         }
 
-        if (join_table)
+        if (join_idx >= 0)
         {
-            int join_idx = join_table->GetColumnIndex(name);
-            if (join_idx >= 0)
-            {
-                if (from_join_table)
-                    *from_join_table = true;
-                return join_idx;
-            }
+            if (from_join_table)
+                *from_join_table = true;
+            return join_idx;
         }
 
         throw std::runtime_error("Unknown column: " + name);
+    }
+
+    void Executor::EnsureJoinContextTable(Table *left, Table *right)
+    {
+        if (left == nullptr || right == nullptr)
+        {
+            throw std::runtime_error("Cannot create join context schema without both tables");
+        }
+        std::vector<Column> join_columns;
+        join_columns.reserve(left->GetSchema().GetColumnCount() + right->GetSchema().GetColumnCount());
+        for (const auto &col : left->GetSchema().GetColumns())
+        {
+            join_columns.emplace_back(left->GetName() + "." + col.name, col.type, col.length);
+        }
+        for (const auto &col : right->GetSchema().GetColumns())
+        {
+            join_columns.emplace_back(right->GetName() + "." + col.name, col.type, col.length);
+        }
+        join_context_table_ = std::make_unique<Table>("__join_context__", Schema(std::move(join_columns)));
+    }
+
+    std::pair<std::string, std::string> Executor::ResolveJoinColumns(const PhysicalPlanNode *node, Table *left, Table *right) const
+    {
+        std::string left_col = StripQualifier(node->join_left_column);
+        std::string right_col = StripQualifier(node->join_right_column);
+        if (left->GetColumnIndex(left_col) < 0)
+        {
+            std::swap(left_col, right_col);
+        }
+        if (left->GetColumnIndex(left_col) < 0 || right->GetColumnIndex(right_col) < 0)
+        {
+            throw std::runtime_error("Invalid JOIN columns in ON clause");
+        }
+        return {left_col, right_col};
     }
 
     Value Executor::EvaluateExpr(const Expression *expr, const Tuple *tuple, Table *table) const
@@ -85,7 +126,28 @@ namespace sql
             if (!tuple || !table)
                 throw std::runtime_error("Column reference without tuple context");
             const auto *col = static_cast<const ColumnExpression *>(expr);
-            int idx = table->GetColumnIndex(StripQualifier(col->name));
+            int idx = table->GetColumnIndex(col->name);
+            if (idx < 0)
+            {
+                const std::string stripped = StripQualifier(col->name);
+                int matched_idx = -1;
+                const auto &columns = table->GetSchema().GetColumns();
+                for (size_t i = 0; i < columns.size(); ++i)
+                {
+                    const std::string schema_col = columns[i].name;
+                    const std::string schema_stripped = StripQualifier(schema_col);
+                    if (schema_stripped != stripped)
+                    {
+                        continue;
+                    }
+                    if (matched_idx >= 0)
+                    {
+                        throw std::runtime_error("Ambiguous column: " + col->name);
+                    }
+                    matched_idx = static_cast<int>(i);
+                }
+                idx = matched_idx;
+            }
             if (idx < 0)
                 throw std::runtime_error("Unknown column: " + col->name);
             return tuple->GetValue(static_cast<size_t>(idx));
@@ -219,19 +281,37 @@ namespace sql
                 node->low_key, node->low_inclusive,
                 node->high_key, node->high_inclusive);
         }
+        case PhysicalPlanType::NESTED_LOOP_JOIN:
+        {
+            Table *left = catalog_->GetTable(node->table_name);
+            Table *right = catalog_->GetTable(node->right_table_name);
+            if (left == nullptr || right == nullptr)
+            {
+                throw std::runtime_error("JOIN table not found while building operator tree");
+            }
+            const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
+            EnsureJoinContextTable(left, right);
+            return std::make_unique<NestedLoopJoin>(left, right, left_col, right_col);
+        }
         case PhysicalPlanType::FILTER:
         {
             if (node->children.empty())
                 throw std::runtime_error("Filter node missing child");
             auto child = BuildOperatorTree(node->children[0].get(), table, join_table);
-            return std::make_unique<Filter>(std::move(child), node->predicate, table);
+            Table *filter_table = (join_context_table_ ? join_context_table_.get() : table);
+            return std::make_unique<Filter>(std::move(child), node->predicate, filter_table);
         }
         case PhysicalPlanType::PROJECTION:
         {
             if (node->children.empty())
                 throw std::runtime_error("Projection node missing child");
             auto child = BuildOperatorTree(node->children[0].get(), table, join_table);
-            auto column_indices = ResolveProjectionIndices(node, table, join_table);
+            Table *projection_join_table = join_table;
+            if (node->children[0]->type == PhysicalPlanType::NESTED_LOOP_JOIN)
+            {
+                projection_join_table = catalog_->GetTable(node->children[0]->right_table_name);
+            }
+            auto column_indices = ResolveProjectionIndices(node, table, projection_join_table);
             return std::make_unique<Projection>(std::move(child), std::move(column_indices), node->project_all);
         }
         default:
@@ -245,68 +325,15 @@ namespace sql
         if (!table)
             throw std::runtime_error("Table not found: " + select->table);
 
-        if (select->join_table.has_value())
-        {
-            Table *right = catalog_->GetTable(*select->join_table);
-            if (!right)
-                throw std::runtime_error("Join table not found: " + *select->join_table);
-            if (!select->join_left_column.has_value() || !select->join_right_column.has_value())
-                throw std::runtime_error("JOIN requires ON left_col = right_col");
-
-            std::string left_col = StripQualifier(*select->join_left_column);
-            std::string right_col = StripQualifier(*select->join_right_column);
-
-            if (table->GetColumnIndex(left_col) < 0)
-            {
-                // Allow swapped ON sides.
-                std::swap(left_col, right_col);
-            }
-            if (table->GetColumnIndex(left_col) < 0 || right->GetColumnIndex(right_col) < 0)
-            {
-                throw std::runtime_error("Invalid JOIN columns in ON clause");
-            }
-
-            std::unique_ptr<Operator> plan = std::make_unique<NestedLoopJoin>(table, right, left_col, right_col);
-            if (select->where)
-            {
-                std::vector<Column> join_columns;
-                join_columns.reserve(table->GetSchema().GetColumnCount() + right->GetSchema().GetColumnCount());
-                for (const auto &col : table->GetSchema().GetColumns())
-                {
-                    join_columns.emplace_back(col.name, col.type, col.length);
-                }
-                for (const auto &col : right->GetSchema().GetColumns())
-                {
-                    join_columns.emplace_back(col.name, col.type, col.length);
-                }
-                join_context_table_ = std::make_unique<Table>("__join_context__", Schema(std::move(join_columns)));
-                plan = std::make_unique<Filter>(std::move(plan), select->where.get(), join_context_table_.get());
-            }
-            if (select->select_star)
-            {
-                return std::make_unique<Projection>(std::move(plan), std::vector<int>{}, true);
-            }
-
-            std::vector<int> projection_indices;
-            projection_indices.reserve(select->columns.size());
-            const int left_count = static_cast<int>(table->GetSchema().GetColumnCount());
-            for (const auto &col_name : select->columns)
-            {
-                bool from_join = false;
-                int idx = ResolveColumnIndexForSelect(col_name, table, right, &from_join);
-                if (from_join)
-                {
-                    idx += left_count;
-                }
-                projection_indices.push_back(idx);
-            }
-            return std::make_unique<Projection>(std::move(plan), std::move(projection_indices), false);
-        }
-
         join_context_table_.reset();
         Optimizer optimizer;
         auto physical_plan = optimizer.BuildPhysicalPlan(select, catalog_);
-        return BuildOperatorTree(physical_plan.get(), table, nullptr);
+        Table *right = nullptr;
+        if (select->join_table.has_value())
+        {
+            right = catalog_->GetTable(*select->join_table);
+        }
+        return BuildOperatorTree(physical_plan.get(), table, right);
     }
 
     ExecutionResult Executor::ExecuteSelect(SelectStatement *select)

@@ -396,4 +396,31 @@ namespace sql
         EXPECT_EQ(select->columns[1], "orders.amount");
     }
 
+    TEST(ParserTest, BuildPhysicalPlanForJoin)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({
+                                                 Column("id", DataType::INTEGER),
+                                                 Column("name", DataType::VARCHAR, 50),
+                                             })));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
+                                                  Column("id", DataType::INTEGER),
+                                                  Column("user_id", DataType::INTEGER),
+                                                  Column("amount", DataType::FLOAT),
+                                              })));
+
+        std::string sql = "SELECT users.id, orders.amount FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 60.0;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+
+        Optimizer optimizer;
+        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
+        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
+
+        EXPECT_NE(explain.find("Projection(columns=[users.id, orders.amount])"), std::string::npos);
+        EXPECT_NE(explain.find("Filter"), std::string::npos);
+        EXPECT_NE(explain.find("NestedLoopJoin(left=users, right=orders, on=users.id = orders.user_id)"), std::string::npos);
+    }
+
 } // namespace sql

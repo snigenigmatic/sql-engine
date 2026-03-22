@@ -55,6 +55,11 @@ namespace sql
                 const auto &right_row = right_rows[right_cursor_++];
                 Value right_key = right_row.GetValue(static_cast<size_t>(right_column_index_));
 
+                if (left_key.GetType() != right_key.GetType())
+                {
+                    continue;
+                }
+
                 if (left_key == right_key)
                 {
                     std::vector<Value> joined_values;

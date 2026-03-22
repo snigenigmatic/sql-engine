@@ -62,11 +62,6 @@ namespace sql
 
     std::unique_ptr<LogicalPlanNode> Optimizer::BuildSelectLogicalPlan(const SelectStatement *select) const
     {
-        if (select->join_table.has_value())
-        {
-            throw std::runtime_error("Logical planner JOIN support is not implemented yet");
-        }
-
         auto scan = std::make_unique<LogicalPlanNode>(LogicalPlanType::SEQ_SCAN);
         scan->table_name = select->table;
 
@@ -166,11 +161,6 @@ namespace sql
 
     std::unique_ptr<PhysicalPlanNode> Optimizer::BuildSelectPhysicalPlan(const SelectStatement *select, Catalog *catalog) const
     {
-        if (select->join_table.has_value())
-        {
-            throw std::runtime_error("Physical planner JOIN support is not implemented yet");
-        }
-
         Table *table = catalog->GetTable(select->table);
         if (table == nullptr)
         {
@@ -178,70 +168,91 @@ namespace sql
         }
 
         std::unique_ptr<PhysicalPlanNode> current;
-
-        std::string column_name;
-        TokenType op = TokenType::ILLEGAL;
-        Value literal_value;
-        if (IsIndexableComparison(select->where.get(), &column_name, &op, &literal_value))
+        if (select->join_table.has_value())
         {
-            BTree *index = catalog->GetIndex(select->table, column_name);
-            if (index != nullptr)
+            Table *right_table = catalog->GetTable(*select->join_table);
+            if (right_table == nullptr)
             {
-                int col_idx = table->GetColumnIndex(column_name);
-                if (col_idx < 0)
-                {
-                    throw std::runtime_error("Indexed column not found in table schema: " + column_name);
-                }
-
-                const Column &column = table->GetSchema().GetColumn(static_cast<size_t>(col_idx));
-                if (column.type != literal_value.GetType())
-                {
-                    index = nullptr;
-                }
+                throw std::runtime_error("Join table not found: " + *select->join_table);
+            }
+            if (!select->join_left_column.has_value() || !select->join_right_column.has_value())
+            {
+                throw std::runtime_error("JOIN requires ON left_col = right_col");
             }
 
-            if (index != nullptr)
-            {
-                (void)index; // Existence check is enough for plan construction
-
-                auto index_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_SCAN);
-                index_scan->table_name = select->table;
-                index_scan->index_column = column_name;
-
-                switch (op)
-                {
-                case TokenType::EQ:
-                    index_scan->is_point_lookup = true;
-                    index_scan->point_key = literal_value;
-                    break;
-                case TokenType::GT:
-                    index_scan->low_key = literal_value;
-                    index_scan->low_inclusive = false;
-                    break;
-                case TokenType::GEQ:
-                    index_scan->low_key = literal_value;
-                    index_scan->low_inclusive = true;
-                    break;
-                case TokenType::LT:
-                    index_scan->high_key = literal_value;
-                    index_scan->high_inclusive = false;
-                    break;
-                case TokenType::LEQ:
-                    index_scan->high_key = literal_value;
-                    index_scan->high_inclusive = true;
-                    break;
-                default:
-                    break;
-                }
-                current = std::move(index_scan);
-            }
+            auto join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::NESTED_LOOP_JOIN);
+            join->table_name = select->table;
+            join->right_table_name = *select->join_table;
+            join->join_left_column = *select->join_left_column;
+            join->join_right_column = *select->join_right_column;
+            current = std::move(join);
         }
-
-        if (!current)
+        else
         {
-            auto seq_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SEQ_SCAN);
-            seq_scan->table_name = select->table;
-            current = std::move(seq_scan);
+            std::string column_name;
+            TokenType op = TokenType::ILLEGAL;
+            Value literal_value;
+            if (IsIndexableComparison(select->where.get(), &column_name, &op, &literal_value))
+            {
+                BTree *index = catalog->GetIndex(select->table, column_name);
+                if (index != nullptr)
+                {
+                    int col_idx = table->GetColumnIndex(column_name);
+                    if (col_idx < 0)
+                    {
+                        throw std::runtime_error("Indexed column not found in table schema: " + column_name);
+                    }
+
+                    const Column &column = table->GetSchema().GetColumn(static_cast<size_t>(col_idx));
+                    if (column.type != literal_value.GetType())
+                    {
+                        index = nullptr;
+                    }
+                }
+
+                if (index != nullptr)
+                {
+                    (void)index; // Existence check is enough for plan construction
+
+                    auto index_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_SCAN);
+                    index_scan->table_name = select->table;
+                    index_scan->index_column = column_name;
+
+                    switch (op)
+                    {
+                    case TokenType::EQ:
+                        index_scan->is_point_lookup = true;
+                        index_scan->point_key = literal_value;
+                        break;
+                    case TokenType::GT:
+                        index_scan->low_key = literal_value;
+                        index_scan->low_inclusive = false;
+                        break;
+                    case TokenType::GEQ:
+                        index_scan->low_key = literal_value;
+                        index_scan->low_inclusive = true;
+                        break;
+                    case TokenType::LT:
+                        index_scan->high_key = literal_value;
+                        index_scan->high_inclusive = false;
+                        break;
+                    case TokenType::LEQ:
+                        index_scan->high_key = literal_value;
+                        index_scan->high_inclusive = true;
+                        break;
+                    default:
+                        break;
+                    }
+                    current = std::move(index_scan);
+                }
+            }
+
+            if (!current)
+            {
+                auto seq_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SEQ_SCAN);
+                seq_scan->table_name = select->table;
+                current = std::move(seq_scan);
+            }
         }
 
         if (select->where != nullptr)
@@ -291,6 +302,12 @@ namespace sql
                 out << (node->high_inclusive ? " (inclusive)" : " (exclusive)");
             }
             out << ")";
+            break;
+        case PhysicalPlanType::NESTED_LOOP_JOIN:
+            out << pad << "NestedLoopJoin(left=" << node->table_name
+                << ", right=" << node->right_table_name
+                << ", on=" << node->join_left_column
+                << " = " << node->join_right_column << ")";
             break;
         case PhysicalPlanType::FILTER:
             out << pad << "Filter";

@@ -39,6 +39,7 @@ namespace sql
     {
         SEQ_SCAN,
         INDEX_SCAN,
+        NESTED_LOOP_JOIN,
         FILTER,
         PROJECTION
     };
@@ -52,6 +53,7 @@ namespace sql
 
         // Common context
         std::string table_name;
+        std::string right_table_name;
 
         // INDEX_SCAN
         std::string index_column;
@@ -61,6 +63,10 @@ namespace sql
         bool low_inclusive = true;
         std::optional<Value> high_key;
         bool high_inclusive = true;
+
+        // NESTED_LOOP_JOIN
+        std::string join_left_column;
+        std::string join_right_column;
 
         // FILTER
         const Expression *predicate = nullptr; // non-owning, refers to AST owned by Statement

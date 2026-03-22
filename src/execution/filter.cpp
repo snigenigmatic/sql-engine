@@ -14,6 +14,16 @@ namespace sql
             }
             return name.substr(dot + 1);
         }
+
+        std::string ExtractQualifier(const std::string &name)
+        {
+            size_t dot = name.find('.');
+            if (dot == std::string::npos)
+            {
+                return "";
+            }
+            return name.substr(0, dot);
+        }
     } // namespace
 
     void Filter::Open()
@@ -67,7 +77,33 @@ namespace sql
         case ExpressionType::COLUMN_REF:
         {
             const auto *col = static_cast<const ColumnExpression *>(expr);
-            int idx = table_->GetColumnIndex(StripQualifier(col->name));
+            int idx = table_->GetColumnIndex(col->name);
+            if (idx < 0)
+            {
+                const std::string stripped = StripQualifier(col->name);
+                const std::string qualifier = ExtractQualifier(col->name);
+                int matched_idx = -1;
+                const auto &columns = table_->GetSchema().GetColumns();
+                for (size_t i = 0; i < columns.size(); ++i)
+                {
+                    const auto &schema_col = columns[i].name;
+                    const std::string schema_stripped = StripQualifier(schema_col);
+                    if (schema_stripped != stripped)
+                    {
+                        continue;
+                    }
+                    if (!qualifier.empty() && ExtractQualifier(schema_col) != qualifier)
+                    {
+                        continue;
+                    }
+                    if (matched_idx >= 0)
+                    {
+                        throw std::runtime_error("Ambiguous column: " + col->name);
+                    }
+                    matched_idx = static_cast<int>(i);
+                }
+                idx = matched_idx;
+            }
             if (idx < 0)
             {
                 throw std::runtime_error("Unknown column: " + col->name);
