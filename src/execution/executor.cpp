@@ -269,7 +269,18 @@ namespace sql
             std::unique_ptr<Operator> plan = std::make_unique<NestedLoopJoin>(table, right, left_col, right_col);
             if (select->where)
             {
-                throw std::runtime_error("WHERE with JOIN is not supported yet");
+                std::vector<Column> join_columns;
+                join_columns.reserve(table->GetSchema().GetColumnCount() + right->GetSchema().GetColumnCount());
+                for (const auto &col : table->GetSchema().GetColumns())
+                {
+                    join_columns.emplace_back(col.name, col.type, col.length);
+                }
+                for (const auto &col : right->GetSchema().GetColumns())
+                {
+                    join_columns.emplace_back(col.name, col.type, col.length);
+                }
+                join_context_table_ = std::make_unique<Table>("__join_context__", Schema(std::move(join_columns)));
+                plan = std::make_unique<Filter>(std::move(plan), select->where.get(), join_context_table_.get());
             }
             if (select->select_star)
             {
@@ -292,6 +303,7 @@ namespace sql
             return std::make_unique<Projection>(std::move(plan), std::move(projection_indices), false);
         }
 
+        join_context_table_.reset();
         Optimizer optimizer;
         auto physical_plan = optimizer.BuildPhysicalPlan(select, catalog_);
         return BuildOperatorTree(physical_plan.get(), table, nullptr);

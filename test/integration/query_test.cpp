@@ -302,6 +302,32 @@ namespace sql
         ASSERT_EQ(result.column_names.size(), 4);
     }
 
+    TEST(IntegrationTest, InnerJoinWithWhereOnRightColumn)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount FLOAT);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (101, 1, 100.0), (102, 1, 50.0), (103, 2, 75.0), (104, 2, 10.0);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.amount FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 60.0;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 2);
+    }
+
+    TEST(IntegrationTest, InnerJoinWithWhereOnLeftColumn)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1), (20, 2), (30, 2);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE users.id = 2;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 2);
+    }
+
     TEST(IntegrationTest, IndexRemainsConsistentAfterInsert)
     {
         Catalog catalog;

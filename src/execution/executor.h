@@ -9,6 +9,7 @@
 #include "parser/ast.h"
 #include "optimizer/optimizer.h"
 #include "catalog/catalog.h"
+#include "storage/table.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -48,6 +49,7 @@ namespace sql
         int ResolveColumnIndexForSelect(const std::string &name, Table *base_table, Table *join_table, bool *from_join_table = nullptr) const;
 
         Catalog *catalog_;
+        std::unique_ptr<Table> join_context_table_;
     };
 
 } // namespace sql

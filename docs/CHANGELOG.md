@@ -5,7 +5,6 @@ All notable repository changes for this implementation cycle are listed below.
 ## 2026-03-22 - AST + Optimizer Foundation
 
 ### Added
-- `CHANGELOG.md` (this file)
 - AST introspection APIs in `src/parser/ast.h`:
   - `ExpressionTypeToString(...)`
   - `StatementTypeToString(...)`
@@ -30,6 +29,20 @@ All notable repository changes for this implementation cycle are listed below.
   - `BuildLogicalPlanForSelectStarWithoutWhere`
   - `BuildPhysicalPlanUsesIndexWhenAvailable`
   - `BuildPhysicalPlanFallsBackToSeqScanWithoutIndex`
+  - `BuildPhysicalPlanFallsBackToSeqScanOnTypeMismatch`
+- JOIN lexer/token support:
+  - Added `JOIN` keyword token.
+  - Added `DOT` delimiter token for qualified names.
+- Parser JOIN syntax support for:
+  - `SELECT ... FROM <table> JOIN <table> ON <left_col> = <right_col>;`
+  - Qualified columns like `users.id`.
+- New execution operator:
+  - `NestedLoopJoin` (`src/execution/nested_loop_join.h/.cpp`)
+- JOIN tests:
+  - Lexer tokenization for JOIN + qualified columns.
+  - Parser JOIN AST test.
+  - Integration tests for basic INNER JOIN and `SELECT *` JOIN.
+  - Integration tests for `JOIN + WHERE` on left/right table columns.
 
 ### Changed
 - `src/execution/executor.h`
@@ -42,8 +55,21 @@ All notable repository changes for this implementation cycle are listed below.
   - Added runtime physical-plan-to-operator translation:
     - `SeqScan`, `IndexScan`, `Filter`, `Projection`.
   - Centralized projection index resolution from planned projection columns.
+  - Added direct JOIN execution path using `NestedLoopJoin`.
+  - Added projection resolution for qualified columns and joined output tuples.
+  - Added support to strip column qualifiers (`table.col`) during expression evaluation.
+  - Enabled `JOIN + WHERE` by applying `Filter` on top of join output with a join-context schema.
 - `src/execution/filter.h`
   - Predicate pointer changed from mutable `Expression*` to `const Expression*` for safer non-owning use.
+- `src/parser/ast.h`
+  - `SelectStatement` now stores optional join metadata:
+    - `join_table`, `join_left_column`, `join_right_column`.
+- `src/parser/ast.cpp`
+  - AST dump now includes JOIN metadata in `SelectStatement` output.
+- `src/optimizer/optimizer.cpp`
+  - Optimizer currently rejects JOIN statements explicitly with clear errors (JOIN execution is handled directly in executor for now).
+- `src/execution/CMakeLists.txt`
+  - Execution CMake wiring updated to compile `nested_loop_join.cpp`.
 
 ### Fixed
 - Added a type-compatibility guard in physical index planning:
@@ -51,18 +77,10 @@ All notable repository changes for this implementation cycle are listed below.
   - Planner now validates `literal_value.GetType()` against indexed column `DataType` before choosing `INDEX_SCAN`.
   - On mismatch (for example `WHERE id = '2'` when `id` is `INTEGER`), planner now falls back to `SEQ_SCAN + FILTER` instead of building an index plan that can throw during BTree comparisons.
 
-### Added Tests
-- `test/parser/parser_test.cpp`
-  - `BuildPhysicalPlanFallsBackToSeqScanOnTypeMismatch`
-- `test/integration/query_test.cpp`
-  - `IndexedPredicateTypeMismatchFallsBackSafely`
-
 ### Validation
 - `cmake --build build && ctest --test-dir build --output-on-failure`
 - Result: all tests passing.
 
-
-
-### Deleted
-- No files deleted in this cycle.
-
+### Notes
+- Current JOIN support is `INNER JOIN ... ON left_col = right_col` for one join table.
+- JOIN planning is still executor-driven; optimizer JOIN nodes are the next step.
