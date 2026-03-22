@@ -62,6 +62,11 @@ namespace sql
 
     std::unique_ptr<LogicalPlanNode> Optimizer::BuildSelectLogicalPlan(const SelectStatement *select) const
     {
+        if (select->join_table.has_value())
+        {
+            throw std::runtime_error("Logical planner JOIN support is not implemented yet");
+        }
+
         auto scan = std::make_unique<LogicalPlanNode>(LogicalPlanType::SEQ_SCAN);
         scan->table_name = select->table;
 
@@ -161,6 +166,11 @@ namespace sql
 
     std::unique_ptr<PhysicalPlanNode> Optimizer::BuildSelectPhysicalPlan(const SelectStatement *select, Catalog *catalog) const
     {
+        if (select->join_table.has_value())
+        {
+            throw std::runtime_error("Physical planner JOIN support is not implemented yet");
+        }
+
         Table *table = catalog->GetTable(select->table);
         if (table == nullptr)
         {

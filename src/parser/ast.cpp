@@ -116,7 +116,14 @@ namespace sql
                 }
                 out << "]";
             }
-            out << ")\n";
+            out << ")";
+            if (select->join_table.has_value())
+            {
+                out << ", join=" << *select->join_table
+                    << ", on=" << select->join_left_column.value_or("")
+                    << " = " << select->join_right_column.value_or("");
+            }
+            out << "\n";
             out << "  where:\n";
             out << DumpExpression(select->where.get(), 2);
             break;

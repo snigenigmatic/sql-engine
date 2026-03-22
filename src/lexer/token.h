@@ -32,6 +32,7 @@ namespace sql
         OR,
         NOT,
         DROP,
+        JOIN,
 
         // Identifiers and Literals
         IDENTIFIER,
@@ -55,6 +56,7 @@ namespace sql
         LPAREN,
         RPAREN,
         COMMA,
+        DOT,
         SEMICOLON,
 
         // System

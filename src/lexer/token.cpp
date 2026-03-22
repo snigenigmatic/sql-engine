@@ -30,6 +30,7 @@ namespace sql
         case TokenType::OR: return "OR";
         case TokenType::NOT: return "NOT";
         case TokenType::DROP: return "DROP";
+        case TokenType::JOIN: return "JOIN";
         case TokenType::IDENTIFIER: return "IDENTIFIER";
         case TokenType::STRING_LITERAL: return "STRING_LITERAL";
         case TokenType::INTEGER_LITERAL: return "INTEGER_LITERAL";
@@ -47,6 +48,7 @@ namespace sql
         case TokenType::LPAREN: return "LPAREN";
         case TokenType::RPAREN: return "RPAREN";
         case TokenType::COMMA: return "COMMA";
+        case TokenType::DOT: return "DOT";
         case TokenType::SEMICOLON: return "SEMICOLON";
         case TokenType::END_OF_FILE: return "EOF";
         case TokenType::ILLEGAL: return "ILLEGAL";

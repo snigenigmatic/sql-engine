@@ -4,6 +4,7 @@ add_library(execution
     filter.cpp
     projection.cpp
     index_scan.cpp
+    nested_loop_join.cpp
 )
 
 target_link_libraries(execution PUBLIC optimizer storage common)

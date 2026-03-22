@@ -71,14 +71,25 @@ namespace sql
         {
             do
             {
-                Token col = Expect(TokenType::IDENTIFIER);
-                stmt->columns.push_back(col.value);
+                stmt->columns.push_back(ParseQualifiedColumnName());
             } while (Match(TokenType::COMMA));
         }
 
         Expect(TokenType::FROM);
         Token table = Expect(TokenType::IDENTIFIER);
         stmt->table = table.value;
+
+        if (Match(TokenType::JOIN))
+        {
+            Token join_table = Expect(TokenType::IDENTIFIER);
+            stmt->join_table = join_table.value;
+            Expect(TokenType::ON);
+            std::string left = ParseQualifiedColumnName();
+            Expect(TokenType::EQ);
+            std::string right = ParseQualifiedColumnName();
+            stmt->join_left_column = left;
+            stmt->join_right_column = right;
+        }
 
         if (Match(TokenType::WHERE))
         {
@@ -298,7 +309,16 @@ namespace sql
         switch (t.type)
         {
         case TokenType::IDENTIFIER:
-            return std::make_unique<ColumnExpression>(t.value);
+        {
+            std::string name = t.value;
+            if (current_token_.type == TokenType::DOT)
+            {
+                NextToken(); // consume dot
+                Token rhs = Expect(TokenType::IDENTIFIER);
+                name += "." + rhs.value;
+            }
+            return std::make_unique<ColumnExpression>(name);
+        }
         case TokenType::INTEGER_LITERAL:
             return std::make_unique<LiteralExpression>(Value(std::stoi(t.value)));
         case TokenType::STRING_LITERAL:
@@ -329,6 +349,18 @@ namespace sql
         default:
             throw std::runtime_error("Unexpected token in expression: " + t.value);
         }
+    }
+
+    std::string Parser::ParseQualifiedColumnName()
+    {
+        Token first = Expect(TokenType::IDENTIFIER);
+        std::string name = first.value;
+        if (Match(TokenType::DOT))
+        {
+            Token second = Expect(TokenType::IDENTIFIER);
+            name += "." + second.value;
+        }
+        return name;
     }
 
 } // namespace sql

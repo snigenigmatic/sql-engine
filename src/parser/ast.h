@@ -71,6 +71,9 @@ namespace sql
     struct SelectStatement : public Statement
     {
         std::string table;
+        std::optional<std::string> join_table;
+        std::optional<std::string> join_left_column;
+        std::optional<std::string> join_right_column;
         std::vector<std::string> columns;
         bool select_star = false;
         std::unique_ptr<Expression> where;

@@ -272,6 +272,36 @@ namespace sql
         EXPECT_EQ(result.tuples.size(), 0);
     }
 
+    TEST(IntegrationTest, InnerJoinBasic)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER, amount FLOAT);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (101, 1, 100.0), (102, 1, 50.0), (103, 2, 75.0), (104, 4, 200.0);");
+
+        auto result = RunSQL(catalog, "SELECT users.id, orders.amount FROM users JOIN orders ON users.id = orders.user_id;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 3);
+        ASSERT_EQ(result.column_names.size(), 2);
+        EXPECT_EQ(result.column_names[0], "id");
+        EXPECT_EQ(result.column_names[1], "amount");
+    }
+
+    TEST(IntegrationTest, InnerJoinSelectStar)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE users (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, user_id INTEGER);");
+        RunSQL(catalog, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');");
+        RunSQL(catalog, "INSERT INTO orders VALUES (10, 1), (20, 2), (30, 2);");
+
+        auto result = RunSQL(catalog, "SELECT * FROM users JOIN orders ON users.id = orders.user_id;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 3);
+        ASSERT_EQ(result.column_names.size(), 4);
+    }
+
     TEST(IntegrationTest, IndexRemainsConsistentAfterInsert)
     {
         Catalog catalog;

@@ -3,6 +3,18 @@
 
 namespace sql
 {
+    namespace
+    {
+        std::string StripQualifier(const std::string &name)
+        {
+            size_t dot = name.find('.');
+            if (dot == std::string::npos)
+            {
+                return name;
+            }
+            return name.substr(dot + 1);
+        }
+    } // namespace
 
     void Filter::Open()
     {
@@ -55,7 +67,7 @@ namespace sql
         case ExpressionType::COLUMN_REF:
         {
             const auto *col = static_cast<const ColumnExpression *>(expr);
-            int idx = table_->GetColumnIndex(col->name);
+            int idx = table_->GetColumnIndex(StripQualifier(col->name));
             if (idx < 0)
             {
                 throw std::runtime_error("Unknown column: " + col->name);

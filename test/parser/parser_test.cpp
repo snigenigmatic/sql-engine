@@ -373,4 +373,27 @@ namespace sql
         EXPECT_EQ(explain.find("IndexScan("), std::string::npos);
     }
 
+    TEST(ParserTest, ParseSelectWithJoin)
+    {
+        std::string sql = "SELECT users.id, orders.amount FROM users JOIN orders ON users.id = orders.user_id;";
+        Lexer lexer(sql);
+        Parser parser(lexer);
+
+        auto stmt = parser.ParseStatement();
+        ASSERT_NE(stmt, nullptr);
+        ASSERT_EQ(stmt->GetType(), StatementType::SELECT);
+        auto select = static_cast<SelectStatement *>(stmt.get());
+
+        EXPECT_EQ(select->table, "users");
+        ASSERT_TRUE(select->join_table.has_value());
+        EXPECT_EQ(*select->join_table, "orders");
+        ASSERT_TRUE(select->join_left_column.has_value());
+        ASSERT_TRUE(select->join_right_column.has_value());
+        EXPECT_EQ(*select->join_left_column, "users.id");
+        EXPECT_EQ(*select->join_right_column, "orders.user_id");
+        ASSERT_EQ(select->columns.size(), 2);
+        EXPECT_EQ(select->columns[0], "users.id");
+        EXPECT_EQ(select->columns[1], "orders.amount");
+    }
+
 } // namespace sql
