@@ -258,6 +258,8 @@ namespace sql
             return ExecuteCreateIndex(static_cast<CreateIndexStatement *>(stmt));
         case StatementType::DROP_TABLE:
             return ExecuteDropTable(static_cast<DropTableStatement *>(stmt));
+        case StatementType::EXPLAIN_STMT:
+            return ExecuteExplain(static_cast<ExplainStatement *>(stmt));
         default:
             return {false, "Unsupported statement type", {}, {}};
         }
@@ -388,6 +390,36 @@ namespace sql
             EnsureJoinContextTable(left, right);
             return std::make_unique<HashJoin>(left, right, left_col, right_col, node->join_build_right);
         }
+        case PhysicalPlanType::INDEX_NESTED_LOOP_JOIN:
+        {
+            Table *left = catalog_->GetTable(node->table_name);
+            Table *right = catalog_->GetTable(node->right_table_name);
+            if (left == nullptr || right == nullptr)
+                throw std::runtime_error("JOIN table not found while building operator tree");
+
+            // Resolve which ON-clause column belongs to which table (handles swapped ON order).
+            const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
+
+            // join_right_as_outer: true → right is outer, left is inner (has index)
+            //                      false → left is outer, right is inner (has index)
+            const bool right_is_outer = node->join_right_as_outer;
+            Table *outer_table = right_is_outer ? right : left;
+            Table *inner_table = right_is_outer ? left : right;
+            const std::string outer_col = right_is_outer ? right_col : left_col;
+            const std::string inner_col = right_is_outer ? left_col : right_col;
+            const std::string &inner_table_name = right_is_outer ? node->table_name : node->right_table_name;
+
+            BTree *inner_index = catalog_->GetIndex(inner_table_name, inner_col);
+            if (inner_index == nullptr)
+                throw std::runtime_error("Expected index not found on " + inner_table_name + "." + inner_col);
+
+            EnsureJoinContextTable(left, right);
+            // outer_is_left: left table is outer when right_is_outer=false
+            const bool outer_is_left = !right_is_outer;
+            return std::make_unique<IndexNestedLoopJoin>(
+                outer_table, inner_table, inner_index,
+                outer_col, inner_col, outer_is_left);
+        }
         case PhysicalPlanType::FILTER:
         {
             if (node->children.empty())
@@ -408,7 +440,8 @@ namespace sql
             auto child = BuildOperatorTree(node->children[0].get(), table, join_table);
             Table *projection_join_table = join_table;
             if (node->children[0]->type == PhysicalPlanType::NESTED_LOOP_JOIN ||
-                node->children[0]->type == PhysicalPlanType::HASH_JOIN)
+                node->children[0]->type == PhysicalPlanType::HASH_JOIN ||
+                node->children[0]->type == PhysicalPlanType::INDEX_NESTED_LOOP_JOIN)
             {
                 projection_join_table = catalog_->GetTable(node->children[0]->right_table_name);
             }
@@ -690,6 +723,26 @@ namespace sql
         if (!catalog_->DropTable(drop->table))
             return {false, "Table '" + drop->table + "' does not exist.", {}, {}};
         return {true, "Table '" + drop->table + "' dropped.", {}, {}};
+    }
+
+    ExecutionResult Executor::ExecuteExplain(ExplainStatement *explain)
+    {
+        ExecutionResult result;
+        try
+        {
+            materialized_tables_.clear();
+            join_context_table_.reset();
+            Optimizer optimizer;
+            auto physical_plan = optimizer.BuildPhysicalPlan(explain->select.get(), catalog_);
+            result.success = true;
+            result.message = optimizer.ExplainPhysicalPlan(physical_plan.get());
+        }
+        catch (const std::exception &e)
+        {
+            result.success = false;
+            result.message = e.what();
+        }
+        return result;
     }
 
 } // namespace sql

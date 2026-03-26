@@ -22,6 +22,7 @@ namespace sql
 
         std::unique_ptr<Statement> ParseCreate();
         std::unique_ptr<SelectStatement> ParseSelect();
+        std::unique_ptr<ExplainStatement> ParseExplain();
         std::unique_ptr<CreateTableStatement> ParseCreateTable();
         std::unique_ptr<CreateIndexStatement> ParseCreateIndex();
         std::unique_ptr<DropTableStatement> ParseDropTable();

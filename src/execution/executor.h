@@ -7,6 +7,7 @@
 #include "execution/index_scan.h"
 #include "execution/nested_loop_join.h"
 #include "execution/hash_join.h"
+#include "execution/index_nested_loop_join.h"
 #include "parser/ast.h"
 #include "optimizer/optimizer.h"
 #include "catalog/catalog.h"
@@ -44,6 +45,7 @@ namespace sql
         ExecutionResult ExecuteUpdate(UpdateStatement *update);
         ExecutionResult ExecuteCreateIndex(CreateIndexStatement *create);
         ExecutionResult ExecuteDropTable(DropTableStatement *drop);
+        ExecutionResult ExecuteExplain(ExplainStatement *explain);
 
         // Evaluate an expression (reused for INSERT values, UPDATE SET, etc.)
         Value EvaluateExpr(const Expression *expr, const Tuple *tuple = nullptr, Table *table = nullptr) const;

@@ -41,6 +41,7 @@ namespace sql
         INDEX_SCAN,
         NESTED_LOOP_JOIN,
         HASH_JOIN,
+        INDEX_NESTED_LOOP_JOIN,
         FILTER,
         PROJECTION
     };
@@ -65,10 +66,10 @@ namespace sql
         std::optional<Value> high_key;
         bool high_inclusive = true;
 
-        // NESTED_LOOP_JOIN
+        // NESTED_LOOP_JOIN / HASH_JOIN / INDEX_NESTED_LOOP_JOIN
         std::string join_left_column;
         std::string join_right_column;
-        bool join_right_as_outer = false;
+        bool join_right_as_outer = false; // NLJ: right is outer loop; INLJ: right is outer (left has index)
 
         // HASH_JOIN
         bool join_build_right = true;

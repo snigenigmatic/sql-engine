@@ -59,7 +59,8 @@ namespace sql
         INSERT,
         CREATE_INDEX,
         DELETE_STMT,
-        UPDATE_STMT
+        UPDATE_STMT,
+        EXPLAIN_STMT
     };
 
     struct Statement
@@ -128,6 +129,12 @@ namespace sql
         std::vector<std::pair<std::string, std::unique_ptr<Expression>>> assignments; // SET col = expr
         std::unique_ptr<Expression> where;
         StatementType GetType() const override { return StatementType::UPDATE_STMT; }
+    };
+
+    struct ExplainStatement : public Statement
+    {
+        std::unique_ptr<SelectStatement> select;
+        StatementType GetType() const override { return StatementType::EXPLAIN_STMT; }
     };
 
     std::string ExpressionTypeToString(ExpressionType type);

@@ -33,6 +33,8 @@ namespace sql
         NOT,
         DROP,
         JOIN,
+        EXPLAIN,
+        INNER,
 
         // Identifiers and Literals
         IDENTIFIER,
