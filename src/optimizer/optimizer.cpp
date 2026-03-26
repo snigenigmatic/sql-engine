@@ -386,26 +386,53 @@ namespace sql
             const size_t left_count = table->GetTupleCount();
             const size_t right_count = right_table->GetTupleCount();
 
-            // Check if either join column has an index → prefer INDEX_NESTED_LOOP_JOIN.
-            const std::string left_col_unq = StripQualifier(*select->join_left_column);
-            const std::string right_col_unq = StripQualifier(*select->join_right_column);
-            BTree *left_index = catalog->GetIndex(select->table, left_col_unq);
-            BTree *right_index = catalog->GetIndex(*select->join_table, right_col_unq);
+            // Resolve which join column belongs to which table.
+            // The ON clause may have columns in either order (e.g., ON right.x = left.y),
+            // so we must check before looking up indexes.
+            const auto left_side = ResolveColumnSide(*select->join_left_column,
+                                                      select->table, *select->join_table,
+                                                      table, right_table);
+            const auto right_side = ResolveColumnSide(*select->join_right_column,
+                                                       select->table, *select->join_table,
+                                                       table, right_table);
 
+            // Determine the actual column name for each table side.
+            std::string col_on_left_table;  // column belonging to select->table
+            std::string col_on_right_table; // column belonging to select->join_table
+            if (left_side == PredicateTableSide::LEFT && right_side == PredicateTableSide::RIGHT)
+            {
+                col_on_left_table = StripQualifier(*select->join_left_column);
+                col_on_right_table = StripQualifier(*select->join_right_column);
+            }
+            else if (left_side == PredicateTableSide::RIGHT && right_side == PredicateTableSide::LEFT)
+            {
+                col_on_left_table = StripQualifier(*select->join_right_column);
+                col_on_right_table = StripQualifier(*select->join_left_column);
+            }
+            // else: ambiguous or unresolved — skip INLJ
+
+            // Check if either join column has an index → prefer INDEX_NESTED_LOOP_JOIN.
             std::unique_ptr<PhysicalPlanNode> join;
-            if (right_index != nullptr)
+            if (!col_on_left_table.empty() && !col_on_right_table.empty())
             {
-                // Right side has index → right is inner, left is outer.
-                join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_NESTED_LOOP_JOIN);
-                join->join_right_as_outer = false; // left is outer
+                BTree *left_index = catalog->GetIndex(select->table, col_on_left_table);
+                BTree *right_index = catalog->GetIndex(*select->join_table, col_on_right_table);
+
+                if (right_index != nullptr)
+                {
+                    // Right table has index → right is inner, left is outer.
+                    join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_NESTED_LOOP_JOIN);
+                    join->join_right_as_outer = false; // left is outer
+                }
+                else if (left_index != nullptr)
+                {
+                    // Left table has index → left is inner, right is outer.
+                    join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_NESTED_LOOP_JOIN);
+                    join->join_right_as_outer = true; // right is outer
+                }
             }
-            else if (left_index != nullptr)
-            {
-                // Left side has index → left is inner, right is outer.
-                join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_NESTED_LOOP_JOIN);
-                join->join_right_as_outer = true; // right is outer
-            }
-            else
+
+            if (join == nullptr)
             {
                 // Rule-based choice between HASH_JOIN and NESTED_LOOP_JOIN.
                 const size_t total_rows = left_count + right_count;

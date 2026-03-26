@@ -526,6 +526,26 @@ namespace sql
         EXPECT_NE(explain.message.find("IndexNestedLoopJoin"), std::string::npos);
     }
 
+    TEST(IntegrationTest, IndexNestedLoopJoinSwappedOnColumns)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE orders (oid INTEGER, cid INTEGER);");
+        RunSQL(catalog, "CREATE TABLE customers (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "INSERT INTO orders VALUES (1, 10), (2, 20), (3, 10);");
+        RunSQL(catalog, "INSERT INTO customers VALUES (10, 'Alice'), (20, 'Bob');");
+        RunSQL(catalog, "CREATE INDEX idx_cid ON customers (id);");
+
+        // ON clause has columns in reverse order: right table column first.
+        auto result = RunSQL(catalog, "SELECT * FROM orders JOIN customers ON customers.id = orders.cid;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 3);
+
+        // EXPLAIN should still pick IndexNestedLoopJoin despite swapped ON order.
+        auto explain = RunSQL(catalog, "EXPLAIN SELECT * FROM orders JOIN customers ON customers.id = orders.cid;");
+        EXPECT_TRUE(explain.success);
+        EXPECT_NE(explain.message.find("IndexNestedLoopJoin"), std::string::npos);
+    }
+
     TEST(IntegrationTest, InnerJoinSyntax)
     {
         Catalog catalog;

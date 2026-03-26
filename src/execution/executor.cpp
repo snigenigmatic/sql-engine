@@ -397,17 +397,17 @@ namespace sql
             if (left == nullptr || right == nullptr)
                 throw std::runtime_error("JOIN table not found while building operator tree");
 
+            // Resolve which ON-clause column belongs to which table (handles swapped ON order).
+            const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
+
             // join_right_as_outer: true → right is outer, left is inner (has index)
             //                      false → left is outer, right is inner (has index)
             const bool right_is_outer = node->join_right_as_outer;
             Table *outer_table = right_is_outer ? right : left;
             Table *inner_table = right_is_outer ? left : right;
-            const std::string &outer_col_raw = right_is_outer ? node->join_right_column : node->join_left_column;
-            const std::string &inner_col_raw = right_is_outer ? node->join_left_column : node->join_right_column;
+            const std::string outer_col = right_is_outer ? right_col : left_col;
+            const std::string inner_col = right_is_outer ? left_col : right_col;
             const std::string &inner_table_name = right_is_outer ? node->table_name : node->right_table_name;
-
-            const std::string outer_col = StripQualifier(outer_col_raw);
-            const std::string inner_col = StripQualifier(inner_col_raw);
 
             BTree *inner_index = catalog_->GetIndex(inner_table_name, inner_col);
             if (inner_index == nullptr)
