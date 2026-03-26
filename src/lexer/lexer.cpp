@@ -268,6 +268,8 @@ namespace sql
              {"NOT", TokenType::NOT},
              {"DROP", TokenType::DROP},
              {"JOIN", TokenType::JOIN},
+             {"INNER", TokenType::INNER},
+             {"EXPLAIN", TokenType::EXPLAIN},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

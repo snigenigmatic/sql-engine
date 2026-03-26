@@ -53,6 +53,8 @@ namespace sql
             return ParseUpdate();
         case TokenType::DROP:
             return ParseDropTable();
+        case TokenType::EXPLAIN:
+            return ParseExplain();
         default:
             throw std::runtime_error("Unexpected token at start of statement: " + current_token_.value);
         }
@@ -79,7 +81,18 @@ namespace sql
         Token table = Expect(TokenType::IDENTIFIER);
         stmt->table = table.value;
 
-        if (Match(TokenType::JOIN))
+        bool has_join = false;
+        if (Match(TokenType::INNER))
+        {
+            Expect(TokenType::JOIN);
+            has_join = true;
+        }
+        else if (Match(TokenType::JOIN))
+        {
+            has_join = true;
+        }
+
+        if (has_join)
         {
             Token join_table = Expect(TokenType::IDENTIFIER);
             stmt->join_table = join_table.value;
@@ -361,6 +374,14 @@ namespace sql
             name += "." + second.value;
         }
         return name;
+    }
+
+    std::unique_ptr<ExplainStatement> Parser::ParseExplain()
+    {
+        Expect(TokenType::EXPLAIN);
+        auto stmt = std::make_unique<ExplainStatement>();
+        stmt->select = ParseSelect();
+        return stmt;
     }
 
 } // namespace sql

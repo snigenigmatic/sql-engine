@@ -6,6 +6,7 @@ add_library(execution
     index_scan.cpp
     nested_loop_join.cpp
     hash_join.cpp
+    index_nested_loop_join.cpp
 )
 
 target_link_libraries(execution PUBLIC optimizer storage common)

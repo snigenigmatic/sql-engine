@@ -462,4 +462,81 @@ namespace sql
         EXPECT_EQ(result.tuples[0].GetValue(1).GetAsInt(), 99);
     }
 
+    // ── EXPLAIN ───────────────────────────────────────────────────────────────────
+
+    TEST(IntegrationTest, ExplainSeqScan)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, name VARCHAR(50));");
+        auto result = RunSQL(catalog, "EXPLAIN SELECT * FROM t;");
+        EXPECT_TRUE(result.success);
+        EXPECT_NE(result.message.find("SeqScan"), std::string::npos);
+        EXPECT_NE(result.message.find("Projection"), std::string::npos);
+    }
+
+    TEST(IntegrationTest, ExplainIndexScan)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (1), (2), (3);");
+        RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
+        auto result = RunSQL(catalog, "EXPLAIN SELECT * FROM t WHERE id = 2;");
+        EXPECT_TRUE(result.success);
+        EXPECT_NE(result.message.find("IndexScan"), std::string::npos);
+    }
+
+    TEST(IntegrationTest, ExplainJoin)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE orders (id INTEGER, cid INTEGER);");
+        RunSQL(catalog, "CREATE TABLE customers (id INTEGER, name VARCHAR(50));");
+        auto result = RunSQL(catalog, "EXPLAIN SELECT * FROM orders JOIN customers ON orders.cid = customers.id;");
+        EXPECT_TRUE(result.success);
+        // Without index: should be hash or nested loop join
+        EXPECT_TRUE(result.message.find("Join") != std::string::npos);
+    }
+
+    // ── INDEX NESTED-LOOP JOIN ────────────────────────────────────────────────────
+
+    TEST(IntegrationTest, IndexNestedLoopJoinBasic)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE orders (oid INTEGER, cid INTEGER);");
+        RunSQL(catalog, "CREATE TABLE customers (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "INSERT INTO orders VALUES (1, 10), (2, 20), (3, 10);");
+        RunSQL(catalog, "INSERT INTO customers VALUES (10, 'Alice'), (20, 'Bob');");
+        RunSQL(catalog, "CREATE INDEX idx_cid ON customers (id);");
+
+        auto result = RunSQL(catalog, "SELECT * FROM orders JOIN customers ON orders.cid = customers.id;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 3);
+    }
+
+    TEST(IntegrationTest, IndexNestedLoopJoinExplain)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE orders (oid INTEGER, cid INTEGER);");
+        RunSQL(catalog, "CREATE TABLE customers (id INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "INSERT INTO orders VALUES (1, 10);");
+        RunSQL(catalog, "INSERT INTO customers VALUES (10, 'Alice');");
+        RunSQL(catalog, "CREATE INDEX idx_cid ON customers (id);");
+
+        auto explain = RunSQL(catalog, "EXPLAIN SELECT * FROM orders JOIN customers ON orders.cid = customers.id;");
+        EXPECT_TRUE(explain.success);
+        EXPECT_NE(explain.message.find("IndexNestedLoopJoin"), std::string::npos);
+    }
+
+    TEST(IntegrationTest, InnerJoinSyntax)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE a (id INTEGER, val INTEGER);");
+        RunSQL(catalog, "CREATE TABLE b (aid INTEGER, name VARCHAR(50));");
+        RunSQL(catalog, "INSERT INTO a VALUES (1, 100), (2, 200);");
+        RunSQL(catalog, "INSERT INTO b VALUES (1, 'x'), (2, 'y');");
+
+        auto result = RunSQL(catalog, "SELECT * FROM a INNER JOIN b ON a.id = b.aid;");
+        EXPECT_TRUE(result.success);
+        ASSERT_EQ(result.tuples.size(), 2);
+    }
+
 } // namespace sql

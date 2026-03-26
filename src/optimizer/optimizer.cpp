@@ -386,22 +386,42 @@ namespace sql
             const size_t left_count = table->GetTupleCount();
             const size_t right_count = right_table->GetTupleCount();
 
-            // Rule-based join choice:
-            // - HASH_JOIN for larger equi-joins
-            // - NESTED_LOOP_JOIN for small inputs
-            const size_t total_rows = left_count + right_count;
-            const bool use_hash_join = total_rows >= 16;
+            // Check if either join column has an index → prefer INDEX_NESTED_LOOP_JOIN.
+            const std::string left_col_unq = StripQualifier(*select->join_left_column);
+            const std::string right_col_unq = StripQualifier(*select->join_right_column);
+            BTree *left_index = catalog->GetIndex(select->table, left_col_unq);
+            BTree *right_index = catalog->GetIndex(*select->join_table, right_col_unq);
 
-            auto join = std::make_unique<PhysicalPlanNode>(
-                use_hash_join ? PhysicalPlanType::HASH_JOIN : PhysicalPlanType::NESTED_LOOP_JOIN);
+            std::unique_ptr<PhysicalPlanNode> join;
+            if (right_index != nullptr)
+            {
+                // Right side has index → right is inner, left is outer.
+                join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_NESTED_LOOP_JOIN);
+                join->join_right_as_outer = false; // left is outer
+            }
+            else if (left_index != nullptr)
+            {
+                // Left side has index → left is inner, right is outer.
+                join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_NESTED_LOOP_JOIN);
+                join->join_right_as_outer = true; // right is outer
+            }
+            else
+            {
+                // Rule-based choice between HASH_JOIN and NESTED_LOOP_JOIN.
+                const size_t total_rows = left_count + right_count;
+                const bool use_hash_join = total_rows >= 16;
+                join = std::make_unique<PhysicalPlanNode>(
+                    use_hash_join ? PhysicalPlanType::HASH_JOIN : PhysicalPlanType::NESTED_LOOP_JOIN);
+                // Iterate smaller table in outer loop for nested loop.
+                join->join_right_as_outer = right_count < left_count;
+                // Build hash table on smaller side for hash join.
+                join->join_build_right = right_count <= left_count;
+            }
+
             join->table_name = select->table;
             join->right_table_name = *select->join_table;
             join->join_left_column = *select->join_left_column;
             join->join_right_column = *select->join_right_column;
-            // Rule-based choice: iterate smaller table in outer loop for nested loop.
-            join->join_right_as_outer = right_count < left_count;
-            // Rule-based choice: build hash table on smaller side for hash join.
-            join->join_build_right = right_count <= left_count;
             join->children.push_back(std::move(left_input));
             join->children.push_back(std::move(right_input));
             current = std::move(join);
@@ -484,6 +504,19 @@ namespace sql
                 << ", build=" << (node->join_build_right ? "right" : "left")
                 << ")";
             break;
+        case PhysicalPlanType::INDEX_NESTED_LOOP_JOIN:
+        {
+            const std::string &outer = node->join_right_as_outer ? node->right_table_name : node->table_name;
+            const std::string &inner = node->join_right_as_outer ? node->table_name : node->right_table_name;
+            const std::string &inner_col = node->join_right_as_outer ? node->join_left_column : node->join_right_column;
+            out << pad << "IndexNestedLoopJoin(outer=" << outer
+                << ", inner=" << inner
+                << "(index on " << inner_col << ")"
+                << ", on=" << node->join_left_column
+                << " = " << node->join_right_column
+                << ")";
+            break;
+        }
         case PhysicalPlanType::FILTER:
             out << pad << "Filter";
             if (node->predicate != nullptr)
