@@ -150,7 +150,8 @@ ctest --test-dir build --output-on-failure --verbose
   - [x] Add `EXPLAIN` command in REPL to print physical plan (`SeqScan`/`IndexScan`/`Join` path)
   - [x] Add join-condition index matching (`IndexNestedLoopJoin` when index exists on join column)
 - [ ] **Phase 6**: Transactions
-
+### Extra Goal
+- [ ] **Distributed Query Processing**
 ## Architecture
 
 See [docs/design.md](docs/design.md) for detailed architecture documentation.
