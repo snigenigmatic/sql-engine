@@ -29,6 +29,7 @@ namespace sql
         std::unique_ptr<InsertStatement> ParseInsert();
         std::unique_ptr<DeleteStatement> ParseDelete();
         std::unique_ptr<UpdateStatement> ParseUpdate();
+        std::unique_ptr<TransactionStatement> ParseTransaction();
 
         std::unique_ptr<Expression> ParseExpression();
         std::unique_ptr<Expression> ParseTerm();

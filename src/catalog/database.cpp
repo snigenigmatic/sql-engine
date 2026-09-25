@@ -1,4 +1,5 @@
 #include "catalog/database.h"
+#include <functional>
 #include <stdexcept>
 
 namespace sql
@@ -81,6 +82,24 @@ namespace sql
 
     bool Database::Rollback(std::string *error)
     {
+        return Restore([this] { return pager_->Rollback(); }, error);
+    }
+
+    bool Database::CreateSavepoint(Pager::Savepoint *savepoint)
+    {
+        if (!bpm_->WriteDirtyPages())
+            return false;
+        *savepoint = pager_->CreateSavepoint();
+        return true;
+    }
+
+    bool Database::RollbackTo(const Pager::Savepoint &savepoint, std::string *error)
+    {
+        return Restore([this, &savepoint] { return pager_->RollbackTo(savepoint); }, error);
+    }
+
+    bool Database::Restore(const std::function<bool()> &rollback_pager, std::string *error)
+    {
         auto fail = [&](const std::string &message)
         {
             if (error)
@@ -92,7 +111,7 @@ namespace sql
             return fail("rollback is not supported for in-memory databases");
         if (!bpm_->DiscardAll())
             return fail("cannot roll back while pages are in use");
-        if (!pager_->Rollback())
+        if (!rollback_pager())
             return fail("rollback failed: " + pager_->GetLastError());
 
         // Tables, indexes and cached counts are rebuilt from the rolled-back

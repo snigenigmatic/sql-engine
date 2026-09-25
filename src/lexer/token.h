@@ -35,6 +35,10 @@ namespace sql
         JOIN,
         EXPLAIN,
         INNER,
+        BEGIN,
+        COMMIT,
+        ROLLBACK,
+        TRANSACTION,
 
         // Identifiers and Literals
         IDENTIFIER,

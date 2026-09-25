@@ -270,6 +270,10 @@ namespace sql
              {"JOIN", TokenType::JOIN},
              {"INNER", TokenType::INNER},
              {"EXPLAIN", TokenType::EXPLAIN},
+             {"BEGIN", TokenType::BEGIN},
+             {"COMMIT", TokenType::COMMIT},
+             {"ROLLBACK", TokenType::ROLLBACK},
+             {"TRANSACTION", TokenType::TRANSACTION},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

@@ -62,6 +62,19 @@ namespace sql
         // Discard frames appended since the last commit
         bool Rollback();
 
+        // A point inside the open transaction that it can be rolled back to
+        struct Savepoint
+        {
+            uint64_t frame_count = 0;
+            uint64_t checksum = 0;
+            std::unordered_map<page_id_t, uint64_t> pending;
+        };
+        Savepoint CreateSavepoint() const { return {frame_count_, running_checksum_, pending_}; }
+
+        // Discard frames appended after the savepoint. Fails if a commit
+        // happened since it was taken.
+        bool RollbackTo(const Savepoint &savepoint);
+
         // Empty the log (after a checkpoint) and start a new generation
         bool Reset();
 

@@ -293,6 +293,16 @@ namespace sql
         return ftruncate(fd_, static_cast<off_t>(FrameOffset(frame_count_))) == 0;
     }
 
+    bool WriteAheadLog::RollbackTo(const Savepoint &savepoint)
+    {
+        if (fd_ < 0 || savepoint.frame_count < committed_frames_ || savepoint.frame_count > frame_count_)
+            return false;
+        pending_ = savepoint.pending;
+        frame_count_ = savepoint.frame_count;
+        running_checksum_ = savepoint.checksum;
+        return ftruncate(fd_, static_cast<off_t>(FrameOffset(frame_count_))) == 0;
+    }
+
     bool WriteAheadLog::ReadFrameData(uint64_t frame_no, char *out) const
     {
         return fd_ >= 0 && frame_no < frame_count_ &&

@@ -31,6 +31,12 @@ namespace sql
         case TokenType::NOT: return "NOT";
         case TokenType::DROP: return "DROP";
         case TokenType::JOIN: return "JOIN";
+        case TokenType::EXPLAIN: return "EXPLAIN";
+        case TokenType::INNER: return "INNER";
+        case TokenType::BEGIN: return "BEGIN";
+        case TokenType::COMMIT: return "COMMIT";
+        case TokenType::ROLLBACK: return "ROLLBACK";
+        case TokenType::TRANSACTION: return "TRANSACTION";
         case TokenType::IDENTIFIER: return "IDENTIFIER";
         case TokenType::STRING_LITERAL: return "STRING_LITERAL";
         case TokenType::INTEGER_LITERAL: return "INTEGER_LITERAL";
