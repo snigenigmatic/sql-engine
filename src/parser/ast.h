@@ -17,8 +17,11 @@ namespace sql
         LITERAL,
         COLUMN_REF,
         BINARY_OP,
-        UNARY_OP, // NOT
-        IS_NULL   // IS NULL / IS NOT NULL
+        UNARY_OP, // NOT, unary minus
+        IS_NULL,  // IS NULL / IS NOT NULL
+        LIKE,     // [NOT] LIKE
+        IN_LIST,  // [NOT] IN (...)
+        BETWEEN   // [NOT] BETWEEN ... AND ...
     };
 
     struct Expression
@@ -67,6 +70,38 @@ namespace sql
         ExpressionType GetType() const override { return ExpressionType::IS_NULL; }
     };
 
+    struct LikeExpression : public Expression
+    {
+        std::unique_ptr<Expression> value;
+        std::unique_ptr<Expression> pattern; // % matches any run, _ any one character
+        bool negated;
+        LikeExpression(std::unique_ptr<Expression> v, std::unique_ptr<Expression> p, bool n)
+            : value(std::move(v)), pattern(std::move(p)), negated(n) {}
+        ExpressionType GetType() const override { return ExpressionType::LIKE; }
+    };
+
+    struct InListExpression : public Expression
+    {
+        std::unique_ptr<Expression> operand;
+        std::vector<std::unique_ptr<Expression>> list;
+        bool negated;
+        InListExpression(std::unique_ptr<Expression> o, std::vector<std::unique_ptr<Expression>> l, bool n)
+            : operand(std::move(o)), list(std::move(l)), negated(n) {}
+        ExpressionType GetType() const override { return ExpressionType::IN_LIST; }
+    };
+
+    struct BetweenExpression : public Expression
+    {
+        std::unique_ptr<Expression> operand;
+        std::unique_ptr<Expression> low;
+        std::unique_ptr<Expression> high;
+        bool negated;
+        BetweenExpression(std::unique_ptr<Expression> o, std::unique_ptr<Expression> l, std::unique_ptr<Expression> h,
+                          bool n)
+            : operand(std::move(o)), low(std::move(l)), high(std::move(h)), negated(n) {}
+        ExpressionType GetType() const override { return ExpressionType::BETWEEN; }
+    };
+
     // --- Statements ---
 
     enum class StatementType
@@ -88,14 +123,33 @@ namespace sql
         virtual StatementType GetType() const = 0;
     };
 
+    // One entry of a SELECT list: an expression and its optional alias
+    struct SelectItem
+    {
+        std::unique_ptr<Expression> expr;
+        std::string alias; // empty if none
+    };
+
     struct SelectStatement : public Statement
     {
         std::string table;
         std::optional<std::string> join_table;
         std::optional<std::string> join_left_column;
         std::optional<std::string> join_right_column;
-        std::vector<std::string> columns;
+        std::vector<SelectItem> items;    // the SELECT list (empty for SELECT *)
+        std::vector<std::string> columns; // column names, when every item is a bare column
         bool select_star = false;
+
+        // True when some item is more than a bare column reference
+        bool HasComputedItems() const
+        {
+            for (const auto &item : items)
+            {
+                if (item.expr->GetType() != ExpressionType::COLUMN_REF)
+                    return true;
+            }
+            return false;
+        }
         std::unique_ptr<Expression> where;
         StatementType GetType() const override { return StatementType::SELECT; }
     };
@@ -179,6 +233,9 @@ namespace sql
     std::string ExpressionTypeToString(ExpressionType type);
     std::string StatementTypeToString(StatementType type);
     std::string DumpExpression(const Expression *expr, int indent = 0);
+
+    // SQL text for an expression (used to name computed result columns)
+    std::string ExpressionToSQL(const Expression *expr);
     std::string DumpStatement(const Statement *stmt);
 
 } // namespace sql

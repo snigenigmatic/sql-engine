@@ -4,6 +4,7 @@ add_library(execution
     seq_scan.cpp
     filter.cpp
     projection.cpp
+    expression_projection.cpp
     index_scan.cpp
     nested_loop_join.cpp
     hash_join.cpp

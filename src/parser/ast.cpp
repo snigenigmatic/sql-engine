@@ -26,6 +26,12 @@ namespace sql
             return "UNARY_OP";
         case ExpressionType::IS_NULL:
             return "IS_NULL";
+        case ExpressionType::LIKE:
+            return "LIKE";
+        case ExpressionType::IN_LIST:
+            return "IN_LIST";
+        case ExpressionType::BETWEEN:
+            return "BETWEEN";
         default:
             return "UNKNOWN_EXPRESSION";
         }
@@ -102,11 +108,148 @@ namespace sql
             out << DumpExpression(is_null->operand.get(), indent + 1);
             break;
         }
+        case ExpressionType::LIKE:
+        {
+            const auto *like = static_cast<const LikeExpression *>(expr);
+            out << Indent(indent) << (like->negated ? "NotLike" : "Like") << "\n";
+            out << DumpExpression(like->value.get(), indent + 1) << "\n";
+            out << DumpExpression(like->pattern.get(), indent + 1);
+            break;
+        }
+        case ExpressionType::IN_LIST:
+        {
+            const auto *in = static_cast<const InListExpression *>(expr);
+            out << Indent(indent) << (in->negated ? "NotIn" : "In") << "\n";
+            out << DumpExpression(in->operand.get(), indent + 1);
+            for (const auto &item : in->list)
+                out << "\n" << DumpExpression(item.get(), indent + 2);
+            break;
+        }
+        case ExpressionType::BETWEEN:
+        {
+            const auto *between = static_cast<const BetweenExpression *>(expr);
+            out << Indent(indent) << (between->negated ? "NotBetween" : "Between") << "\n";
+            out << DumpExpression(between->operand.get(), indent + 1) << "\n";
+            out << DumpExpression(between->low.get(), indent + 1) << "\n";
+            out << DumpExpression(between->high.get(), indent + 1);
+            break;
+        }
         default:
             out << Indent(indent) << "UnknownExpression";
             break;
         }
         return out.str();
+    }
+
+    namespace
+    {
+        const char *OperatorSQL(TokenType op)
+        {
+            switch (op)
+            {
+            case TokenType::PLUS:
+                return "+";
+            case TokenType::MINUS:
+                return "-";
+            case TokenType::STAR:
+                return "*";
+            case TokenType::SLASH:
+                return "/";
+            case TokenType::EQ:
+                return "=";
+            case TokenType::NEQ:
+                return "<>";
+            case TokenType::LT:
+                return "<";
+            case TokenType::GT:
+                return ">";
+            case TokenType::LEQ:
+                return "<=";
+            case TokenType::GEQ:
+                return ">=";
+            case TokenType::AND:
+                return "AND";
+            case TokenType::OR:
+                return "OR";
+            case TokenType::NOT:
+                return "NOT";
+            default:
+                return "?";
+            }
+        }
+
+        // Nested operators are parenthesized so the text stays unambiguous
+        std::string OperandSQL(const Expression *expr)
+        {
+            const ExpressionType t = expr->GetType();
+            const bool simple = t == ExpressionType::LITERAL || t == ExpressionType::COLUMN_REF;
+            return simple ? ExpressionToSQL(expr) : "(" + ExpressionToSQL(expr) + ")";
+        }
+    } // namespace
+
+    std::string ExpressionToSQL(const Expression *expr)
+    {
+        if (expr == nullptr)
+            return "";
+        switch (expr->GetType())
+        {
+        case ExpressionType::LITERAL:
+        {
+            const Value &v = static_cast<const LiteralExpression *>(expr)->value;
+            if (v.IsNull())
+                return "NULL";
+            if (v.GetType() == DataType::VARCHAR)
+            {
+                std::string quoted = "'";
+                for (char c : v.GetAsString())
+                    quoted += (c == '\'' ? std::string("''") : std::string(1, c));
+                return quoted + "'";
+            }
+            if (v.GetType() == DataType::BOOLEAN)
+                return v.GetAsBool() ? "TRUE" : "FALSE";
+            return v.ToString();
+        }
+        case ExpressionType::COLUMN_REF:
+            return static_cast<const ColumnExpression *>(expr)->name;
+        case ExpressionType::BINARY_OP:
+        {
+            const auto *bin = static_cast<const BinaryExpression *>(expr);
+            return OperandSQL(bin->left.get()) + " " + OperatorSQL(bin->op) + " " + OperandSQL(bin->right.get());
+        }
+        case ExpressionType::UNARY_OP:
+        {
+            const auto *unary = static_cast<const UnaryExpression *>(expr);
+            if (unary->op == TokenType::MINUS)
+                return "-" + OperandSQL(unary->operand.get());
+            return "NOT " + OperandSQL(unary->operand.get());
+        }
+        case ExpressionType::IS_NULL:
+        {
+            const auto *is_null = static_cast<const IsNullExpression *>(expr);
+            return OperandSQL(is_null->operand.get()) + (is_null->negated ? " IS NOT NULL" : " IS NULL");
+        }
+        case ExpressionType::LIKE:
+        {
+            const auto *like = static_cast<const LikeExpression *>(expr);
+            return OperandSQL(like->value.get()) + (like->negated ? " NOT LIKE " : " LIKE ") +
+                   OperandSQL(like->pattern.get());
+        }
+        case ExpressionType::IN_LIST:
+        {
+            const auto *in = static_cast<const InListExpression *>(expr);
+            std::string text = OperandSQL(in->operand.get()) + (in->negated ? " NOT IN (" : " IN (");
+            for (size_t i = 0; i < in->list.size(); ++i)
+                text += (i ? ", " : "") + ExpressionToSQL(in->list[i].get());
+            return text + ")";
+        }
+        case ExpressionType::BETWEEN:
+        {
+            const auto *between = static_cast<const BetweenExpression *>(expr);
+            return OperandSQL(between->operand.get()) + (between->negated ? " NOT BETWEEN " : " BETWEEN ") +
+                   OperandSQL(between->low.get()) + " AND " + OperandSQL(between->high.get());
+        }
+        }
+        return "?";
     }
 
     std::string DumpStatement(const Statement *stmt)

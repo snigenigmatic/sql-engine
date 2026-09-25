@@ -39,6 +39,9 @@ namespace sql
         std::unique_ptr<Expression> ParseTerm();
         std::unique_ptr<Expression> ParseNot();
         std::unique_ptr<Expression> ParseComparison();
+        std::unique_ptr<Expression> ParseAdditive();
+        std::unique_ptr<Expression> ParseMultiplicative();
+        std::unique_ptr<Expression> ParseUnary();
         std::unique_ptr<Expression> ParsePrimary();
         std::string ParseQualifiedColumnName();
 

@@ -18,7 +18,11 @@ namespace sql
     // INTEGER and FLOAT operands are compared and combined numerically.
 
     Value EvaluateBinaryOp(TokenType op, const Value &left, const Value &right);
-    Value EvaluateUnaryOp(TokenType op, const Value &operand);
+    Value EvaluateUnaryOp(TokenType op, const Value &operand); // NOT, unary minus
+
+    // value LIKE pattern: % matches any run of characters, _ exactly one;
+    // case-sensitive; NULL if either side is NULL
+    Value EvaluateLike(const Value &value, const Value &pattern);
 
     // Resolves a column reference to its value in the current row
     using ColumnResolver = std::function<Value(const ColumnExpression &)>;

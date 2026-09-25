@@ -279,6 +279,10 @@ namespace sql
              {"PRIMARY", TokenType::PRIMARY},
              {"UNIQUE", TokenType::UNIQUE},
              {"DEFAULT", TokenType::DEFAULT},
+             {"AS", TokenType::AS},
+             {"LIKE", TokenType::LIKE},
+             {"IN", TokenType::IN},
+             {"BETWEEN", TokenType::BETWEEN},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

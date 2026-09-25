@@ -1108,4 +1108,95 @@ namespace sql
         EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t VALUES (1, 2);").success);
     }
 
+    // ── Expressions ───────────────────────────────────────────────────────────────
+
+    static void CreateItems(Catalog &catalog)
+    {
+        RunSQL(catalog, "CREATE TABLE items (id INTEGER PRIMARY KEY, name VARCHAR(20), price FLOAT, qty INTEGER);");
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO items VALUES (1, 'apple', 0.5, 10), (2, 'banana', 0.25, 12), "
+                                    "(3, 'cherry', 3.0, NULL), (4, 'apricot', 1.5, 4);")
+                        .success);
+    }
+
+    TEST(IntegrationTest, SelectExpressionsAndNames)
+    {
+        Catalog catalog;
+        CreateItems(catalog);
+        auto result = RunSQL(catalog, "SELECT name, price * qty AS total, qty + 1, -id FROM items WHERE id <= 3;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(result.column_names, (std::vector<std::string>{"name", "total", "qty + 1", "-id"}));
+        ASSERT_EQ(result.tuples.size(), 3u);
+        EXPECT_DOUBLE_EQ(result.tuples[0].GetValue(1).GetAsFloat(), 5.0);
+        EXPECT_EQ(result.tuples[0].GetValue(2).GetAsInt(), 11);
+        EXPECT_EQ(result.tuples[0].GetValue(3).GetAsInt(), -1);
+        EXPECT_TRUE(result.tuples[2].GetValue(1).IsNull()); // NULL qty
+    }
+
+    TEST(IntegrationTest, AliasesOnPlainColumns)
+    {
+        Catalog catalog;
+        CreateItems(catalog);
+        auto result = RunSQL(catalog, "SELECT name AS fruit, id FROM items WHERE id = 1;");
+        EXPECT_EQ(result.column_names, (std::vector<std::string>{"fruit", "id"}));
+        ASSERT_EQ(result.tuples.size(), 1u);
+        EXPECT_EQ(result.tuples[0].GetValue(0).GetAsString(), "apple");
+    }
+
+    TEST(IntegrationTest, ArithmeticInWhereAndSet)
+    {
+        Catalog catalog;
+        CreateItems(catalog);
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM items WHERE price * qty > 4;")), (std::vector<int>{1, 4}));
+        ASSERT_TRUE(RunSQL(catalog, "UPDATE items SET qty = qty * 2 + 1, price = price / 2 WHERE id = 1;").success);
+        auto row = RunSQL(catalog, "SELECT qty, price FROM items WHERE id = 1;").tuples.at(0);
+        EXPECT_EQ(row.GetValue(0).GetAsInt(), 21);
+        EXPECT_DOUBLE_EQ(row.GetValue(1).GetAsFloat(), 0.25);
+        EXPECT_FALSE(RunSQL(catalog, "SELECT id / 0 FROM items;").success);
+        EXPECT_FALSE(RunSQL(catalog, "SELECT name + 1 FROM items;").success);
+    }
+
+    TEST(IntegrationTest, LikeInAndBetweenFilters)
+    {
+        Catalog catalog;
+        CreateItems(catalog);
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM items WHERE name LIKE 'ap%';")), (std::vector<int>{1, 4}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM items WHERE name NOT LIKE '%an%';")), (std::vector<int>{1, 3, 4}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM items WHERE id IN (4, 2, 99);")), (std::vector<int>{2, 4}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM items WHERE qty NOT IN (10, 12);")), (std::vector<int>{4}));
+        EXPECT_TRUE(RunSQL(catalog, "SELECT id FROM items WHERE qty NOT IN (10, NULL);").tuples.empty());
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM items WHERE price BETWEEN 0.5 AND 1.5;")), (std::vector<int>{1, 4}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM items WHERE qty NOT BETWEEN 5 AND 11;")), (std::vector<int>{2, 4}));
+    }
+
+    TEST(IntegrationTest, BetweenUsesAnIndexRange)
+    {
+        Catalog catalog;
+        CreateItems(catalog);
+        auto explain = RunSQL(catalog, "EXPLAIN SELECT id FROM items WHERE id BETWEEN 2 AND 3;");
+        EXPECT_NE(explain.message.find("IndexScan(table=items, column=id, low=2 (inclusive), high=3 (inclusive))"),
+                  std::string::npos)
+            << explain.message;
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM items WHERE id BETWEEN 2 AND 3;")), (std::vector<int>{2, 3}));
+    }
+
+    TEST(IntegrationTest, ExpressionsOverAJoin)
+    {
+        Catalog catalog;
+        CreateOrdersAndCustomers(catalog);
+        auto result = RunSQL(catalog, "SELECT orders.oid * 100 + customers.id AS code, name FROM orders "
+                                      "JOIN customers ON orders.cid = customers.id WHERE name LIKE 'A%';");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(result.column_names, (std::vector<std::string>{"code", "name"}));
+        ASSERT_EQ(result.tuples.size(), 2u);
+        EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), 110);
+        EXPECT_EQ(result.tuples[1].GetValue(0).GetAsInt(), 310);
+
+        // An unqualified name present in both tables is ambiguous here too
+        RunSQL(catalog, "CREATE TABLE other (cid INTEGER, oid INTEGER);");
+        RunSQL(catalog, "INSERT INTO other VALUES (10, 1);");
+        auto ambiguous = RunSQL(catalog, "SELECT oid + 1 FROM orders JOIN other ON orders.cid = other.cid;");
+        EXPECT_FALSE(ambiguous.success);
+        EXPECT_NE(ambiguous.message.find("Ambiguous"), std::string::npos) << ambiguous.message;
+    }
+
 } // namespace sql

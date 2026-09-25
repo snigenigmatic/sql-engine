@@ -14,7 +14,8 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - `INTEGER` and `FLOAT` values compare and combine numerically
 - Constraints: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, and `CREATE UNIQUE INDEX`; values are type-checked on write and `VARCHAR(n)` lengths are enforced
 - `INSERT INTO t (col, ...) VALUES ...`: columns left out take their default
-- Column projection (`SELECT col1, col2 ...`)
+- Column projection and computed columns: `SELECT name, price * qty AS total ...`
+- Expressions: `+ - * /` (with integer overflow checks), unary minus, `LIKE` / `NOT LIKE` (`%`, `_`), `IN (...)`, `BETWEEN ... AND ...`
 - Disk-resident B+tree indexes: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`), maintained row by row on INSERT/UPDATE/DELETE
 - Query planner: automatically uses index scan when an index exists on the filtered column
 - Single-file database: tables and index definitions are stored in 4 KB pages (slotted heaps + a `sqlite_master`-style schema table) behind an LRU buffer pool
@@ -108,7 +109,7 @@ DROP TABLE users;
 -- DML
 INSERT INTO users VALUES (1, 'Alice', 25), (2, 'Bob', 30);
 SELECT * FROM users WHERE age > 25;
-SELECT name, age FROM users;
+SELECT name, age + 1 AS next_age FROM users WHERE name LIKE 'A%';
 UPDATE users SET age = 99 WHERE id = 1;
 DELETE FROM users WHERE id = 2;
 
@@ -174,6 +175,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
 - [ ] **M7**: SQL coverage
   - [x] NULL semantics and a single shared expression evaluator
   - [x] Constraints (`PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`), type checking, `INSERT` column lists
+  - [x] Expressions: arithmetic, computed and aliased SELECT columns, `LIKE`, `IN`, `BETWEEN` (index range scans)
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

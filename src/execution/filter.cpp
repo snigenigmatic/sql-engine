@@ -61,15 +61,15 @@ namespace sql
         }
     }
 
-    Value Filter::ResolveColumn(const ColumnExpression &col, const Tuple &tuple) const
+    int FindColumnIndex(const Table &table, const std::string &name)
     {
-        int idx = table_->GetColumnIndex(col.name);
+        int idx = table.GetColumnIndex(name);
         if (idx < 0)
         {
-            const std::string stripped = StripQualifier(col.name);
-            const std::string qualifier = ExtractQualifier(col.name);
+            const std::string stripped = StripQualifier(name);
+            const std::string qualifier = ExtractQualifier(name);
             int matched_idx = -1;
-            const auto &columns = table_->GetSchema().GetColumns();
+            const auto &columns = table.GetSchema().GetColumns();
             for (size_t i = 0; i < columns.size(); ++i)
             {
                 const auto &schema_col = columns[i].name;
@@ -88,19 +88,25 @@ namespace sql
                             continue;
                         }
                     }
-                    else if (qualifier != table_->GetName())
+                    else if (qualifier != table.GetName())
                     {
                         continue;
                     }
                 }
                 if (matched_idx >= 0)
                 {
-                    throw std::runtime_error("Ambiguous column: " + col.name);
+                    throw std::runtime_error("Ambiguous column: " + name);
                 }
                 matched_idx = static_cast<int>(i);
             }
             idx = matched_idx;
         }
+        return idx;
+    }
+
+    Value Filter::ResolveColumn(const ColumnExpression &col, const Tuple &tuple) const
+    {
+        const int idx = FindColumnIndex(*table_, col.name);
         if (idx < 0)
         {
             throw std::runtime_error("Unknown column: " + col.name);

@@ -4,6 +4,7 @@
 #include "execution/seq_scan.h"
 #include "execution/filter.h"
 #include "execution/projection.h"
+#include "execution/expression_projection.h"
 #include "execution/index_scan.h"
 #include "execution/nested_loop_join.h"
 #include "execution/hash_join.h"

@@ -49,21 +49,32 @@ namespace sql
             if (left.GetType() == DataType::INTEGER && right.GetType() == DataType::INTEGER)
             {
                 const int32_t l = left.GetAsInt(), r = right.GetAsInt();
+                int32_t out = 0;
+                bool overflow = false;
                 switch (op)
                 {
                 case TokenType::PLUS:
-                    return Value(l + r);
+                    overflow = __builtin_add_overflow(l, r, &out);
+                    break;
                 case TokenType::MINUS:
-                    return Value(l - r);
+                    overflow = __builtin_sub_overflow(l, r, &out);
+                    break;
                 case TokenType::STAR:
-                    return Value(l * r);
+                    overflow = __builtin_mul_overflow(l, r, &out);
+                    break;
                 case TokenType::SLASH:
                     if (r == 0)
                         throw std::runtime_error("Division by zero");
-                    return Value(l / r);
-                default:
+                    overflow = l == INT32_MIN && r == -1;
+                    if (!overflow)
+                        out = l / r;
                     break;
+                default:
+                    throw std::runtime_error("Unknown arithmetic operator");
                 }
+                if (overflow)
+                    throw std::runtime_error("Integer overflow");
+                return Value(out);
             }
             else
             {
@@ -161,7 +172,60 @@ namespace sql
                 return NULL_BOOL;
             return Value(!AsBool(operand, "NOT"));
         }
+        if (op == TokenType::MINUS)
+        {
+            if (operand.IsNull())
+                return operand;
+            if (operand.GetType() == DataType::INTEGER)
+            {
+                if (operand.GetAsInt() == INT32_MIN)
+                    throw std::runtime_error("Integer overflow");
+                return Value(-operand.GetAsInt());
+            }
+            if (operand.GetType() == DataType::FLOAT)
+                return Value(-operand.GetAsFloat());
+            throw std::runtime_error("Unary minus requires a number, got " + operand.ToString());
+        }
         throw std::runtime_error("Unknown unary operator: " + TokenToString(op));
+    }
+
+    Value EvaluateLike(const Value &value, const Value &pattern)
+    {
+        if (value.IsNull() || pattern.IsNull())
+            return NULL_BOOL;
+        if (value.GetType() != DataType::VARCHAR || pattern.GetType() != DataType::VARCHAR)
+            throw std::runtime_error("LIKE requires strings");
+        const std::string s = value.GetAsString();
+        const std::string p = pattern.GetAsString();
+
+        // Greedy wildcard match with backtracking to the last %
+        size_t si = 0, pi = 0;
+        size_t star = std::string::npos, star_s = 0;
+        while (si < s.size())
+        {
+            if (pi < p.size() && (p[pi] == '_' || p[pi] == s[si]))
+            {
+                ++si;
+                ++pi;
+            }
+            else if (pi < p.size() && p[pi] == '%')
+            {
+                star = pi++;
+                star_s = si;
+            }
+            else if (star != std::string::npos)
+            {
+                pi = star + 1;
+                si = ++star_s;
+            }
+            else
+            {
+                return Value(false);
+            }
+        }
+        while (pi < p.size() && p[pi] == '%')
+            ++pi;
+        return Value(pi == p.size());
     }
 
     Value EvaluateExpression(const Expression *expr, const ColumnResolver &resolve_column)
@@ -185,6 +249,44 @@ namespace sql
             const auto *is_null = static_cast<const IsNullExpression *>(expr);
             const bool null = EvaluateExpression(is_null->operand.get(), resolve_column).IsNull();
             return Value(is_null->negated ? !null : null);
+        }
+        case ExpressionType::LIKE:
+        {
+            const auto *like = static_cast<const LikeExpression *>(expr);
+            Value matched = EvaluateLike(EvaluateExpression(like->value.get(), resolve_column),
+                                         EvaluateExpression(like->pattern.get(), resolve_column));
+            return like->negated ? EvaluateUnaryOp(TokenType::NOT, matched) : matched;
+        }
+        case ExpressionType::IN_LIST:
+        {
+            // TRUE if any item equals the operand; otherwise NULL if the
+            // operand or any item is NULL (it might have matched); else FALSE
+            const auto *in = static_cast<const InListExpression *>(expr);
+            const Value operand = EvaluateExpression(in->operand.get(), resolve_column);
+            Value result(false);
+            for (const auto &item : in->list)
+            {
+                const Value equal = EvaluateBinaryOp(TokenType::EQ, operand,
+                                                     EvaluateExpression(item.get(), resolve_column));
+                if (IsTrue(equal))
+                {
+                    result = Value(true);
+                    break;
+                }
+                if (equal.IsNull())
+                    result = NULL_BOOL;
+            }
+            return in->negated ? EvaluateUnaryOp(TokenType::NOT, result) : result;
+        }
+        case ExpressionType::BETWEEN:
+        {
+            const auto *between = static_cast<const BetweenExpression *>(expr);
+            const Value operand = EvaluateExpression(between->operand.get(), resolve_column);
+            const Value inside = EvaluateBinaryOp(
+                TokenType::AND,
+                EvaluateBinaryOp(TokenType::GEQ, operand, EvaluateExpression(between->low.get(), resolve_column)),
+                EvaluateBinaryOp(TokenType::LEQ, operand, EvaluateExpression(between->high.get(), resolve_column)));
+            return between->negated ? EvaluateUnaryOp(TokenType::NOT, inside) : inside;
         }
         case ExpressionType::BINARY_OP:
         {
