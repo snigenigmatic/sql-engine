@@ -25,9 +25,9 @@ namespace sql
         return node;
     }
 
-    void BTree::Insert(const Value &key, size_t row_index)
+    void BTree::Insert(const Value &key, RID rid)
     {
-        auto result = InsertInternal(root_, key, row_index);
+        auto result = InsertInternal(root_, key, rid);
         if (result)
         {
             // Root was split, create new root
@@ -41,7 +41,7 @@ namespace sql
     }
 
     std::optional<BTree::SplitResult> BTree::InsertInternal(
-        std::shared_ptr<BTreeNode> node, const Value &key, size_t row_index)
+        std::shared_ptr<BTreeNode> node, const Value &key, RID rid)
     {
         if (node->is_leaf)
         {
@@ -51,7 +51,7 @@ namespace sql
                 pos++;
 
             node->keys.insert(node->keys.begin() + static_cast<long>(pos), key);
-            node->row_indices.insert(node->row_indices.begin() + static_cast<long>(pos), row_index);
+            node->rids.insert(node->rids.begin() + static_cast<long>(pos), rid);
 
             // Check if we need to split
             if (static_cast<int>(node->keys.size()) > BTREE_MAX_KEYS)
@@ -62,13 +62,13 @@ namespace sql
                 size_t mid = node->keys.size() / 2;
 
                 new_leaf->keys.assign(node->keys.begin() + static_cast<long>(mid), node->keys.end());
-                new_leaf->row_indices.assign(node->row_indices.begin() + static_cast<long>(mid),
-                                             node->row_indices.end());
+                new_leaf->rids.assign(node->rids.begin() + static_cast<long>(mid),
+                                             node->rids.end());
 
                 Value median = new_leaf->keys[0];
 
                 node->keys.resize(mid);
-                node->row_indices.resize(mid);
+                node->rids.resize(mid);
 
                 // Maintain leaf linked list
                 new_leaf->next_leaf = node->next_leaf;
@@ -85,7 +85,7 @@ namespace sql
             while (i < node->keys.size() && !(key < node->keys[i]))
                 i++;
 
-            auto result = InsertInternal(node->children[i], key, row_index);
+            auto result = InsertInternal(node->children[i], key, rid);
             if (!result)
                 return std::nullopt;
 
@@ -131,7 +131,7 @@ namespace sql
                                  if (node->keys[i] == key)
                  {
                      node->keys.erase(node->keys.begin() + static_cast<long>(i));
-                     node->row_indices.erase(node->row_indices.begin() + static_cast<long>(i));
+                     node->rids.erase(node->rids.begin() + static_cast<long>(i));
                  }
                  else if (key < node->keys[i])
                  {
@@ -147,9 +147,9 @@ namespace sql
         }
     }
 
-    std::vector<size_t> BTree::Search(const Value &key) const
+    std::vector<RID> BTree::Search(const Value &key) const
     {
-        std::vector<size_t> results;
+        std::vector<RID> results;
         auto leaf = FindLeaf(key);
 
         // Scan this leaf and subsequent leaves for matching keys (handles duplicates)
@@ -159,7 +159,7 @@ namespace sql
             for (size_t i = 0; i < node->keys.size(); ++i)
             {
                 if (node->keys[i] == key)
-                    results.push_back(node->row_indices[i]);
+                    results.push_back(node->rids[i]);
                 else if (key < node->keys[i])
                     return results; // Past our key, done
             }
@@ -168,10 +168,10 @@ namespace sql
         return results;
     }
 
-    std::vector<size_t> BTree::RangeScan(const std::optional<Value> &low, bool low_inclusive,
+    std::vector<RID> BTree::RangeScan(const std::optional<Value> &low, bool low_inclusive,
                                           const std::optional<Value> &high, bool high_inclusive) const
     {
-        std::vector<size_t> results;
+        std::vector<RID> results;
 
         std::shared_ptr<BTreeNode> node;
         if (low.has_value())
@@ -211,7 +211,7 @@ namespace sql
                     }
                 }
 
-                results.push_back(node->row_indices[i]);
+                results.push_back(node->rids[i]);
             }
             node = node->next_leaf;
         }
@@ -225,13 +225,13 @@ namespace sql
         while (node)
         {
             for (size_t i = 0; i < node->keys.size(); ++i)
-                entries.push_back({node->keys[i], node->row_indices[i]});
+                entries.push_back({node->keys[i], node->rids[i]});
             node = node->next_leaf;
         }
         return entries;
     }
 
-    void BTree::BulkLoad(const std::vector<std::pair<Value, size_t>> &entries)
+    void BTree::BulkLoad(const std::vector<std::pair<Value, RID>> &entries)
     {
         // Reset tree
         root_ = std::make_shared<BTreeNode>();

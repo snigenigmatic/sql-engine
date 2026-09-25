@@ -29,9 +29,13 @@ namespace sql
 
         int left_column_index_ = -1;
         int right_column_index_ = -1;
-        size_t left_cursor_ = 0;
-        size_t right_cursor_ = 0;
         bool right_as_outer_ = false;
+
+        TableIterator outer_it_;
+        TableIterator inner_it_;
+        bool outer_started_ = false;
+        bool inner_active_ = false;
+        Tuple current_outer_;
     };
 
 } // namespace sql

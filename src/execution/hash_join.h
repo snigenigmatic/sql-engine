@@ -70,12 +70,16 @@ namespace sql
         int left_column_index_ = -1;
         int right_column_index_ = -1;
 
+        // Build side is materialized; hash table values index into build_rows_
         std::unordered_map<JoinKey, std::vector<size_t>, JoinKeyHasher> hash_table_;
-        const std::vector<Tuple> *probe_rows_ = nullptr;
-        const std::vector<Tuple> *build_rows_ = nullptr;
+        std::vector<Tuple> build_rows_;
+        Table *probe_table_ = nullptr;
         bool probe_is_left_ = true;
 
-        size_t probe_cursor_ = 0;
+        TableIterator probe_it_;
+        bool probe_started_ = false;
+        bool probe_valid_ = false;
+        Tuple probe_tuple_;
         size_t match_cursor_ = 0;
         std::vector<size_t> current_matches_;
 

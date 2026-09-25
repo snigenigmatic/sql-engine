@@ -1,5 +1,7 @@
 add_library(storage
     table.cpp
+    table_page.cpp
+    table_heap.cpp
     page.cpp
     buffer_pool.cpp
     pager.cpp

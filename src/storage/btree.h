@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/value.h"
+#include "storage/rid.h"
 #include <vector>
 #include <memory>
 #include <optional>
@@ -16,13 +17,13 @@ namespace sql{
 
     struct BTreeEntry{
         Value key;
-        size_t row_index; // Points to the tuple in the table
+        RID rid; // Location of the tuple in the table heap
     };
 
     struct BTreeNode{
         bool is_leaf = true;
         std::vector<Value> keys;
-        std::vector<size_t> row_indices;                  // only for leaf nodes, parallel to keys
+        std::vector<RID> rids;                  // only for leaf nodes, parallel to keys
         std::vector<std::shared_ptr<BTreeNode>> children; // only for internal nodes
         std::shared_ptr<BTreeNode> next_leaf = nullptr;   // leaf linked list
 
@@ -35,24 +36,24 @@ namespace sql{
         BTree() : root_(std::make_shared<BTreeNode>()) {}
 
         // Insert a key with its row index
-        void Insert(const Value &key, size_t row_index);
+        void Insert(const Value &key, RID rid);
 
         // Remove all entries with the given key
         void Remove(const Value &key);
 
         // Point lookup: find all row indices matching key
-        std::vector<size_t> Search(const Value &key) const;
+        std::vector<RID> Search(const Value &key) const;
 
         // Range scan: find all row indices where key is in [low, high]
         // Pass nullopt for unbounded side
-        std::vector<size_t> RangeScan(const std::optional<Value> &low, bool low_inclusive,
+        std::vector<RID> RangeScan(const std::optional<Value> &low, bool low_inclusive,
                                        const std::optional<Value> &high, bool high_inclusive) const;
 
         // Get all entries (for debugging / full scan fallback)
         std::vector<BTreeEntry> GetAllEntries() const;
 
         // Rebuild the index from scratch given column values and their row indices
-        void BulkLoad(const std::vector<std::pair<Value, size_t>> &entries);
+        void BulkLoad(const std::vector<std::pair<Value, RID>> &entries);
 
         bool IsEmpty() const { return root_->keys.empty(); }
 
@@ -64,7 +65,7 @@ namespace sql{
         };
 
         std::optional<SplitResult> InsertInternal(std::shared_ptr<BTreeNode> node,
-                                                   const Value &key, size_t row_index);
+                                                   const Value &key, RID rid);
 
         // Find the leaf node where key should go
         std::shared_ptr<BTreeNode> FindLeaf(const Value &key) const;

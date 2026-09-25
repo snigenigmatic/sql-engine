@@ -2,6 +2,8 @@
 
 #include "storage/table.h"
 #include "storage/btree.h"
+#include "storage/buffer_pool.h"
+#include "storage/pager.h"
 #include <unordered_map>
 #include <string>
 #include <memory>
@@ -13,7 +15,18 @@ namespace sql
     class Catalog
     {
     public:
-        Catalog() = default;
+        static constexpr size_t DEFAULT_POOL_SIZE = 256;
+
+        // Transient database held entirely in memory
+        Catalog();
+
+        // Tables are stored in pages managed by the given buffer pool
+        explicit Catalog(BufferPoolManager *bpm);
+
+        Catalog(const Catalog &) = delete;
+        Catalog &operator=(const Catalog &) = delete;
+
+        BufferPoolManager *GetBufferPool() const { return bpm_; }
 
         // Create a new table in the catalog
         bool CreateTable(const std::string &name, const Schema &schema);
@@ -41,6 +54,12 @@ namespace sql
         void RebuildIndexesForTable(const std::string &table_name);
 
     private:
+        // Owned storage for in-memory catalogs. Declared before tables_ so
+        // tables are destroyed first.
+        std::unique_ptr<Pager> owned_pager_;
+        std::unique_ptr<BufferPoolManager> owned_bpm_;
+        BufferPoolManager *bpm_ = nullptr;
+
         std::unordered_map<std::string, std::unique_ptr<Table>> tables_;
 
         // table_name -> (column_name -> BTree)

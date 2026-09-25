@@ -30,3 +30,4 @@ add_sqlengine_test(parser_test parser/parser_test.cpp)
 add_sqlengine_test(query_test integration/query_test.cpp)
 # Storage tests
 add_sqlengine_test(buffer_pool_test storage/buffer_pool_test.cpp)
+add_sqlengine_test(table_heap_test storage/table_heap_test.cpp)

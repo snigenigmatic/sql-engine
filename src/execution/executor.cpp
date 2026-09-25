@@ -601,6 +601,9 @@ namespace sql
         {
             result.success = false;
             result.message = e.what();
+            // Rows changed before the failure stay changed until transactions
+            // land; keep indexes consistent with what is actually stored.
+            catalog_->RebuildIndexesForTable(insert->table);
         }
         return result;
     }
@@ -614,24 +617,24 @@ namespace sql
             if (!table)
                 throw std::runtime_error("Table not found: " + del->table);
 
-            const auto &tuples = table->GetTuples();
-            std::vector<size_t> to_delete;
+            std::vector<RID> to_delete;
 
-            for (size_t i = 0; i < tuples.size(); ++i)
+            for (auto it = table->begin(); it != table->end(); ++it)
             {
                 if (!del->where)
                 {
-                    to_delete.push_back(i);
+                    to_delete.push_back(it.GetRID());
                 }
                 else
                 {
-                    Value v = EvaluateExpr(del->where.get(), &tuples[i], table);
+                    Value v = EvaluateExpr(del->where.get(), &*it, table);
                     if (v.GetAsBool())
-                        to_delete.push_back(i);
+                        to_delete.push_back(it.GetRID());
                 }
             }
 
-            table->DeleteByIndices(to_delete);
+            for (const RID &rid : to_delete)
+                table->DeleteTuple(rid);
             catalog_->RebuildIndexesForTable(del->table);
             result.success = true;
             result.message = std::to_string(to_delete.size()) + " row(s) deleted.";
@@ -640,6 +643,9 @@ namespace sql
         {
             result.success = false;
             result.message = e.what();
+            // Rows changed before the failure stay changed until transactions
+            // land; keep indexes consistent with what is actually stored.
+            catalog_->RebuildIndexesForTable(del->table);
         }
         return result;
     }
@@ -653,11 +659,11 @@ namespace sql
             if (!table)
                 throw std::runtime_error("Table not found: " + update->table);
 
-            std::vector<std::pair<size_t, Tuple>> updates; // (index, new tuple)
-            size_t idx = 0;
+            std::vector<std::pair<RID, Tuple>> updates; // (location, new tuple)
 
-            for (auto &existing_tuple : *table)
+            for (auto it = table->begin(); it != table->end(); ++it)
             {
+                const Tuple &existing_tuple = *it;
                 bool matches = true;
                 if (update->where)
                 {
@@ -681,9 +687,8 @@ namespace sql
                         new_values[static_cast<size_t>(col_idx)] = EvaluateExpr(assign.second.get(), &existing_tuple, table);
                     }
 
-                    updates.push_back({idx, Tuple(std::move(new_values))});
+                    updates.push_back({it.GetRID(), Tuple(std::move(new_values))});
                 }
-                ++idx;
             }
 
             // Apply all updates
@@ -698,6 +703,9 @@ namespace sql
         {
             result.success = false;
             result.message = e.what();
+            // Rows changed before the failure stay changed until transactions
+            // land; keep indexes consistent with what is actually stored.
+            catalog_->RebuildIndexesForTable(update->table);
         }
         return result;
     }

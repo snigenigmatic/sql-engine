@@ -88,8 +88,47 @@ namespace sql
         return true;
     }
 
+    void Pager::OpenInMemory()
+    {
+        Close();
+        in_memory_ = true;
+        page_count_ = 1;
+        free_list_head_ = INVALID_PAGE_ID;
+        catalog_root_ = INVALID_PAGE_ID;
+        mem_pages_.clear();
+        mem_pages_.push_back(std::make_unique<std::array<char, PAGE_SIZE>>());
+        WriteHeader();
+    }
+
+    bool Pager::RawRead(page_id_t page_id, char *out)
+    {
+        if (in_memory_)
+        {
+            std::memcpy(out, mem_pages_[static_cast<size_t>(page_id)]->data(), PAGE_SIZE);
+            return true;
+        }
+        return PreadFull(fd_, out, PAGE_SIZE, PageOffset(page_id));
+    }
+
+    bool Pager::RawWrite(page_id_t page_id, const char *data)
+    {
+        if (in_memory_)
+        {
+            while (mem_pages_.size() <= static_cast<size_t>(page_id))
+                mem_pages_.push_back(std::make_unique<std::array<char, PAGE_SIZE>>());
+            std::memcpy(mem_pages_[static_cast<size_t>(page_id)]->data(), data, PAGE_SIZE);
+            return true;
+        }
+        return PwriteFull(fd_, data, PAGE_SIZE, PageOffset(page_id));
+    }
+
     void Pager::Close()
     {
+        if (in_memory_)
+        {
+            in_memory_ = false;
+            mem_pages_.clear();
+        }
         if (fd_ >= 0)
         {
             fsync(fd_);
@@ -101,7 +140,7 @@ namespace sql
     bool Pager::ReadHeader()
     {
         std::array<char, PAGE_SIZE> buf{};
-        if (!PreadFull(fd_, buf.data(), PAGE_SIZE, 0))
+        if (!RawRead(0, buf.data()))
             return false;
         if (std::memcmp(buf.data(), MAGIC, sizeof(MAGIC)) != 0)
             return false;
@@ -126,26 +165,26 @@ namespace sql
         std::memcpy(buf.data() + OFF_PAGE_COUNT, &page_count_, sizeof(page_count_));
         std::memcpy(buf.data() + OFF_FREE_HEAD, &free_list_head_, sizeof(free_list_head_));
         std::memcpy(buf.data() + OFF_CATALOG_ROOT, &catalog_root_, sizeof(catalog_root_));
-        return PwriteFull(fd_, buf.data(), PAGE_SIZE, 0);
+        return RawWrite(0, buf.data());
     }
 
     bool Pager::ReadPage(page_id_t page_id, char *out)
     {
-        if (fd_ < 0 || page_id <= 0 || static_cast<uint32_t>(page_id) >= page_count_)
+        if (!IsOpen() || page_id <= 0 || static_cast<uint32_t>(page_id) >= page_count_)
             return false;
-        return PreadFull(fd_, out, PAGE_SIZE, PageOffset(page_id));
+        return RawRead(page_id, out);
     }
 
     bool Pager::WritePage(page_id_t page_id, const char *data)
     {
-        if (fd_ < 0 || page_id <= 0 || static_cast<uint32_t>(page_id) >= page_count_)
+        if (!IsOpen() || page_id <= 0 || static_cast<uint32_t>(page_id) >= page_count_)
             return false;
-        return PwriteFull(fd_, data, PAGE_SIZE, PageOffset(page_id));
+        return RawWrite(page_id, data);
     }
 
     page_id_t Pager::AllocatePage()
     {
-        if (fd_ < 0)
+        if (!IsOpen())
             return INVALID_PAGE_ID;
 
         std::array<char, PAGE_SIZE> zeros{};
@@ -154,19 +193,19 @@ namespace sql
         {
             page_id_t page_id = free_list_head_;
             std::array<char, PAGE_SIZE> buf{};
-            if (!PreadFull(fd_, buf.data(), PAGE_SIZE, PageOffset(page_id)))
+            if (!RawRead(page_id, buf.data()))
                 return INVALID_PAGE_ID;
             page_id_t next;
             std::memcpy(&next, buf.data(), sizeof(next));
             free_list_head_ = next;
-            if (!PwriteFull(fd_, zeros.data(), PAGE_SIZE, PageOffset(page_id)) || !WriteHeader())
+            if (!RawWrite(page_id, zeros.data()) || !WriteHeader())
                 return INVALID_PAGE_ID;
             return page_id;
         }
 
         page_id_t page_id = static_cast<page_id_t>(page_count_);
         page_count_++;
-        if (!PwriteFull(fd_, zeros.data(), PAGE_SIZE, PageOffset(page_id)) || !WriteHeader())
+        if (!RawWrite(page_id, zeros.data()) || !WriteHeader())
         {
             page_count_--;
             return INVALID_PAGE_ID;
@@ -176,12 +215,12 @@ namespace sql
 
     bool Pager::DeallocatePage(page_id_t page_id)
     {
-        if (fd_ < 0 || page_id <= 0 || static_cast<uint32_t>(page_id) >= page_count_)
+        if (!IsOpen() || page_id <= 0 || static_cast<uint32_t>(page_id) >= page_count_)
             return false;
 
         std::array<char, PAGE_SIZE> buf{};
         std::memcpy(buf.data(), &free_list_head_, sizeof(free_list_head_));
-        if (!PwriteFull(fd_, buf.data(), PAGE_SIZE, PageOffset(page_id)))
+        if (!RawWrite(page_id, buf.data()))
             return false;
         free_list_head_ = page_id;
         return WriteHeader();
@@ -195,6 +234,8 @@ namespace sql
 
     bool Pager::Sync()
     {
+        if (in_memory_)
+            return true;
         return fd_ >= 0 && fsync(fd_) == 0;
     }
 

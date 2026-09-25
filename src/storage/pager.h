@@ -1,7 +1,10 @@
 #pragma once
 
 #include "storage/page.h"
+#include <array>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace sql
 {
@@ -31,8 +34,14 @@ namespace sql
         // Open (or create) the database file. Returns false on I/O error or
         // if an existing file is not a valid database.
         bool Open(const std::string &path);
+
+        // Open a transient database held entirely in memory (like SQLite's
+        // ":memory:"). Nothing is written to disk.
+        void OpenInMemory();
+
         void Close();
-        bool IsOpen() const { return fd_ >= 0; }
+        bool IsOpen() const { return fd_ >= 0 || in_memory_; }
+        bool IsInMemory() const { return in_memory_; }
 
         bool ReadPage(page_id_t page_id, char *out);
         bool WritePage(page_id_t page_id, const char *data);
@@ -55,7 +64,13 @@ namespace sql
         bool WriteHeader();
         bool ReadHeader();
 
+        // Raw page access for either backend (page 0 included)
+        bool RawRead(page_id_t page_id, char *out);
+        bool RawWrite(page_id_t page_id, const char *data);
+
         int fd_ = -1;
+        bool in_memory_ = false;
+        std::vector<std::unique_ptr<std::array<char, PAGE_SIZE>>> mem_pages_;
         uint32_t page_count_ = 0;
         page_id_t free_list_head_ = INVALID_PAGE_ID;
         page_id_t catalog_root_ = INVALID_PAGE_ID;

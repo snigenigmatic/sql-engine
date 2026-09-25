@@ -42,7 +42,7 @@ namespace sql{
         bool high_inclusive_ = true;
 
         // Runtime state
-        std::vector<size_t> matching_rows_;
+        std::vector<RID> matching_rows_;
         size_t cursor_ = 0;
     };
 } // namespace sql
