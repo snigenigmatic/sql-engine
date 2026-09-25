@@ -36,7 +36,9 @@ namespace sql
     {
         size_t operator()(const RID &rid) const
         {
-            return std::hash<int64_t>{}((static_cast<int64_t>(rid.page_id) << 32) | rid.slot);
+            // Shift as unsigned: page_id may be INVALID_PAGE_ID (-1)
+            const uint64_t page = static_cast<uint32_t>(rid.page_id);
+            return std::hash<uint64_t>{}((page << 32) | rid.slot);
         }
     };
 

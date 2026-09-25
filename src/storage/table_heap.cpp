@@ -178,9 +178,17 @@ namespace sql
             current = TablePage(guard.GetData()).GetNextPageId();
         }
         for (page_id_t page_id : pages)
-            bpm_->DeletePage(page_id);
+        {
+            if (bpm_->IsPinned(page_id))
+                throw std::runtime_error("Cannot drop table: page " + std::to_string(page_id) + " is in use");
+        }
         first_page_id_ = INVALID_PAGE_ID;
         last_page_id_ = INVALID_PAGE_ID;
+        for (page_id_t page_id : pages)
+        {
+            if (!bpm_->DeletePage(page_id))
+                throw std::runtime_error("Failed to free table page " + std::to_string(page_id));
+        }
     }
 
 } // namespace sql

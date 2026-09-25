@@ -66,6 +66,9 @@ namespace sql
         bool UnpinPage(page_id_t page_id, bool is_dirty);
 
         bool FlushPage(page_id_t page_id);
+
+        // True if the page is cached and currently pinned
+        bool IsPinned(page_id_t page_id);
         bool FlushAll();
 
         // Remove a page from the pool and return it to the Pager free list.

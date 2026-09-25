@@ -183,7 +183,7 @@ namespace sql
         case DataType::BOOLEAN:
         {
             uint8_t v;
-            if (!ReadRaw(cursor, end, &v))
+            if (!ReadRaw(cursor, end, &v) || v > 1)
                 return false;
             *out = Value(v != 0);
             return true;

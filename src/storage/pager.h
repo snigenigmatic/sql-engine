@@ -63,6 +63,7 @@ namespace sql
     private:
         bool WriteHeader();
         bool ReadHeader();
+        bool IsValidHeaderPageId(page_id_t page_id) const;
 
         // Raw page access for either backend (page 0 included)
         bool RawRead(page_id_t page_id, char *out);
