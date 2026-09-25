@@ -1,5 +1,6 @@
 add_library(execution
     executor.cpp
+    evaluator.cpp
     seq_scan.cpp
     filter.cpp
     projection.cpp

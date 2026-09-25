@@ -105,6 +105,12 @@ namespace sql
                 }
                 return left == right ? left : PredicateTableSide::BOTH;
             }
+            case ExpressionType::UNARY_OP:
+                return ResolvePredicateSingleTable(static_cast<const UnaryExpression *>(expr)->operand.get(),
+                                                   left_table_name, right_table_name, left_table, right_table);
+            case ExpressionType::IS_NULL:
+                return ResolvePredicateSingleTable(static_cast<const IsNullExpression *>(expr)->operand.get(),
+                                                   left_table_name, right_table_name, left_table, right_table);
             default:
                 return PredicateTableSide::BOTH;
             }
@@ -141,6 +147,11 @@ namespace sql
 
             const auto *col_expr = static_cast<const ColumnExpression *>(bin->left.get());
             const auto *lit_expr = static_cast<const LiteralExpression *>(bin->right.get());
+            // Comparisons with NULL are never true, and NULLs are not indexed
+            if (lit_expr->value.IsNull())
+            {
+                return false;
+            }
             *column_name = col_expr->name;
             *op = bin->op;
             *literal_value = lit_expr->value;

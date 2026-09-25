@@ -108,7 +108,8 @@ namespace sql
         build_rows_.reserve(build_table->GetTupleCount());
         for (auto it = build_table->begin(); it != build_table->end(); ++it)
         {
-            if (build_index >= it->GetValueCount())
+            // NULL keys can never match, so they are not worth hashing
+            if (build_index >= it->GetValueCount() || it->GetValue(build_index).IsNull())
             {
                 continue;
             }
@@ -156,7 +157,8 @@ namespace sql
                 match_cursor_ = 0;
                 current_matches_.clear();
 
-                if (probe_key_index < 0 || static_cast<size_t>(probe_key_index) >= probe_tuple_.GetValueCount())
+                if (probe_key_index < 0 || static_cast<size_t>(probe_key_index) >= probe_tuple_.GetValueCount() ||
+                    probe_tuple_.GetValue(static_cast<size_t>(probe_key_index)).IsNull())
                 {
                     probe_valid_ = false;
                     continue;

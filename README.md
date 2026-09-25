@@ -9,7 +9,9 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Lexer and full SQL parser
 - Volcano/iterator query execution model
 - Full DML/DDL: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
-- `WHERE` clause with comparison and logical operators
+- `WHERE` clause with comparison and logical operators (`AND`, `OR`, `NOT`)
+- SQL `NULL`: `NULL` literals, `IS [NOT] NULL`, three-valued logic (a comparison with `NULL` is unknown, and `WHERE` keeps only true rows), and joins never match `NULL` keys
+- `INTEGER` and `FLOAT` values compare and combine numerically
 - Column projection (`SELECT col1, col2 ...`)
 - Disk-resident B+tree indexes: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`), maintained row by row on INSERT/UPDATE/DELETE
 - Query planner: automatically uses index scan when an index exists on the filtered column
@@ -20,7 +22,7 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, with statement-level rollback inside a transaction
 
 ### Planned
-- SQL coverage: NULL semantics, constraints, expressions in SELECT, `ORDER BY` / `LIMIT`, aggregates and `GROUP BY`, outer and multi-way joins (see [docs/roadmap.md](docs/roadmap.md))
+- SQL coverage: constraints, expressions in SELECT, `ORDER BY` / `LIMIT`, aggregates and `GROUP BY`, outer and multi-way joins (see [docs/roadmap.md](docs/roadmap.md))
 
 ## Building
 
@@ -167,6 +169,8 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
 - [x] **M4**: On-disk B+tree indexes keyed by (value, RID), maintained incrementally
 - [x] **M5**: Write-ahead log with crash recovery, checkpoints, and atomic per-statement commit/rollback
 - [x] **M6**: `BEGIN` / `COMMIT` / `ROLLBACK` with savepoint-based statement rollback (single connection, so serializable)
+- [ ] **M7**: SQL coverage
+  - [x] NULL semantics and a single shared expression evaluator
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

@@ -546,4 +546,46 @@ namespace sql
         EXPECT_THROW(parser.ParseStatement(), std::runtime_error);
     }
 
+    TEST(ParserTest, ParseNullAndIsNull)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a IS NULL OR b IS NOT NULL OR c = NULL;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        ASSERT_NE(select->where, nullptr);
+        // ((a IS NULL OR b IS NOT NULL) OR c = NULL)
+        auto *outer = static_cast<BinaryExpression *>(select->where.get());
+        ASSERT_EQ(outer->op, TokenType::OR);
+        auto *inner = static_cast<BinaryExpression *>(outer->left.get());
+        ASSERT_EQ(inner->left->GetType(), ExpressionType::IS_NULL);
+        EXPECT_FALSE(static_cast<IsNullExpression *>(inner->left.get())->negated);
+        ASSERT_EQ(inner->right->GetType(), ExpressionType::IS_NULL);
+        EXPECT_TRUE(static_cast<IsNullExpression *>(inner->right.get())->negated);
+        auto *eq = static_cast<BinaryExpression *>(outer->right.get());
+        ASSERT_EQ(eq->right->GetType(), ExpressionType::LITERAL);
+        EXPECT_TRUE(static_cast<LiteralExpression *>(eq->right.get())->value.IsNull());
+    }
+
+    TEST(ParserTest, NotBindsTighterThanAnd)
+    {
+        Lexer lexer("SELECT * FROM t WHERE NOT a = 1 AND b = 2;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        // (NOT (a = 1)) AND (b = 2)
+        auto *top = static_cast<BinaryExpression *>(select->where.get());
+        ASSERT_EQ(top->op, TokenType::AND);
+        ASSERT_EQ(top->left->GetType(), ExpressionType::UNARY_OP);
+        auto *not_expr = static_cast<UnaryExpression *>(top->left.get());
+        EXPECT_EQ(not_expr->op, TokenType::NOT);
+        EXPECT_EQ(not_expr->operand->GetType(), ExpressionType::BINARY_OP);
+    }
+
+    TEST(ParserTest, IsRequiresNull)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a IS 5;");
+        Parser parser(lexer);
+        EXPECT_THROW(parser.ParseStatement(), std::runtime_error);
+    }
+
 } // namespace sql

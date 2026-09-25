@@ -21,6 +21,7 @@ namespace sql
     private:
         // Evaluate an expression against a tuple, returns the resulting Value
         Value Evaluate(const Expression *expr, const Tuple &tuple) const;
+        Value ResolveColumn(const ColumnExpression &col, const Tuple &tuple) const;
 
         // Check if the predicate is satisfied by the tuple
         bool EvaluatePredicate(const Tuple &tuple) const;

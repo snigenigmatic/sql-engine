@@ -758,4 +758,123 @@ namespace sql
         EXPECT_EQ(row.GetValue(0).GetAsInt(), 5);
     }
 
+    // ── NULL semantics ────────────────────────────────────────────────────────────
+
+    static std::vector<int> Ids(const ExecutionResult &result)
+    {
+        std::vector<int> ids;
+        for (const auto &t : result.tuples)
+            ids.push_back(t.GetValue(0).GetAsInt());
+        return ids;
+    }
+
+    static void CreatePeople(Catalog &catalog)
+    {
+        RunSQL(catalog, "CREATE TABLE people (id INTEGER, name VARCHAR(20), age INTEGER);");
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO people VALUES (1, 'ann', 30), (2, NULL, 40), "
+                                    "(3, 'cy', NULL), (4, NULL, NULL);")
+                        .success);
+    }
+
+    TEST(IntegrationTest, NullValuesAreStoredWithColumnType)
+    {
+        Catalog catalog;
+        CreatePeople(catalog);
+        auto rows = RunSQL(catalog, "SELECT * FROM people;");
+        ASSERT_EQ(rows.tuples.size(), 4u);
+        EXPECT_TRUE(rows.tuples[1].GetValue(1).IsNull());
+        EXPECT_EQ(rows.tuples[1].GetValue(1).GetType(), DataType::VARCHAR);
+        EXPECT_EQ(rows.tuples[1].GetValue(1).ToString(), "NULL");
+    }
+
+    TEST(IntegrationTest, IsNullAndIsNotNull)
+    {
+        Catalog catalog;
+        CreatePeople(catalog);
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM people WHERE name IS NULL;")), (std::vector<int>{2, 4}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM people WHERE age IS NOT NULL;")), (std::vector<int>{1, 2}));
+    }
+
+    TEST(IntegrationTest, ComparisonsWithNullMatchNothing)
+    {
+        Catalog catalog;
+        CreatePeople(catalog);
+        EXPECT_TRUE(RunSQL(catalog, "SELECT id FROM people WHERE age = NULL;").tuples.empty());
+        EXPECT_TRUE(RunSQL(catalog, "SELECT id FROM people WHERE age <> NULL;").tuples.empty());
+        // Rows with a NULL age are neither > 35 nor NOT > 35
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM people WHERE age > 35;")), (std::vector<int>{2}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM people WHERE NOT age > 35;")), (std::vector<int>{1}));
+    }
+
+    TEST(IntegrationTest, ThreeValuedLogicInWhere)
+    {
+        Catalog catalog;
+        CreatePeople(catalog);
+        // NULL OR TRUE is TRUE; NULL AND TRUE is unknown
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM people WHERE age > 35 OR id = 3;")), (std::vector<int>{2, 3}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM people WHERE age < 100 AND id >= 2;")), (std::vector<int>{2}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM people WHERE NOT (name IS NULL OR age IS NULL);")),
+                  (std::vector<int>{1}));
+    }
+
+    TEST(IntegrationTest, NullInUpdateAndDelete)
+    {
+        Catalog catalog;
+        CreatePeople(catalog);
+        ASSERT_TRUE(RunSQL(catalog, "UPDATE people SET age = NULL WHERE id = 1;").success);
+        // UPDATE / DELETE with an unknown WHERE touch nothing
+        EXPECT_EQ(RunSQL(catalog, "UPDATE people SET name = 'x' WHERE age > 0;").message, "1 row(s) updated.");
+        EXPECT_EQ(RunSQL(catalog, "DELETE FROM people WHERE age = NULL;").message, "0 row(s) deleted.");
+        EXPECT_EQ(RunSQL(catalog, "DELETE FROM people WHERE age IS NULL;").message, "3 row(s) deleted.");
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM people;")), (std::vector<int>{2}));
+    }
+
+    TEST(IntegrationTest, NullJoinKeysNeverMatch)
+    {
+        // Every join algorithm: nested loop, hash join, index nested loop
+        for (const char *setup : {"", "HASH", "INDEX"})
+        {
+            Catalog catalog;
+            RunSQL(catalog, "CREATE TABLE a (k INTEGER, tag VARCHAR(5));");
+            RunSQL(catalog, "CREATE TABLE b (k INTEGER, tag VARCHAR(5));");
+            RunSQL(catalog, "INSERT INTO a VALUES (1, 'a1'), (NULL, 'aN');");
+            RunSQL(catalog, "INSERT INTO b VALUES (1, 'b1'), (NULL, 'bN');");
+            if (std::string(setup) == "HASH")
+            {
+                // Enough rows that the optimizer prefers a hash join
+                std::string sql = "INSERT INTO b VALUES ";
+                for (int i = 100; i < 400; ++i)
+                    sql += std::string(i > 100 ? ", " : "") + "(" + std::to_string(i) + ", 'x')";
+                RunSQL(catalog, sql + ";");
+            }
+            if (std::string(setup) == "INDEX")
+                RunSQL(catalog, "CREATE INDEX idx_b ON b (k);");
+
+            auto joined = RunSQL(catalog, "SELECT * FROM a JOIN b ON a.k = b.k;");
+            ASSERT_TRUE(joined.success) << setup << ": " << joined.message;
+            ASSERT_EQ(joined.tuples.size(), 1u) << setup;
+            EXPECT_EQ(joined.tuples[0].GetValue(1).GetAsString(), "a1") << setup;
+        }
+    }
+
+    TEST(IntegrationTest, IndexIgnoresNullsAndNullLiterals)
+    {
+        Catalog catalog;
+        CreatePeople(catalog);
+        RunSQL(catalog, "CREATE INDEX idx_age ON people (age);");
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM people WHERE age >= 0;")), (std::vector<int>{1, 2}));
+        EXPECT_TRUE(RunSQL(catalog, "SELECT id FROM people WHERE age > NULL;").tuples.empty());
+        auto explain = RunSQL(catalog, "EXPLAIN SELECT * FROM people WHERE age = NULL;");
+        EXPECT_EQ(explain.message.find("IndexScan"), std::string::npos) << explain.message;
+    }
+
+    TEST(IntegrationTest, MixedIntegerAndFloatComparisons)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE prices (id INTEGER, price FLOAT);");
+        RunSQL(catalog, "INSERT INTO prices VALUES (1, 4.5), (2, 5.0), (3, 7.25);");
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM prices WHERE price > 5;")), (std::vector<int>{3}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM prices WHERE price = 5;")), (std::vector<int>{2}));
+    }
+
 } // namespace sql

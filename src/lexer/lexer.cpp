@@ -274,6 +274,8 @@ namespace sql
              {"COMMIT", TokenType::COMMIT},
              {"ROLLBACK", TokenType::ROLLBACK},
              {"TRANSACTION", TokenType::TRANSACTION},
+             {"NULL", TokenType::NULL_KW},
+             {"IS", TokenType::IS},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

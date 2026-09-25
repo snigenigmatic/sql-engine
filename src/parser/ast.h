@@ -16,7 +16,9 @@ namespace sql
     {
         LITERAL,
         COLUMN_REF,
-        BINARY_OP
+        BINARY_OP,
+        UNARY_OP, // NOT
+        IS_NULL   // IS NULL / IS NOT NULL
     };
 
     struct Expression
@@ -47,6 +49,22 @@ namespace sql
         BinaryExpression(std::unique_ptr<Expression> l, TokenType o, std::unique_ptr<Expression> r)
             : left(std::move(l)), right(std::move(r)), op(o) {}
         ExpressionType GetType() const override { return ExpressionType::BINARY_OP; }
+    };
+
+    struct UnaryExpression : public Expression
+    {
+        TokenType op;
+        std::unique_ptr<Expression> operand;
+        UnaryExpression(TokenType o, std::unique_ptr<Expression> e) : op(o), operand(std::move(e)) {}
+        ExpressionType GetType() const override { return ExpressionType::UNARY_OP; }
+    };
+
+    struct IsNullExpression : public Expression
+    {
+        std::unique_ptr<Expression> operand;
+        bool negated; // IS NOT NULL
+        IsNullExpression(std::unique_ptr<Expression> e, bool n) : operand(std::move(e)), negated(n) {}
+        ExpressionType GetType() const override { return ExpressionType::IS_NULL; }
     };
 
     // --- Statements ---

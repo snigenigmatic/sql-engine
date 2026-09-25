@@ -77,7 +77,8 @@ namespace sql
                 ++inner_it_;
                 const Value &inner_key = inner_row.GetValue(inner_index);
 
-                if (outer_key.GetType() != inner_key.GetType())
+                // NULL never equals anything, including NULL
+                if (outer_key.IsNull() || inner_key.IsNull() || outer_key.GetType() != inner_key.GetType())
                 {
                     continue;
                 }
