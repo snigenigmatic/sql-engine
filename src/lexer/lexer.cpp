@@ -283,6 +283,13 @@ namespace sql
              {"LIKE", TokenType::LIKE},
              {"IN", TokenType::IN},
              {"BETWEEN", TokenType::BETWEEN},
+             {"ORDER", TokenType::ORDER},
+             {"BY", TokenType::BY},
+             {"ASC", TokenType::ASC},
+             {"DESC", TokenType::DESC},
+             {"LIMIT", TokenType::LIMIT},
+             {"OFFSET", TokenType::OFFSET},
+             {"DISTINCT", TokenType::DISTINCT},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

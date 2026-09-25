@@ -425,6 +425,18 @@ namespace sql
             }
             return std::make_unique<Filter>(std::move(child), node->predicate, filter_table);
         }
+        case PhysicalPlanType::SORT:
+        {
+            auto child = BuildOperatorTree(node->children.at(0).get(), table, join_table);
+            // Rows below the projection: the base table's, or joined rows
+            Table *context = join_context_table_ ? join_context_table_.get() : table;
+            return std::make_unique<Sort>(std::move(child), node->sort_keys, node->sort_descending, context);
+        }
+        case PhysicalPlanType::DISTINCT:
+            return std::make_unique<Distinct>(BuildOperatorTree(node->children.at(0).get(), table, join_table));
+        case PhysicalPlanType::LIMIT:
+            return std::make_unique<Limit>(BuildOperatorTree(node->children.at(0).get(), table, join_table),
+                                           node->limit, node->offset);
         case PhysicalPlanType::PROJECTION:
         {
             if (node->children.empty())
@@ -460,13 +472,15 @@ namespace sql
         materialized_tables_.clear();
         join_context_table_.reset();
         Optimizer optimizer;
-        auto physical_plan = optimizer.BuildPhysicalPlan(select, catalog_);
+        // Operators may point into the plan (e.g. sort keys the planner
+        // created), so it lives as long as the executor
+        physical_plan_ = optimizer.BuildPhysicalPlan(select, catalog_);
         Table *right = nullptr;
         if (select->join_table.has_value())
         {
             right = catalog_->GetTable(*select->join_table);
         }
-        return BuildOperatorTree(physical_plan.get(), table, right);
+        return BuildOperatorTree(physical_plan_.get(), table, right);
     }
 
     ExecutionResult Executor::ExecuteSelect(SelectStatement *select)

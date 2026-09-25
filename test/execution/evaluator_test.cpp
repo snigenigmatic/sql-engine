@@ -173,4 +173,15 @@ namespace sql
         EXPECT_EQ(between(Value(9), Value(), Value(5), false), "F");  // NULL AND FALSE
     }
 
+    TEST(EvaluatorTest, SortOrderIsTotal)
+    {
+        EXPECT_LT(CompareForSort(Value(DataType::INTEGER), Value(-100)), 0); // NULL first
+        EXPECT_EQ(CompareForSort(Value(), Value(DataType::VARCHAR)), 0);
+        EXPECT_LT(CompareForSort(Value(2), Value(2.5)), 0);                // numeric across types
+        EXPECT_EQ(CompareForSort(Value(2), Value(2.0)), 0);
+        EXPECT_GT(CompareForSort(Value("b"), Value("a")), 0);
+        EXPECT_NE(CompareForSort(Value(1), Value("1")), 0);                // different types never throw
+        EXPECT_EQ(CompareForSort(Value(1), Value("1")), -CompareForSort(Value("1"), Value(1)));
+    }
+
 } // namespace sql

@@ -37,6 +37,11 @@ namespace sql
     // type are returned unchanged.
     std::optional<Value> ConvertNumber(const Value &value, DataType target);
 
+    // Total order used by ORDER BY: NULL first, numbers by value (INTEGER
+    // and FLOAT together), other values by value within a type, and values
+    // of different types by type. Never throws.
+    int CompareForSort(const Value &a, const Value &b);
+
     // WHERE semantics: only TRUE qualifies; FALSE and NULL do not.
     // Throws if the value is not a boolean.
     bool IsTrue(const Value &value);

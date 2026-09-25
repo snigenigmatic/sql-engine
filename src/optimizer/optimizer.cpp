@@ -577,6 +577,17 @@ namespace sql
             }
         }
 
+        // ORDER BY sorts the rows before projection, so it can use columns
+        // that are not selected
+        if (!select->order_by.empty())
+        {
+            auto sort = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SORT);
+            ResolveSortKeys(*select, table, select->join_table ? catalog->GetTable(*select->join_table) : nullptr,
+                            sort.get());
+            sort->children.push_back(std::move(current));
+            current = std::move(sort);
+        }
+
         auto projection = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::PROJECTION);
         projection->project_all = select->select_star;
         projection->projected_columns = ProjectionLabels(*select);
@@ -587,7 +598,96 @@ namespace sql
                 projection->projected_exprs.push_back(item.expr.get());
         }
         projection->children.push_back(std::move(current));
-        return projection;
+        current = std::move(projection);
+
+        if (select->distinct)
+        {
+            auto distinct = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::DISTINCT);
+            distinct->children.push_back(std::move(current));
+            current = std::move(distinct);
+        }
+        if (select->limit || select->offset > 0)
+        {
+            auto limit = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::LIMIT);
+            limit->limit = select->limit;
+            limit->offset = select->offset;
+            limit->children.push_back(std::move(current));
+            current = std::move(limit);
+        }
+        return current;
+    }
+
+    void Optimizer::ResolveSortKeys(const SelectStatement &select, Table *table, Table *join_table,
+                                    PhysicalPlanNode *sort) const
+    {
+        for (const auto &order : select.order_by)
+        {
+            const Expression *key = order.expr.get();
+
+            // ORDER BY 2: the second output column
+            if (key->GetType() == ExpressionType::LITERAL)
+            {
+                const Value &v = static_cast<const LiteralExpression *>(key)->value;
+                if (!v.IsNull() && v.GetType() == DataType::INTEGER)
+                {
+                    const int64_t pos = v.GetAsInt();
+                    if (select.select_star)
+                    {
+                        // Output columns are the table's (then the joined table's)
+                        std::vector<std::string> names;
+                        for (const auto &col : table->GetSchema().GetColumns())
+                            names.push_back(join_table ? table->GetName() + "." + col.name : col.name);
+                        if (join_table)
+                        {
+                            for (const auto &col : join_table->GetSchema().GetColumns())
+                                names.push_back(join_table->GetName() + "." + col.name);
+                        }
+                        if (pos < 1 || pos > static_cast<int64_t>(names.size()))
+                            throw std::runtime_error("ORDER BY position " + std::to_string(pos) + " is out of range");
+                        sort->owned_exprs.push_back(std::make_unique<ColumnExpression>(names[static_cast<size_t>(pos - 1)]));
+                        key = sort->owned_exprs.back().get();
+                    }
+                    else
+                    {
+                        if (pos < 1 || pos > static_cast<int64_t>(select.items.size()))
+                            throw std::runtime_error("ORDER BY position " + std::to_string(pos) + " is out of range");
+                        key = select.items[static_cast<size_t>(pos - 1)].expr.get();
+                    }
+                }
+            }
+            // ORDER BY alias: that output column's expression
+            else if (key->GetType() == ExpressionType::COLUMN_REF)
+            {
+                const std::string &name = static_cast<const ColumnExpression *>(key)->name;
+                for (const auto &item : select.items)
+                {
+                    if (!item.alias.empty() && item.alias == name)
+                    {
+                        key = item.expr.get();
+                        break;
+                    }
+                }
+            }
+
+            // With DISTINCT, rows are only defined by the selected values
+            if (select.distinct)
+            {
+                bool selected = select.select_star && key->GetType() == ExpressionType::COLUMN_REF;
+                for (const auto &item : select.items)
+                {
+                    selected = selected || item.expr.get() == key ||
+                               (key->GetType() == ExpressionType::COLUMN_REF &&
+                                item.expr->GetType() == ExpressionType::COLUMN_REF &&
+                                static_cast<const ColumnExpression *>(item.expr.get())->name ==
+                                    static_cast<const ColumnExpression *>(key)->name);
+                }
+                if (!selected)
+                    throw std::runtime_error("With SELECT DISTINCT, ORDER BY expressions must appear in the select list");
+            }
+
+            sort->sort_keys.push_back(key);
+            sort->sort_descending.push_back(order.descending);
+        }
     }
 
     std::string Optimizer::ExplainPhysicalNode(const PhysicalPlanNode *node, int indent) const
@@ -658,6 +758,21 @@ namespace sql
             {
                 out << "\n" << pad << "  predicate:\n" << DumpExpression(node->predicate, indent + 2);
             }
+            break;
+        case PhysicalPlanType::SORT:
+            out << pad << "Sort(keys=[";
+            for (size_t i = 0; i < node->sort_keys.size(); ++i)
+            {
+                out << (i ? ", " : "") << ExpressionToSQL(node->sort_keys[i]) << (node->sort_descending[i] ? " DESC" : "");
+            }
+            out << "])";
+            break;
+        case PhysicalPlanType::DISTINCT:
+            out << pad << "Distinct";
+            break;
+        case PhysicalPlanType::LIMIT:
+            out << pad << "Limit(" << (node->limit ? "limit=" + std::to_string(*node->limit) : std::string("no limit"))
+                << ", offset=" << node->offset << ")";
             break;
         case PhysicalPlanType::PROJECTION:
             out << pad << "Projection(columns=";
