@@ -216,19 +216,82 @@ namespace sql
             if (entry.second->table == table_name)
                 result.push_back(entry.second.get());
         }
+        // Deterministic order (by name) so row operations are reproducible
+        std::sort(result.begin(), result.end(), [](const IndexInfo *a, const IndexInfo *b)
+                  { return a->name < b->name; });
         return result;
     }
+
+    namespace
+    {
+        // An index entry touched by a row operation, kept so the operation
+        // can be undone if a later step fails
+        struct IndexEntry
+        {
+            BTree *tree;
+            Value key;
+        };
+
+        // Undo helpers are best effort: storage that just failed may fail
+        // again, and the original error is the one worth reporting
+        void InsertEntries(const std::vector<IndexEntry> &entries, const RID &rid) noexcept
+        {
+            for (const auto &entry : entries)
+            {
+                try
+                {
+                    entry.tree->Insert(entry.key, rid);
+                }
+                catch (...)
+                {
+                }
+            }
+        }
+
+        void RemoveEntries(const std::vector<IndexEntry> &entries, const RID &rid) noexcept
+        {
+            for (const auto &entry : entries)
+            {
+                try
+                {
+                    entry.tree->Remove(entry.key, rid);
+                }
+                catch (...)
+                {
+                }
+            }
+        }
+    } // namespace
 
     RID Catalog::InsertRow(Table *table, const Tuple &tuple)
     {
         auto indexes = GetTableIndexes(table->GetName());
         CheckIndexKeys(indexes, tuple);
         RID rid = table->Insert(tuple);
-        for (IndexInfo *index : indexes)
+
+        std::vector<IndexEntry> inserted;
+        try
         {
-            const Value &value = tuple.GetValue(static_cast<size_t>(index->column_index));
-            if (!value.IsNull())
+            for (IndexInfo *index : indexes)
+            {
+                const Value &value = tuple.GetValue(static_cast<size_t>(index->column_index));
+                if (value.IsNull())
+                    continue;
                 index->tree->Insert(value, rid);
+                inserted.push_back({index->tree.get(), value});
+            }
+        }
+        catch (...)
+        {
+            RemoveEntries(inserted, rid);
+            try
+            {
+                table->DeleteTuple(rid);
+            }
+            catch (...)
+            {
+            }
+            throw;
         }
         return rid;
     }
@@ -238,13 +301,30 @@ namespace sql
         Tuple old_tuple;
         if (!table->GetTuple(rid, &old_tuple))
             return false;
-        for (IndexInfo *index : GetTableIndexes(table->GetName()))
+
+        // Remove index entries first so a failure never leaves entries
+        // pointing at a deleted row
+        std::vector<IndexEntry> removed;
+        try
         {
-            const Value &value = old_tuple.GetValue(static_cast<size_t>(index->column_index));
-            if (!value.IsNull())
-                index->tree->Remove(value, rid);
+            for (IndexInfo *index : GetTableIndexes(table->GetName()))
+            {
+                const Value &value = old_tuple.GetValue(static_cast<size_t>(index->column_index));
+                if (!value.IsNull() && index->tree->Remove(value, rid))
+                    removed.push_back({index->tree.get(), value});
+            }
+            if (!table->DeleteTuple(rid))
+            {
+                InsertEntries(removed, rid);
+                return false;
+            }
         }
-        return table->DeleteTuple(rid);
+        catch (...)
+        {
+            InsertEntries(removed, rid);
+            throw;
+        }
+        return true;
     }
 
     bool Catalog::UpdateRow(Table *table, const RID &rid, const Tuple &tuple)
@@ -255,21 +335,64 @@ namespace sql
         auto indexes = GetTableIndexes(table->GetName());
         CheckIndexKeys(indexes, tuple);
 
+        // 1. Remove the old entries, then 2. rewrite the row (it may move)
+        std::vector<IndexEntry> removed;
         RID new_rid;
-        if (!table->UpdateTuple(rid, tuple, &new_rid))
-            return false;
+        try
+        {
+            for (IndexInfo *index : indexes)
+            {
+                const Value &old_value = old_tuple.GetValue(static_cast<size_t>(index->column_index));
+                if (!old_value.IsNull() && index->tree->Remove(old_value, rid))
+                    removed.push_back({index->tree.get(), old_value});
+            }
+            if (!table->UpdateTuple(rid, tuple, &new_rid))
+            {
+                InsertEntries(removed, rid);
+                return false;
+            }
+        }
+        catch (...)
+        {
+            InsertEntries(removed, rid);
+            throw;
+        }
+
+        // 3. Add the new entries at the row's final location
+        std::vector<IndexEntry> new_entries;
         for (IndexInfo *index : indexes)
         {
-            const auto col = static_cast<size_t>(index->column_index);
-            const Value &old_value = old_tuple.GetValue(col);
-            const Value &new_value = tuple.GetValue(col);
-            if (rid == new_rid && BTree::CompareKeys(old_value, new_value) == 0 &&
-                old_value.IsNull() == new_value.IsNull())
-                continue; // entry unchanged
-            if (!old_value.IsNull())
-                index->tree->Remove(old_value, rid);
+            const Value &new_value = tuple.GetValue(static_cast<size_t>(index->column_index));
             if (!new_value.IsNull())
-                index->tree->Insert(new_value, new_rid);
+                new_entries.push_back({index->tree.get(), new_value});
+        }
+        size_t inserted = 0;
+        try
+        {
+            for (; inserted < new_entries.size(); ++inserted)
+                new_entries[inserted].tree->Insert(new_entries[inserted].key, new_rid);
+        }
+        catch (...)
+        {
+            RemoveEntries(std::vector<IndexEntry>(new_entries.begin(), new_entries.begin() + static_cast<long>(inserted)),
+                          new_rid);
+            // Put the old contents back (the row may move again) and point
+            // the old entries at it. If that fails too, index the row as it
+            // is actually stored.
+            RID restored = new_rid;
+            bool reverted = false;
+            try
+            {
+                reverted = table->UpdateTuple(new_rid, old_tuple, &restored);
+            }
+            catch (...)
+            {
+            }
+            if (reverted)
+                InsertEntries(removed, restored);
+            else
+                InsertEntries(new_entries, new_rid);
+            throw;
         }
         return true;
     }

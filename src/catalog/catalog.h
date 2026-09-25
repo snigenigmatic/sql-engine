@@ -69,7 +69,7 @@ namespace sql
         // Retrieve a BTree for a given table/column (nullptr if no index)
         BTree *GetIndex(const std::string &table_name, const std::string &column_name);
 
-        // All indexes defined on a table
+        // All indexes defined on a table, ordered by index name
         std::vector<IndexInfo *> GetTableIndexes(const std::string &table_name);
 
         // Row modifications that keep every index on the table in sync.

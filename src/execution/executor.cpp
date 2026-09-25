@@ -630,7 +630,10 @@ namespace sql
             }
 
             for (const RID &rid : to_delete)
-                catalog_->DeleteRow(table, rid);
+            {
+                if (!catalog_->DeleteRow(table, rid))
+                    throw std::runtime_error("Failed to delete row " + rid.ToString());
+            }
             result.success = true;
             result.message = std::to_string(to_delete.size()) + " row(s) deleted.";
         }
@@ -685,7 +688,10 @@ namespace sql
 
             // Apply all updates
             for (const auto &update_pair : updates)
-                catalog_->UpdateRow(table, update_pair.first, update_pair.second);
+            {
+                if (!catalog_->UpdateRow(table, update_pair.first, update_pair.second))
+                    throw std::runtime_error("Failed to update row " + update_pair.first.ToString());
+            }
 
             result.success = true;
             result.message = std::to_string(updates.size()) + " row(s) updated.";

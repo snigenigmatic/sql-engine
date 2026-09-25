@@ -77,6 +77,9 @@ namespace sql
         // Height of the tree (1 = root is a leaf)
         int GetHeight() const;
 
+        // Leaf page where a lookup for key starts (diagnostics and tests)
+        page_id_t GetLeafPageForKey(const Value &key) const { return FindLeafForKey(key); }
+
         // Return every page to the free list. The tree is unusable afterwards.
         // Throws std::runtime_error (before freeing anything) if a page is
         // still pinned, or if the pager fails to free a page.
