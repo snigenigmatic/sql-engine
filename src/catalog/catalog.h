@@ -12,6 +12,16 @@
 namespace sql
 {
 
+    // A named index on one column of a table, backed by an on-disk B+ tree
+    struct IndexInfo
+    {
+        std::string name;
+        std::string table;
+        std::string column;
+        int column_index = -1;
+        std::unique_ptr<BTree> tree;
+    };
+
     class Catalog
     {
     public:
@@ -50,15 +60,24 @@ namespace sql
         // Get all table names, sorted
         std::vector<std::string> GetTableNames() const;
 
-        // Build a BTree index on table.column from current data; returns false on error
+        // Build a BTree index on table.column from current data. Returns false
+        // if the name is taken or the table/column does not exist; throws
+        // std::invalid_argument if an existing value cannot be indexed.
         bool CreateIndex(const std::string &index_name, const std::string &table_name,
                          const std::string &column_name);
 
-        // Retrieve the BTree for a given table/column (nullptr if no index)
+        // Retrieve a BTree for a given table/column (nullptr if no index)
         BTree *GetIndex(const std::string &table_name, const std::string &column_name);
 
-        // Rebuild all indexes for a table (call after INSERT / DELETE / UPDATE)
-        void RebuildIndexesForTable(const std::string &table_name);
+        // All indexes defined on a table
+        std::vector<IndexInfo *> GetTableIndexes(const std::string &table_name);
+
+        // Row modifications that keep every index on the table in sync.
+        // Index keys are validated before the table is touched, so a row is
+        // either written with all its index entries or not at all.
+        RID InsertRow(Table *table, const Tuple &tuple);
+        bool DeleteRow(Table *table, const RID &rid);
+        bool UpdateRow(Table *table, const RID &rid, const Tuple &tuple);
 
     private:
         // Owned storage for in-memory catalogs. Declared before tables_ so
@@ -81,16 +100,14 @@ namespace sql
                             const std::string &definition);
         void DeleteSchemaRow(const std::string &type, const std::string &name);
 
-        // Build (or rebuild) the BTree for table.column from current rows
-        void BuildIndex(Table *table, int col_idx, BTree *btree);
+        // Create a tree for the index and insert every existing row
+        void PopulateIndex(Table *table, IndexInfo *index);
+        void CheckIndexKeys(const std::vector<IndexInfo *> &indexes, const Tuple &tuple) const;
 
         std::unordered_map<std::string, std::unique_ptr<Table>> tables_;
 
-        // table_name -> (column_name -> BTree)
-        std::unordered_map<std::string, std::unordered_map<std::string, BTree>> indexes_;
-
-        // index_name -> (table_name, column_name) — for duplicate detection
-        std::unordered_map<std::string, std::pair<std::string, std::string>> index_registry_;
+        // index name -> index
+        std::unordered_map<std::string, std::unique_ptr<IndexInfo>> indexes_;
     };
 
 } // namespace sql

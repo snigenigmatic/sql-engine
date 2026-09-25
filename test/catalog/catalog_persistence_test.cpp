@@ -3,6 +3,7 @@
 #include "execution/executor.h"
 #include "lexer/lexer.h"
 #include "parser/parser.h"
+#include "storage/table_heap.h"
 #include <cstdio>
 #include <string>
 #include <unistd.h>
@@ -176,6 +177,82 @@ namespace sql
         ASSERT_TRUE(Run(*db, "INSERT INTO m VALUES (1), (2);").success);
         EXPECT_EQ(Run(*db, "SELECT * FROM m;").tuples.size(), 2u);
         EXPECT_EQ(db->GetPath(), ":memory:");
+    }
+
+    TEST_F(CatalogPersistenceTest, IndexIsStoredOnDiskAndMaintainedAcrossReopen)
+    {
+        {
+            auto db = OpenDb();
+            Run(*db, "CREATE TABLE t (id INTEGER, name VARCHAR(20));");
+            std::string sql = "INSERT INTO t VALUES ";
+            for (int i = 0; i < 2000; ++i)
+                sql += std::string(i ? ", " : "") + "(" + std::to_string(i) + ", 'n" + std::to_string(i) + "')";
+            ASSERT_TRUE(Run(*db, sql + ";").success);
+            ASSERT_TRUE(Run(*db, "CREATE INDEX idx_t_id ON t (id);").success);
+        }
+        {
+            auto db = OpenDb();
+            BTree *index = db->GetCatalog().GetIndex("t", "id");
+            ASSERT_NE(index, nullptr);
+            EXPECT_GE(index->GetHeight(), 2); // loaded from pages, not rebuilt
+            EXPECT_EQ(index->Search(Value(1999)).size(), 1u);
+
+            // Keep modifying through the reopened index
+            ASSERT_TRUE(Run(*db, "INSERT INTO t VALUES (5000, 'new');").success);
+            ASSERT_TRUE(Run(*db, "DELETE FROM t WHERE id < 1000;").success);
+            ASSERT_TRUE(Run(*db, "UPDATE t SET id = 7000 WHERE id = 1500;").success);
+        }
+        auto db = OpenDb();
+        EXPECT_EQ(Run(*db, "SELECT * FROM t WHERE id = 5000;").tuples.size(), 1u);
+        EXPECT_EQ(Run(*db, "SELECT * FROM t WHERE id = 10;").tuples.size(), 0u);
+        EXPECT_EQ(Run(*db, "SELECT * FROM t WHERE id = 1500;").tuples.size(), 0u);
+        auto moved = Run(*db, "SELECT name FROM t WHERE id = 7000;");
+        ASSERT_EQ(moved.tuples.size(), 1u);
+        EXPECT_EQ(moved.tuples[0].GetValue(0).GetAsString(), "n1500");
+        EXPECT_EQ(Run(*db, "SELECT * FROM t WHERE id >= 1000;").tuples.size(), 1001u);
+        EXPECT_EQ(db->GetCatalog().GetIndex("t", "id")->GetAllEntries().size(), 1001u);
+    }
+
+    TEST_F(CatalogPersistenceTest, IndexWithoutStoredTreeIsBuiltOnOpen)
+    {
+        // Databases written before indexes were stored on disk record
+        // root_page = -1 for indexes; opening one builds and records the tree
+        {
+            auto db = OpenDb();
+            Run(*db, "CREATE TABLE t (id INTEGER);");
+            Run(*db, "INSERT INTO t VALUES (1), (2), (3);");
+        }
+        {
+            Pager pager;
+            ASSERT_TRUE(pager.Open(path_));
+            BufferPoolManager bpm(8, &pager);
+            TableHeap schema(&bpm, pager.GetCatalogRoot());
+            schema.InsertTuple(Tuple({Value("index"), Value("old_idx"), Value("t"),
+                                      Value(static_cast<int32_t>(INVALID_PAGE_ID)), Value("id")}));
+        }
+        {
+            auto db = OpenDb();
+            ASSERT_NE(db->GetCatalog().GetIndex("t", "id"), nullptr);
+            EXPECT_EQ(db->GetCatalog().GetIndex("t", "id")->Search(Value(2)).size(), 1u);
+        }
+        auto db = OpenDb();
+        EXPECT_EQ(db->GetCatalog().GetIndex("t", "id")->Search(Value(3)).size(), 1u);
+        auto explain = Run(*db, "EXPLAIN SELECT * FROM t WHERE id = 3;");
+        EXPECT_NE(explain.message.find("IndexScan"), std::string::npos);
+    }
+
+    TEST_F(CatalogPersistenceTest, CreateIndexFailsCleanlyOnUnindexableValue)
+    {
+        auto db = OpenDb();
+        Run(*db, "CREATE TABLE t (s VARCHAR(3000));");
+        Run(*db, "INSERT INTO t VALUES ('short'), ('" + std::string(2000, 'x') + "');");
+        auto result = Run(*db, "CREATE INDEX idx_s ON t (s);");
+        EXPECT_FALSE(result.success);
+        EXPECT_NE(result.message.find("Index key too large"), std::string::npos) << result.message;
+        EXPECT_EQ(db->GetCatalog().GetIndex("t", "s"), nullptr);
+        // Name is not taken by the failed attempt
+        Run(*db, "DELETE FROM t WHERE s = '" + std::string(2000, 'x') + "';");
+        EXPECT_TRUE(Run(*db, "CREATE INDEX idx_s ON t (s);").success);
     }
 
 } // namespace sql

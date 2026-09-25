@@ -632,18 +632,23 @@ namespace sql
         RunSQL(catalog, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
         RunSQL(catalog, "CREATE INDEX idx_s ON t (s);");
 
-        // Row 1 grows and is applied; row 2's new value is too large and fails
-        std::string ok_value(2000, 'k');
+        // Row 1 grows (and may move) and its index entry follows it
+        std::string ok_value(600, 'k');
         auto update = RunSQL(catalog, "UPDATE t SET s = '" + ok_value + "' WHERE id = 1;");
-        ASSERT_TRUE(update.success);
-        auto failing = RunSQL(catalog, "UPDATE t SET s = '" + std::string(5000, 'z') + "' WHERE id >= 2;");
+        ASSERT_TRUE(update.success) << update.message;
+
+        // A value too large to index is rejected before the row is modified
+        auto failing = RunSQL(catalog, "UPDATE t SET s = '" + std::string(2000, 'z') + "' WHERE id >= 2;");
         EXPECT_FALSE(failing.success);
+        EXPECT_NE(failing.message.find("Index key too large"), std::string::npos) << failing.message;
 
         auto via_index = RunSQL(catalog, "SELECT id FROM t WHERE s = '" + ok_value + "';");
         ASSERT_EQ(via_index.tuples.size(), 1u);
         EXPECT_EQ(via_index.tuples[0].GetValue(0).GetAsInt(), 1);
         auto untouched = RunSQL(catalog, "SELECT id FROM t WHERE s = 'b';");
         EXPECT_EQ(untouched.tuples.size(), 1u);
+        auto also_untouched = RunSQL(catalog, "SELECT id FROM t WHERE s = 'c';");
+        EXPECT_EQ(also_untouched.tuples.size(), 1u);
     }
 
     TEST(IntegrationTest, DropTableRemovesItsIndexes)
