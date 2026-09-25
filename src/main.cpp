@@ -8,15 +8,18 @@
 #include "parser/parser.h"
 #include "catalog/catalog.h"
 #include "execution/executor.h"
-#include "storage/disk_manager.h"
+#include "catalog/database.h"
+#include "catalog/legacy_import.h"
+#include <memory>
+#include <sys/stat.h>
 
-sql::Catalog g_catalog;
-sql::DiskManager g_disk_manager;
+std::unique_ptr<sql::Database> g_db;
 
 void PrintBanner()
 {
     std::cout << "========================================\n";
     std::cout << "  SQL Engine v0.2.0\n";
+    std::cout << "  Database: " << g_db->GetPath() << "\n";
     std::cout << "  Type 'help' for help, 'quit' to exit\n";
     std::cout << "========================================\n\n";
 }
@@ -25,8 +28,8 @@ void PrintHelp()
 {
     std::cout << "Available commands:\n";
     std::cout << "  help   - Show this help message\n";
-    std::cout << "  quit   - Exit the program (auto-saves)\n";
-    std::cout << "  save   - Save all tables to disk\n";
+    std::cout << "  quit   - Exit the program\n";
+    std::cout << "  save   - Flush all pages to the database file\n";
     std::cout << "  tables - List all tables\n";
     std::cout << "\nSQL commands (end with semicolon):\n";
     std::cout << "  CREATE TABLE t (col1 INTEGER, col2 VARCHAR(50), col3 BOOLEAN);\n";
@@ -35,7 +38,8 @@ void PrintHelp()
     std::cout << "  SELECT col1, col2 FROM t WHERE col1 > 5;\n";
     std::cout << "  UPDATE t SET col1 = 10 WHERE col2 = 'hello';\n";
     std::cout << "  DELETE FROM t WHERE col1 = 1;\n";
-    std::cout << "\nData is stored in: .sqlengine/\n";
+    std::cout << "\nData is stored in: " << g_db->GetPath()
+              << " (written after every statement)\n";
 }
 
 void PrintResults(const sql::ExecutionResult &result)
@@ -94,7 +98,7 @@ void PrintResults(const sql::ExecutionResult &result)
 
 void ListTables()
 {
-    auto names = g_catalog.GetTableNames();
+    auto names = g_db->GetCatalog().GetTableNames();
     if (names.empty())
     {
         std::cout << "No tables.\n";
@@ -103,7 +107,7 @@ void ListTables()
     std::cout << "Tables:\n";
     for (const auto &name : names)
     {
-        sql::Table *t = g_catalog.GetTable(name);
+        sql::Table *t = g_db->GetCatalog().GetTable(name);
         const auto &cols = t->GetSchema().GetColumns();
         std::cout << "  " << name << " (" << t->GetTupleCount() << " rows) - columns: ";
         for (size_t i = 0; i < cols.size(); ++i)
@@ -129,9 +133,16 @@ void ExecuteSQL(const std::string &sql_input)
             return;
         }
 
-        sql::Executor executor(&g_catalog);
+        sql::Executor executor(&g_db->GetCatalog());
         auto result = executor.Execute(stmt.get());
         PrintResults(result);
+
+        const auto type = stmt->GetType();
+        if (type != sql::StatementType::SELECT && type != sql::StatementType::EXPLAIN_STMT &&
+            !g_db->Flush())
+        {
+            std::cout << "Warning: failed to write changes to " << g_db->GetPath() << "\n";
+        }
     }
     catch (const std::exception &e)
     {
@@ -139,13 +150,61 @@ void ExecuteSQL(const std::string &sql_input)
     }
 }
 
-int main()
+// True if the path names an existing, non-empty file
+bool DatabaseFileHasContent(const std::string &path)
 {
-    if (g_disk_manager.LoadCatalog(g_catalog))
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && st.st_size > 0;
+}
+
+int main(int argc, char **argv)
+{
+    std::string path = "sqlengine.db";
+    if (argc > 1)
     {
-        auto tables = g_catalog.GetTableNames();
+        std::string arg = argv[1];
+        if (arg == "-h" || arg == "--help")
+        {
+            std::cout << "Usage: " << argv[0] << " [database-file]   (default: sqlengine.db)\n";
+            return 0;
+        }
+        path = arg;
+    }
+
+    // One-time migration of text snapshots written by earlier versions. It
+    // only runs when the database file does not exist yet, and is all or
+    // nothing: a failed import leaves no database behind and is retried on
+    // the next launch.
+    std::string error;
+    sql::LegacyImporter legacy;
+    bool imported = false;
+    if (!DatabaseFileHasContent(path) && legacy.HasSnapshot())
+    {
+        size_t table_count = 0;
+        if (!sql::MigrateLegacySnapshot(legacy.GetDirectory(), path, &table_count, &error))
+        {
+            std::cerr << "Error: could not import legacy snapshot from " << legacy.GetDirectory()
+                      << "/: " << error << "\n"
+                      << "No database was created. Fix or move the snapshot aside, then retry.\n";
+            return 1;
+        }
+        std::cout << "Imported " << table_count << " table(s) from legacy snapshot "
+                  << legacy.GetDirectory() << "/\n";
+        imported = true;
+    }
+
+    g_db = sql::Database::Open(path, &error);
+    if (!g_db)
+    {
+        std::cerr << "Error: " << error << "\n";
+        return 1;
+    }
+
+    if (!imported)
+    {
+        auto tables = g_db->GetCatalog().GetTableNames();
         if (!tables.empty())
-            std::cout << "Loaded " << tables.size() << " table(s) from disk.\n";
+            std::cout << "Loaded " << tables.size() << " table(s) from " << path << ".\n";
     }
 
     PrintBanner();
@@ -182,17 +241,15 @@ int main()
 
             if (command == "quit" || command == "exit" || command == "q")
             {
-                if (g_disk_manager.SaveCatalog(g_catalog))
-                    std::cout << "Data saved.\n";
                 std::cout << "Goodbye!\n";
                 break;
             }
             else if (command == "save")
             {
-                if (g_disk_manager.SaveCatalog(g_catalog))
-                    std::cout << "All tables saved to disk.\n";
+                if (g_db->Flush())
+                    std::cout << "All changes written to " << g_db->GetPath() << ".\n";
                 else
-                    std::cout << "Error saving data.\n";
+                    std::cout << "Error writing to " << g_db->GetPath() << ".\n";
                 continue;
             }
             else if (command == "help" || command == "h")
@@ -216,5 +273,8 @@ int main()
         }
     }
 
+    if (!g_db->Flush())
+        std::cerr << "Warning: failed to write changes to " << g_db->GetPath() << "\n";
+    g_db.reset();
     return 0;
 }
