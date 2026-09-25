@@ -306,20 +306,34 @@ namespace sql
 
     std::unique_ptr<Expression> Parser::ParseTerm()
     {
-        auto left = ParseComparison();
+        auto left = ParseNot();
         while (current_token_.type == TokenType::AND)
         {
             TokenType op = current_token_.type;
             NextToken();
-            auto right = ParseComparison();
+            auto right = ParseNot();
             left = std::make_unique<BinaryExpression>(std::move(left), op, std::move(right));
         }
         return left;
     }
 
+    // NOT binds tighter than AND / OR and looser than comparisons
+    std::unique_ptr<Expression> Parser::ParseNot()
+    {
+        if (Match(TokenType::NOT))
+            return std::make_unique<UnaryExpression>(TokenType::NOT, ParseNot());
+        return ParseComparison();
+    }
+
     std::unique_ptr<Expression> Parser::ParseComparison()
     {
         auto left = ParsePrimary();
+        if (Match(TokenType::IS))
+        {
+            const bool negated = Match(TokenType::NOT);
+            Expect(TokenType::NULL_KW);
+            return std::make_unique<IsNullExpression>(std::move(left), negated);
+        }
         if (current_token_.type == TokenType::EQ ||
             current_token_.type == TokenType::NEQ ||
             current_token_.type == TokenType::LT ||
@@ -361,6 +375,8 @@ namespace sql
             return std::make_unique<LiteralExpression>(Value(true));
         case TokenType::FALSE:
             return std::make_unique<LiteralExpression>(Value(false));
+        case TokenType::NULL_KW:
+            return std::make_unique<LiteralExpression>(Value()); // untyped NULL
         case TokenType::FLOAT_LITERAL:
             return std::make_unique<LiteralExpression>(Value(std::stod(t.value)));
         case TokenType::LPAREN:

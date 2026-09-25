@@ -43,3 +43,4 @@ add_sqlengine_test(crash_recovery_test recovery/crash_recovery_test.cpp)
 
 # Session tests
 add_sqlengine_test(session_test session/session_test.cpp)
+add_sqlengine_test(evaluator_test execution/evaluator_test.cpp)

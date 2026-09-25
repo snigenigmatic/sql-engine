@@ -22,6 +22,10 @@ namespace sql
             return "COLUMN_REF";
         case ExpressionType::BINARY_OP:
             return "BINARY_OP";
+        case ExpressionType::UNARY_OP:
+            return "UNARY_OP";
+        case ExpressionType::IS_NULL:
+            return "IS_NULL";
         default:
             return "UNKNOWN_EXPRESSION";
         }
@@ -82,6 +86,20 @@ namespace sql
             out << Indent(indent) << "BinaryOp(" << TokenToString(binary->op) << ")\n";
             out << DumpExpression(binary->left.get(), indent + 1) << "\n";
             out << DumpExpression(binary->right.get(), indent + 1);
+            break;
+        }
+        case ExpressionType::UNARY_OP:
+        {
+            const auto *unary = static_cast<const UnaryExpression *>(expr);
+            out << Indent(indent) << "UnaryOp(" << TokenToString(unary->op) << ")\n";
+            out << DumpExpression(unary->operand.get(), indent + 1);
+            break;
+        }
+        case ExpressionType::IS_NULL:
+        {
+            const auto *is_null = static_cast<const IsNullExpression *>(expr);
+            out << Indent(indent) << (is_null->negated ? "IsNotNull" : "IsNull") << "\n";
+            out << DumpExpression(is_null->operand.get(), indent + 1);
             break;
         }
         default:

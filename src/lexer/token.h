@@ -39,6 +39,8 @@ namespace sql
         COMMIT,
         ROLLBACK,
         TRANSACTION,
+        NULL_KW,
+        IS,
 
         // Identifiers and Literals
         IDENTIFIER,

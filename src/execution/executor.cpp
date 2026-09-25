@@ -1,4 +1,5 @@
 #include "execution/executor.h"
+#include "execution/evaluator.h"
 #include <stdexcept>
 #include <utility>
 
@@ -112,129 +113,72 @@ namespace sql
         return {left_col, right_col};
     }
 
-    Value Executor::EvaluateExpr(const Expression *expr, const Tuple *tuple, Table *table) const
+    Value Executor::ResolveColumnValue(const ColumnExpression &col, const Tuple *tuple, Table *table) const
     {
-        if (!expr)
-            throw std::runtime_error("Null expression");
+        if (!tuple || !table)
+            throw std::runtime_error("Column reference without tuple context");
+        const size_t dot = col.name.find('.');
+        int idx = -1;
+        if (dot != std::string::npos)
+        {
+            const std::string qualifier = col.name.substr(0, dot);
+            const std::string unqualified = col.name.substr(dot + 1);
 
-        switch (expr->GetType())
-        {
-        case ExpressionType::LITERAL:
-            return static_cast<const LiteralExpression *>(expr)->value;
-        case ExpressionType::COLUMN_REF:
-        {
-            if (!tuple || !table)
-                throw std::runtime_error("Column reference without tuple context");
-            const auto *col = static_cast<const ColumnExpression *>(expr);
-            const size_t dot = col->name.find('.');
-            int idx = -1;
-            if (dot != std::string::npos)
+            // Join context stores qualified column names directly.
+            if (table->GetName() == "__join_context__")
             {
-                const std::string qualifier = col->name.substr(0, dot);
-                const std::string unqualified = col->name.substr(dot + 1);
-
-                // Join context stores qualified column names directly.
-                if (table->GetName() == "__join_context__")
-                {
-                    idx = table->GetColumnIndex(col->name);
-                    if (idx < 0)
-                    {
-                        throw std::runtime_error("Unknown column: " + col->name);
-                    }
-                    return tuple->GetValue(static_cast<size_t>(idx));
-                }
-
-                if (qualifier != table->GetName())
-                {
-                    throw std::runtime_error("Unknown table qualifier in column: " + col->name);
-                }
-
-                idx = table->GetColumnIndex(unqualified);
+                idx = table->GetColumnIndex(col.name);
                 if (idx < 0)
                 {
-                    throw std::runtime_error("Unknown column: " + col->name);
+                    throw std::runtime_error("Unknown column: " + col.name);
                 }
                 return tuple->GetValue(static_cast<size_t>(idx));
             }
 
-            idx = table->GetColumnIndex(col->name);
+            if (qualifier != table->GetName())
+            {
+                throw std::runtime_error("Unknown table qualifier in column: " + col.name);
+            }
+
+            idx = table->GetColumnIndex(unqualified);
             if (idx < 0)
             {
-                const std::string stripped = StripQualifier(col->name);
-                int matched_idx = -1;
-                const auto &columns = table->GetSchema().GetColumns();
-                for (size_t i = 0; i < columns.size(); ++i)
-                {
-                    const std::string schema_col = columns[i].name;
-                    const std::string schema_stripped = StripQualifier(schema_col);
-                    if (schema_stripped != stripped)
-                    {
-                        continue;
-                    }
-                    if (matched_idx >= 0)
-                    {
-                        throw std::runtime_error("Ambiguous column: " + col->name);
-                    }
-                    matched_idx = static_cast<int>(i);
-                }
-                idx = matched_idx;
+                throw std::runtime_error("Unknown column: " + col.name);
             }
-            if (idx < 0)
-                throw std::runtime_error("Unknown column: " + col->name);
             return tuple->GetValue(static_cast<size_t>(idx));
         }
-        case ExpressionType::BINARY_OP:
+
+        idx = table->GetColumnIndex(col.name);
+        if (idx < 0)
         {
-            const auto *bin = static_cast<const BinaryExpression *>(expr);
-            Value left = EvaluateExpr(bin->left.get(), tuple, table);
-            Value right = EvaluateExpr(bin->right.get(), tuple, table);
-            switch (bin->op)
+            const std::string stripped = StripQualifier(col.name);
+            int matched_idx = -1;
+            const auto &columns = table->GetSchema().GetColumns();
+            for (size_t i = 0; i < columns.size(); ++i)
             {
-            case TokenType::EQ:
-                return Value(left == right);
-            case TokenType::NEQ:
-                return Value(left != right);
-            case TokenType::LT:
-                return Value(left < right);
-            case TokenType::GT:
-                return Value(left > right);
-            case TokenType::LEQ:
-                return Value(left <= right);
-            case TokenType::GEQ:
-                return Value(left >= right);
-            case TokenType::AND:
-                return Value(left.GetAsBool() && right.GetAsBool());
-            case TokenType::OR:
-                return Value(left.GetAsBool() || right.GetAsBool());
-            case TokenType::PLUS:
-                if (left.GetType() == DataType::INTEGER && right.GetType() == DataType::INTEGER)
-                    return Value(left.GetAsInt() + right.GetAsInt());
-                return Value(left.GetAsFloat() + right.GetAsFloat());
-            case TokenType::MINUS:
-                if (left.GetType() == DataType::INTEGER && right.GetType() == DataType::INTEGER)
-                    return Value(left.GetAsInt() - right.GetAsInt());
-                return Value(left.GetAsFloat() - right.GetAsFloat());
-            case TokenType::STAR:
-                if (left.GetType() == DataType::INTEGER && right.GetType() == DataType::INTEGER)
-                    return Value(left.GetAsInt() * right.GetAsInt());
-                return Value(left.GetAsFloat() * right.GetAsFloat());
-            case TokenType::SLASH:
-                if (left.GetType() == DataType::INTEGER && right.GetType() == DataType::INTEGER)
+                const std::string schema_col = columns[i].name;
+                const std::string schema_stripped = StripQualifier(schema_col);
+                if (schema_stripped != stripped)
                 {
-                    if (right.GetAsInt() == 0)
-                        throw std::runtime_error("Division by zero");
-                    return Value(left.GetAsInt() / right.GetAsInt());
+                    continue;
                 }
-                if (right.GetAsFloat() == 0.0)
-                    throw std::runtime_error("Division by zero");
-                return Value(left.GetAsFloat() / right.GetAsFloat());
-            default:
-                throw std::runtime_error("Unknown binary operator");
+                if (matched_idx >= 0)
+                {
+                    throw std::runtime_error("Ambiguous column: " + col.name);
+                }
+                matched_idx = static_cast<int>(i);
             }
+            idx = matched_idx;
         }
-        default:
-            throw std::runtime_error("Unknown expression type");
-        }
+        if (idx < 0)
+            throw std::runtime_error("Unknown column: " + col.name);
+        return tuple->GetValue(static_cast<size_t>(idx));
+    }
+
+    Value Executor::EvaluateExpr(const Expression *expr, const Tuple *tuple, Table *table) const
+    {
+        return EvaluateExpression(expr, [&](const ColumnExpression &col)
+                                  { return ResolveColumnValue(col, tuple, table); });
     }
 
     ExecutionResult Executor::Execute(Statement *stmt)
@@ -588,8 +532,14 @@ namespace sql
                                              std::to_string(row.size()));
 
                 std::vector<Value> values;
-                for (auto &expr : row)
-                    values.push_back(EvaluateExpr(expr.get()));
+                for (size_t c = 0; c < row.size(); ++c)
+                {
+                    Value v = EvaluateExpr(row[c].get());
+                    // A bare NULL takes the column's type
+                    if (v.IsNull())
+                        v = Value(table->GetSchema().GetColumn(c).type);
+                    values.push_back(std::move(v));
+                }
 
                 catalog_->InsertRow(table, Tuple(std::move(values)));
                 rows_inserted++;
@@ -625,8 +575,7 @@ namespace sql
                 }
                 else
                 {
-                    Value v = EvaluateExpr(del->where.get(), &*it, table);
-                    if (v.GetAsBool())
+                    if (IsTrue(EvaluateExpr(del->where.get(), &*it, table)))
                         to_delete.push_back(it.GetRID());
                 }
             }
@@ -664,8 +613,7 @@ namespace sql
                 bool matches = true;
                 if (update->where)
                 {
-                    Value v = EvaluateExpr(update->where.get(), &existing_tuple, table);
-                    matches = v.GetAsBool();
+                    matches = IsTrue(EvaluateExpr(update->where.get(), &existing_tuple, table));
                 }
 
                 if (matches)
@@ -681,7 +629,10 @@ namespace sql
                         int col_idx = table->GetColumnIndex(assign.first);
                         if (col_idx < 0)
                             throw std::runtime_error("Unknown column: " + assign.first);
-                        new_values[static_cast<size_t>(col_idx)] = EvaluateExpr(assign.second.get(), &existing_tuple, table);
+                        Value v = EvaluateExpr(assign.second.get(), &existing_tuple, table);
+                        if (v.IsNull())
+                            v = Value(table->GetSchema().GetColumn(static_cast<size_t>(col_idx)).type);
+                        new_values[static_cast<size_t>(col_idx)] = std::move(v);
                     }
 
                     updates.push_back({it.GetRID(), Tuple(std::move(new_values))});

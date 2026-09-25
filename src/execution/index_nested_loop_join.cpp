@@ -68,7 +68,11 @@ namespace sql
 
             current_outer_ = *outer_it_;
             Value probe_key = current_outer_.GetValue(static_cast<size_t>(outer_col_idx_));
-            inner_matches_ = inner_index_->Search(probe_key);
+            // NULL never matches (and is not indexed)
+            if (probe_key.IsNull())
+                inner_matches_.clear();
+            else
+                inner_matches_ = inner_index_->Search(probe_key);
             inner_cursor_ = 0;
         }
     }
