@@ -150,6 +150,9 @@ ctest --test-dir build --output-on-failure --verbose
   - [x] Add `EXPLAIN` command in REPL to print physical plan (`SeqScan`/`IndexScan`/`Join` path)
   - [x] Add join-condition index matching (`IndexNestedLoopJoin` when index exists on join column)
 - [ ] **Phase 6**: Transactions
+
+The path to a fully working embedded database (page storage, WAL, transactions, SQL coverage) is tracked in [docs/roadmap.md](docs/roadmap.md).
+- [x] **M1**: Page layer, single-file `Pager`, LRU `BufferPoolManager` with RAII `PageGuard`
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture
