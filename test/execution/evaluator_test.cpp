@@ -184,4 +184,38 @@ namespace sql
         EXPECT_EQ(CompareForSort(Value(1), Value("1")), -CompareForSort(Value("1"), Value(1)));
     }
 
+    TEST(EvaluatorTest, AggregatesCannotBeEvaluatedDirectly)
+    {
+        AggregateExpression count(AggregateFunction::COUNT, nullptr, false);
+        try
+        {
+            EvaluateExpression(&count, [](const ColumnExpression &) { return Value(1); });
+            FAIL() << "expected an error";
+        }
+        catch (const std::runtime_error &e)
+        {
+            EXPECT_STREQ(e.what(), "Misuse of aggregate function COUNT()");
+        }
+    }
+
+    TEST(EvaluatorTest, GroupKeysFollowEquality)
+    {
+        auto key = [](const Value &v)
+        {
+            std::string k;
+            AppendGroupKey(v, &k);
+            return k;
+        };
+        EXPECT_EQ(key(Value(1)), key(Value(1.0)));
+        EXPECT_NE(key(Value(1)), key(Value(1.5)));
+        EXPECT_EQ(key(Value(0.0)), key(Value(-0.0)));
+        EXPECT_EQ(key(Value()), key(Value(DataType::VARCHAR))); // every NULL alike
+        EXPECT_NE(key(Value()), key(Value(0)));
+        EXPECT_NE(key(Value(1)), key(Value("1")));
+        EXPECT_NE(key(Value(true)), key(Value(1)));
+        EXPECT_EQ(key(Value("ab")), key(Value("ab")));
+        // Keys of several values concatenate without ambiguity
+        EXPECT_NE(key(Value("a")) + key(Value("bc")), key(Value("ab")) + key(Value("c")));
+    }
+
 } // namespace sql

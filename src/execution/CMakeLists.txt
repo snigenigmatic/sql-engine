@@ -7,6 +7,7 @@ add_library(execution
     expression_projection.cpp
     sort.cpp
     distinct.cpp
+    aggregate.cpp
     limit.cpp
     index_scan.cpp
     nested_loop_join.cpp

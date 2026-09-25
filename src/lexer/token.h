@@ -55,6 +55,8 @@ namespace sql
         LIMIT,
         OFFSET,
         DISTINCT,
+        GROUP,
+        HAVING,
 
         // Identifiers and Literals
         IDENTIFIER,

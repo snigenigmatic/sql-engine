@@ -56,7 +56,10 @@ Add these in small PRs, each with parser tests plus `query_test` cases:
 2. **Constraints**: `PRIMARY KEY` (auto-creates a unique index), `NOT NULL`, `UNIQUE`, `DEFAULT`, and `INSERT INTO t(cols) VALUES`.
 3. **Expressions**: arithmetic in SELECT/WHERE/SET, column aliases (`AS`), `SELECT` of expressions, `LIKE`, `IN (...)` and `BETWEEN`. Generalize `SelectStatement::columns` from `vector<string>` to a vector of expressions.
 4. **ORDER BY / LIMIT / OFFSET / DISTINCT**: new `Sort` (external merge sort over temporary pages when the input exceeds the buffer), `Limit` and `Distinct` operators.
-5. **Aggregates**: `COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`, `HAVING` and a `HashAggregate` operator.
+5. **Aggregates** (done): `COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`, `HAVING` and a `HashAggregate` operator.
+   - Grouping is strict, as in PostgreSQL: every selected, HAVING or ORDER BY column must be grouped or aggregated.
+   - `SUM` of integers errors on `INTEGER` overflow, as SQLite does. `AVG` returns `FLOAT`.
+   - Groups and `DISTINCT` follow `=`, so NULLs group together and 1 = 1.0.
 6. **Joins**: `LEFT [OUTER] JOIN`, multi-way joins (more than two tables) and table aliases. Generalize `join_table` from `optional` to a join list.
 7. **Subqueries** (stretch goal): `IN (SELECT …)`, `EXISTS` and scalar subqueries.
 

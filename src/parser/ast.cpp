@@ -1,5 +1,6 @@
 #include "parser/ast.h"
 #include <sstream>
+#include <stdexcept>
 
 namespace sql
 {
@@ -32,6 +33,8 @@ namespace sql
             return "IN_LIST";
         case ExpressionType::BETWEEN:
             return "BETWEEN";
+        case ExpressionType::AGGREGATE:
+            return "AGGREGATE";
         default:
             return "UNKNOWN_EXPRESSION";
         }
@@ -134,6 +137,15 @@ namespace sql
             out << DumpExpression(between->high.get(), indent + 1);
             break;
         }
+        case ExpressionType::AGGREGATE:
+        {
+            const auto *aggregate = static_cast<const AggregateExpression *>(expr);
+            out << Indent(indent) << "Aggregate(" << AggregateFunctionName(aggregate->function)
+                << (aggregate->distinct ? " DISTINCT" : "") << (aggregate->argument ? ")\n" : ", *)");
+            if (aggregate->argument)
+                out << DumpExpression(aggregate->argument.get(), indent + 1);
+            break;
+        }
         default:
             out << Indent(indent) << "UnknownExpression";
             break;
@@ -182,7 +194,8 @@ namespace sql
         std::string OperandSQL(const Expression *expr)
         {
             const ExpressionType t = expr->GetType();
-            const bool simple = t == ExpressionType::LITERAL || t == ExpressionType::COLUMN_REF;
+            const bool simple =
+                t == ExpressionType::LITERAL || t == ExpressionType::COLUMN_REF || t == ExpressionType::AGGREGATE;
             return simple ? ExpressionToSQL(expr) : "(" + ExpressionToSQL(expr) + ")";
         }
     } // namespace
@@ -248,8 +261,221 @@ namespace sql
             return OperandSQL(between->operand.get()) + (between->negated ? " NOT BETWEEN " : " BETWEEN ") +
                    OperandSQL(between->low.get()) + " AND " + OperandSQL(between->high.get());
         }
+        case ExpressionType::AGGREGATE:
+        {
+            const auto *aggregate = static_cast<const AggregateExpression *>(expr);
+            return std::string(AggregateFunctionName(aggregate->function)) + "(" +
+                   (aggregate->distinct ? "DISTINCT " : "") +
+                   (aggregate->argument ? ExpressionToSQL(aggregate->argument.get()) : "*") + ")";
+        }
         }
         return "?";
+    }
+
+    const char *AggregateFunctionName(AggregateFunction function)
+    {
+        switch (function)
+        {
+        case AggregateFunction::COUNT:
+            return "COUNT";
+        case AggregateFunction::SUM:
+            return "SUM";
+        case AggregateFunction::AVG:
+            return "AVG";
+        case AggregateFunction::MIN:
+            return "MIN";
+        case AggregateFunction::MAX:
+            return "MAX";
+        }
+        return "?";
+    }
+
+    namespace
+    {
+        // The direct subexpressions of an expression, in order
+        std::vector<const Expression *> Children(const Expression *expr)
+        {
+            switch (expr->GetType())
+            {
+            case ExpressionType::LITERAL:
+            case ExpressionType::COLUMN_REF:
+                return {};
+            case ExpressionType::BINARY_OP:
+            {
+                const auto *bin = static_cast<const BinaryExpression *>(expr);
+                return {bin->left.get(), bin->right.get()};
+            }
+            case ExpressionType::UNARY_OP:
+                return {static_cast<const UnaryExpression *>(expr)->operand.get()};
+            case ExpressionType::IS_NULL:
+                return {static_cast<const IsNullExpression *>(expr)->operand.get()};
+            case ExpressionType::LIKE:
+            {
+                const auto *like = static_cast<const LikeExpression *>(expr);
+                return {like->value.get(), like->pattern.get()};
+            }
+            case ExpressionType::IN_LIST:
+            {
+                const auto *in = static_cast<const InListExpression *>(expr);
+                std::vector<const Expression *> children{in->operand.get()};
+                for (const auto &item : in->list)
+                    children.push_back(item.get());
+                return children;
+            }
+            case ExpressionType::BETWEEN:
+            {
+                const auto *between = static_cast<const BetweenExpression *>(expr);
+                return {between->operand.get(), between->low.get(), between->high.get()};
+            }
+            case ExpressionType::AGGREGATE:
+            {
+                const auto *aggregate = static_cast<const AggregateExpression *>(expr);
+                if (aggregate->argument)
+                    return {aggregate->argument.get()};
+                return {};
+            }
+            }
+            return {};
+        }
+    } // namespace
+
+    bool ContainsAggregate(const Expression *expr)
+    {
+        if (expr == nullptr)
+            return false;
+        if (expr->GetType() == ExpressionType::AGGREGATE)
+            return true;
+        for (const Expression *child : Children(expr))
+        {
+            if (ContainsAggregate(child))
+                return true;
+        }
+        return false;
+    }
+
+    bool ExpressionsEqual(const Expression *a, const Expression *b,
+                          const std::function<bool(const std::string &, const std::string &)> &same_column)
+    {
+        if (a == nullptr || b == nullptr)
+            return a == b;
+        if (a->GetType() != b->GetType())
+            return false;
+        switch (a->GetType())
+        {
+        case ExpressionType::LITERAL:
+        {
+            const Value &x = static_cast<const LiteralExpression *>(a)->value;
+            const Value &y = static_cast<const LiteralExpression *>(b)->value;
+            if (x.IsNull() || y.IsNull())
+                return x.IsNull() && y.IsNull();
+            return x.GetType() == y.GetType() && x == y;
+        }
+        case ExpressionType::COLUMN_REF:
+            return same_column(static_cast<const ColumnExpression *>(a)->name,
+                               static_cast<const ColumnExpression *>(b)->name);
+        case ExpressionType::BINARY_OP:
+            if (static_cast<const BinaryExpression *>(a)->op != static_cast<const BinaryExpression *>(b)->op)
+                return false;
+            break;
+        case ExpressionType::UNARY_OP:
+            if (static_cast<const UnaryExpression *>(a)->op != static_cast<const UnaryExpression *>(b)->op)
+                return false;
+            break;
+        case ExpressionType::IS_NULL:
+            if (static_cast<const IsNullExpression *>(a)->negated != static_cast<const IsNullExpression *>(b)->negated)
+                return false;
+            break;
+        case ExpressionType::LIKE:
+            if (static_cast<const LikeExpression *>(a)->negated != static_cast<const LikeExpression *>(b)->negated)
+                return false;
+            break;
+        case ExpressionType::IN_LIST:
+            if (static_cast<const InListExpression *>(a)->negated != static_cast<const InListExpression *>(b)->negated)
+                return false;
+            break;
+        case ExpressionType::BETWEEN:
+            if (static_cast<const BetweenExpression *>(a)->negated != static_cast<const BetweenExpression *>(b)->negated)
+                return false;
+            break;
+        case ExpressionType::AGGREGATE:
+        {
+            const auto *x = static_cast<const AggregateExpression *>(a);
+            const auto *y = static_cast<const AggregateExpression *>(b);
+            if (x->function != y->function || x->distinct != y->distinct)
+                return false;
+            break;
+        }
+        }
+        const std::vector<const Expression *> left = Children(a);
+        const std::vector<const Expression *> right = Children(b);
+        if (left.size() != right.size())
+            return false;
+        for (size_t i = 0; i < left.size(); ++i)
+        {
+            if (!ExpressionsEqual(left[i], right[i], same_column))
+                return false;
+        }
+        return true;
+    }
+
+    std::unique_ptr<Expression> RewriteExpression(
+        const Expression *expr, const std::function<std::unique_ptr<Expression>(const Expression *)> &replace)
+    {
+        if (expr == nullptr)
+            return nullptr;
+        if (auto replaced = replace(expr))
+            return replaced;
+        auto copy = [&](const std::unique_ptr<Expression> &e)
+        { return RewriteExpression(e.get(), replace); };
+
+        switch (expr->GetType())
+        {
+        case ExpressionType::LITERAL:
+            return std::make_unique<LiteralExpression>(static_cast<const LiteralExpression *>(expr)->value);
+        case ExpressionType::COLUMN_REF:
+            return std::make_unique<ColumnExpression>(static_cast<const ColumnExpression *>(expr)->name);
+        case ExpressionType::BINARY_OP:
+        {
+            const auto *bin = static_cast<const BinaryExpression *>(expr);
+            return std::make_unique<BinaryExpression>(copy(bin->left), bin->op, copy(bin->right));
+        }
+        case ExpressionType::UNARY_OP:
+        {
+            const auto *unary = static_cast<const UnaryExpression *>(expr);
+            return std::make_unique<UnaryExpression>(unary->op, copy(unary->operand));
+        }
+        case ExpressionType::IS_NULL:
+        {
+            const auto *is_null = static_cast<const IsNullExpression *>(expr);
+            return std::make_unique<IsNullExpression>(copy(is_null->operand), is_null->negated);
+        }
+        case ExpressionType::LIKE:
+        {
+            const auto *like = static_cast<const LikeExpression *>(expr);
+            return std::make_unique<LikeExpression>(copy(like->value), copy(like->pattern), like->negated);
+        }
+        case ExpressionType::IN_LIST:
+        {
+            const auto *in = static_cast<const InListExpression *>(expr);
+            std::vector<std::unique_ptr<Expression>> list;
+            for (const auto &item : in->list)
+                list.push_back(copy(item));
+            return std::make_unique<InListExpression>(copy(in->operand), std::move(list), in->negated);
+        }
+        case ExpressionType::BETWEEN:
+        {
+            const auto *between = static_cast<const BetweenExpression *>(expr);
+            return std::make_unique<BetweenExpression>(copy(between->operand), copy(between->low),
+                                                       copy(between->high), between->negated);
+        }
+        case ExpressionType::AGGREGATE:
+        {
+            const auto *aggregate = static_cast<const AggregateExpression *>(expr);
+            return std::make_unique<AggregateExpression>(aggregate->function, copy(aggregate->argument),
+                                                         aggregate->distinct);
+        }
+        }
+        throw std::logic_error("Unknown expression type");
     }
 
     std::string DumpStatement(const Statement *stmt)

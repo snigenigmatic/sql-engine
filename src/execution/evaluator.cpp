@@ -2,6 +2,8 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace sql
@@ -288,6 +290,12 @@ namespace sql
                 EvaluateBinaryOp(TokenType::LEQ, operand, EvaluateExpression(between->high.get(), resolve_column)));
             return between->negated ? EvaluateUnaryOp(TokenType::NOT, inside) : inside;
         }
+        case ExpressionType::AGGREGATE:
+            // The planner computes aggregates per group; anywhere else
+            // (WHERE, UPDATE SET, VALUES) they have no meaning
+            throw std::runtime_error(std::string("Misuse of aggregate function ") +
+                                     AggregateFunctionName(static_cast<const AggregateExpression *>(expr)->function) +
+                                     "()");
         case ExpressionType::BINARY_OP:
         {
             const auto *bin = static_cast<const BinaryExpression *>(expr);
@@ -326,6 +334,30 @@ namespace sql
         if (a.GetType() != b.GetType())
             return static_cast<int>(a.GetType()) < static_cast<int>(b.GetType()) ? -1 : 1;
         return a < b ? -1 : (b < a ? 1 : 0);
+    }
+
+    void AppendGroupKey(const Value &value, std::string *key)
+    {
+        if (value.IsNull())
+        {
+            key->push_back('\0');
+            return;
+        }
+        if (IsNumeric(value))
+        {
+            double d = AsDouble(value); // exact for every INTEGER
+            if (d == 0.0)
+                d = 0.0; // -0.0 == 0.0
+            if (std::isnan(d))
+                d = std::numeric_limits<double>::quiet_NaN();
+            char bytes[sizeof(double)];
+            std::memcpy(bytes, &d, sizeof(d));
+            key->push_back('N');
+            key->append(bytes, sizeof(bytes));
+            return;
+        }
+        key->push_back('V');
+        value.SerializeTo(key);
     }
 
     bool IsTrue(const Value &value)

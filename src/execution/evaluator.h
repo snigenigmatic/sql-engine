@@ -42,6 +42,12 @@ namespace sql
     // of different types by type. Never throws.
     int CompareForSort(const Value &a, const Value &b);
 
+    // Appends a byte encoding of the value to *key such that two values get
+    // the same encoding exactly when GROUP BY / DISTINCT treat them as the
+    // same: every NULL is alike, numbers compare by value (1 = 1.0,
+    // 0.0 = -0.0), and other values by type and value.
+    void AppendGroupKey(const Value &value, std::string *key);
+
     // WHERE semantics: only TRUE qualifies; FALSE and NULL do not.
     // Throws if the value is not a boolean.
     bool IsTrue(const Value &value);

@@ -53,6 +53,8 @@ namespace sql
         case TokenType::LIMIT: return "LIMIT";
         case TokenType::OFFSET: return "OFFSET";
         case TokenType::DISTINCT: return "DISTINCT";
+        case TokenType::GROUP: return "GROUP";
+        case TokenType::HAVING: return "HAVING";
         case TokenType::IDENTIFIER: return "IDENTIFIER";
         case TokenType::STRING_LITERAL: return "STRING_LITERAL";
         case TokenType::INTEGER_LITERAL: return "INTEGER_LITERAL";
