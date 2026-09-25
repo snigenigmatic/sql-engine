@@ -10,10 +10,12 @@
 #include "execution/executor.h"
 #include "catalog/database.h"
 #include "catalog/legacy_import.h"
+#include "session/session.h"
 #include <memory>
 #include <sys/stat.h>
 
 std::unique_ptr<sql::Database> g_db;
+std::unique_ptr<sql::Session> g_session;
 
 void PrintBanner()
 {
@@ -38,9 +40,14 @@ void PrintHelp()
     std::cout << "  SELECT col1, col2 FROM t WHERE col1 > 5;\n";
     std::cout << "  UPDATE t SET col1 = 10 WHERE col2 = 'hello';\n";
     std::cout << "  DELETE FROM t WHERE col1 = 1;\n";
+    std::cout << "\nTransactions:\n";
+    std::cout << "  BEGIN;     - start a transaction (prompt changes to sql*>)\n";
+    std::cout << "  COMMIT;    - make its changes permanent\n";
+    std::cout << "  ROLLBACK;  - discard its changes\n";
     std::cout << "\nData is stored in: " << g_db->GetPath() << " (write-ahead log: "
               << g_db->GetPath() << "-wal)\n";
-    std::cout << "Each statement is atomic: committed when it succeeds, rolled back when it fails.\n";
+    std::cout << "Outside a transaction each statement commits when it succeeds and is rolled\n"
+              << "back when it fails. Inside one, a failed statement is undone on its own.\n";
 }
 
 void PrintResults(const sql::ExecutionResult &result)
@@ -120,57 +127,15 @@ void ListTables()
     }
 }
 
-// Undo a failed statement's partial changes, if it made any
-void RollbackStatement()
-{
-    if (!g_db->HasUncommittedChanges())
-        return;
-    std::string error;
-    if (g_db->Rollback(&error))
-        std::cout << "(statement rolled back)\n";
-    else
-        std::cout << "Warning: " << error << "\n";
-}
-
 void ExecuteSQL(const std::string &sql_input)
 {
     try
     {
-        sql::Lexer lexer(sql_input);
-        sql::Parser parser(lexer);
-        auto stmt = parser.ParseStatement();
-
-        if (!stmt)
-        {
-            std::cout << "Error: Failed to parse SQL statement.\n";
-            return;
-        }
-
-        sql::ExecutionResult result;
-        {
-            sql::Executor executor(&g_db->GetCatalog());
-            result = executor.Execute(stmt.get());
-        }
-        PrintResults(result);
-
-        // Each statement is its own transaction: all of it or none of it
-        if (result.success)
-        {
-            if (!g_db->Commit())
-            {
-                std::cout << "Error: failed to commit to " << g_db->GetPath() << "\n";
-                RollbackStatement();
-            }
-        }
-        else
-        {
-            RollbackStatement();
-        }
+        PrintResults(g_session->Execute(sql_input));
     }
     catch (const std::exception &e)
     {
         std::cout << "Error: " << e.what() << "\n";
-        RollbackStatement();
     }
 }
 
@@ -231,6 +196,7 @@ int main(int argc, char **argv)
             std::cout << "Loaded " << tables.size() << " table(s) from " << path << ".\n";
     }
 
+    g_session = std::make_unique<sql::Session>(g_db.get());
     PrintBanner();
 
     std::string input;
@@ -239,7 +205,7 @@ int main(int argc, char **argv)
     while (true)
     {
         if (sql_buffer.empty())
-            std::cout << "sql> ";
+            std::cout << (g_session->InTransaction() ? "sql*> " : "sql> ");
         else
             std::cout << "  -> ";
 
@@ -270,10 +236,11 @@ int main(int argc, char **argv)
             }
             else if (command == "save")
             {
-                if (g_db->Checkpoint())
+                std::string error;
+                if (g_session->Checkpoint(&error))
                     std::cout << "Checkpoint complete: all changes are in " << g_db->GetPath() << ".\n";
                 else
-                    std::cout << "Error: checkpoint of " << g_db->GetPath() << " failed.\n";
+                    std::cout << "Error: " << error << "\n";
                 continue;
             }
             else if (command == "help" || command == "h")
@@ -297,6 +264,9 @@ int main(int argc, char **argv)
         }
     }
 
-    g_db.reset(); // checkpoints and removes the write-ahead log
+    if (g_session->InTransaction())
+        std::cout << "Rolling back the open transaction.\n";
+    g_session.reset(); // rolls back an open transaction
+    g_db.reset();      // checkpoints and removes the write-ahead log
     return 0;
 }

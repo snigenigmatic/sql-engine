@@ -60,7 +60,8 @@ namespace sql
         CREATE_INDEX,
         DELETE_STMT,
         UPDATE_STMT,
-        EXPLAIN_STMT
+        EXPLAIN_STMT,
+        TRANSACTION_STMT
     };
 
     struct Statement
@@ -129,6 +130,20 @@ namespace sql
         std::vector<std::pair<std::string, std::unique_ptr<Expression>>> assignments; // SET col = expr
         std::unique_ptr<Expression> where;
         StatementType GetType() const override { return StatementType::UPDATE_STMT; }
+    };
+
+    // BEGIN / COMMIT / ROLLBACK [TRANSACTION]
+    struct TransactionStatement : public Statement
+    {
+        enum class Kind
+        {
+            BEGIN,
+            COMMIT,
+            ROLLBACK
+        };
+        Kind kind;
+        explicit TransactionStatement(Kind k) : kind(k) {}
+        StatementType GetType() const override { return StatementType::TRANSACTION_STMT; }
     };
 
     struct ExplainStatement : public Statement

@@ -45,6 +45,10 @@ namespace sql
             return "DELETE";
         case StatementType::UPDATE_STMT:
             return "UPDATE";
+        case StatementType::EXPLAIN_STMT:
+            return "EXPLAIN";
+        case StatementType::TRANSACTION_STMT:
+            return "TRANSACTION";
         default:
             return "UNKNOWN_STATEMENT";
         }

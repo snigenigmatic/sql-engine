@@ -3,6 +3,7 @@
 #include "catalog/catalog.h"
 #include "storage/buffer_pool.h"
 #include "storage/pager.h"
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -53,14 +54,28 @@ namespace sql
         // Not supported for in-memory databases.
         bool Rollback(std::string *error = nullptr);
 
+        // Mark the current state of the open transaction. Writes cached dirty
+        // pages to the log first so the savepoint captures everything.
+        bool CreateSavepoint(Pager::Savepoint *savepoint);
+
+        // Discard every change made after the savepoint and reload the
+        // catalog; the transaction stays open. Not supported in memory.
+        bool RollbackTo(const Pager::Savepoint &savepoint, std::string *error = nullptr);
+
         // Commit, then copy the log into the database file
         bool Checkpoint();
+
+        bool IsInMemory() const { return pager_->IsInMemory(); }
 
         // Same as Commit()
         bool Flush() { return Commit(); }
 
     private:
         Database() = default;
+
+        // Discard the cache, roll the pager back with rollback_pager, and
+        // reload the catalog
+        bool Restore(const std::function<bool()> &rollback_pager, std::string *error);
 
         std::string path_;
         bool was_created_ = false;

@@ -75,6 +75,30 @@ namespace sql
         // Discard every change since the last commit (file databases only)
         bool Rollback();
 
+    private:
+        struct HeaderState
+        {
+            uint32_t page_count = 0;
+            page_id_t free_list_head = INVALID_PAGE_ID;
+            page_id_t catalog_root = INVALID_PAGE_ID;
+        };
+
+    public:
+        // A point inside the open transaction to roll back to. Taken after
+        // the buffer pool has written its dirty pages, so it captures the
+        // whole state at that moment.
+        struct Savepoint
+        {
+            WriteAheadLog::Savepoint wal;
+            HeaderState header;
+            bool header_dirty = false;
+            std::unordered_set<page_id_t> fresh_pages;
+        };
+        Savepoint CreateSavepoint() const;
+
+        // Discard every change made after the savepoint (file databases only)
+        bool RollbackTo(const Savepoint &savepoint);
+
         // Copy committed pages from the log into the database file and empty
         // the log. Fails if there are uncommitted changes.
         bool Checkpoint();
@@ -91,13 +115,6 @@ namespace sql
         bool SetCatalogRoot(page_id_t page_id);
 
     private:
-        struct HeaderState
-        {
-            uint32_t page_count = 0;
-            page_id_t free_list_head = INVALID_PAGE_ID;
-            page_id_t catalog_root = INVALID_PAGE_ID;
-        };
-
         bool Fail(const std::string &message);
         void BuildHeader(char *buf) const;
         bool WriteHeader();

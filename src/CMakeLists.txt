@@ -6,6 +6,7 @@ add_subdirectory(optimizer)
 add_subdirectory(execution)
 add_subdirectory(storage)
 add_subdirectory(catalog)
+add_subdirectory(session)
 
 # Main executable (REPL)
 add_executable(sqlengine main.cpp)
@@ -20,6 +21,7 @@ target_link_libraries(sqlengine
         execution
         storage
         catalog
+        session
 )
 
 # Install target

@@ -373,6 +373,31 @@ namespace sql
         return wal_.Rollback();
     }
 
+    Pager::Savepoint Pager::CreateSavepoint() const
+    {
+        return {wal_.CreateSavepoint(), CurrentHeader(), header_dirty_, fresh_pages_};
+    }
+
+    bool Pager::RollbackTo(const Savepoint &savepoint)
+    {
+        if (in_memory_)
+        {
+            last_error_ = "rollback is not supported for in-memory databases";
+            return false;
+        }
+        if (fd_ < 0 || !wal_.RollbackTo(savepoint.wal))
+        {
+            last_error_ = "cannot roll back to savepoint";
+            return false;
+        }
+        page_count_ = savepoint.header.page_count;
+        free_list_head_ = savepoint.header.free_list_head;
+        catalog_root_ = savepoint.header.catalog_root;
+        header_dirty_ = savepoint.header_dirty;
+        fresh_pages_ = savepoint.fresh_pages;
+        return true;
+    }
+
     bool Pager::CheckpointLog()
     {
         std::array<char, PAGE_SIZE> buf{};
