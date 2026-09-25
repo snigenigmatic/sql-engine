@@ -79,7 +79,11 @@ namespace sql
 
         // PROJECTION
         bool project_all = false;
-        std::vector<std::string> projected_columns;
+        std::vector<std::string> projected_columns; // names, or SQL text of computed items
+        // Set when some SELECT item is computed: evaluate these expressions
+        // instead of copying columns (non-owning, AST owned by Statement)
+        bool compute_projection = false;
+        std::vector<const Expression *> projected_exprs;
     };
 
     class Optimizer

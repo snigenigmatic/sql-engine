@@ -111,6 +111,41 @@ namespace sql
             case ExpressionType::IS_NULL:
                 return ResolvePredicateSingleTable(static_cast<const IsNullExpression *>(expr)->operand.get(),
                                                    left_table_name, right_table_name, left_table, right_table);
+            case ExpressionType::LIKE:
+            case ExpressionType::IN_LIST:
+            case ExpressionType::BETWEEN:
+            {
+                // The side all operands agree on (BOTH if they disagree)
+                std::vector<const Expression *> operands;
+                if (expr->GetType() == ExpressionType::LIKE)
+                {
+                    const auto *like = static_cast<const LikeExpression *>(expr);
+                    operands = {like->value.get(), like->pattern.get()};
+                }
+                else if (expr->GetType() == ExpressionType::IN_LIST)
+                {
+                    const auto *in = static_cast<const InListExpression *>(expr);
+                    operands.push_back(in->operand.get());
+                    for (const auto &item : in->list)
+                        operands.push_back(item.get());
+                }
+                else
+                {
+                    const auto *between = static_cast<const BetweenExpression *>(expr);
+                    operands = {between->operand.get(), between->low.get(), between->high.get()};
+                }
+                PredicateTableSide side = PredicateTableSide::NONE;
+                for (const Expression *operand : operands)
+                {
+                    const PredicateTableSide s = ResolvePredicateSingleTable(operand, left_table_name, right_table_name,
+                                                                            left_table, right_table);
+                    if (s == PredicateTableSide::BOTH || (side != PredicateTableSide::NONE && s != PredicateTableSide::NONE && s != side))
+                        return PredicateTableSide::BOTH;
+                    if (s != PredicateTableSide::NONE)
+                        side = s;
+                }
+                return side;
+            }
             default:
                 return PredicateTableSide::BOTH;
             }
@@ -157,6 +192,34 @@ namespace sql
             *literal_value = lit_expr->value;
             return true;
         }
+        // What EXPLAIN shows for each SELECT item: the column name when the
+        // list is plain columns (the executor looks these up), else SQL text
+        std::vector<std::string> ProjectionLabels(const SelectStatement &select)
+        {
+            if (!select.HasComputedItems())
+                return select.columns;
+            std::vector<std::string> labels;
+            for (const auto &item : select.items)
+                labels.push_back(ExpressionToSQL(item.expr.get()) + (item.alias.empty() ? "" : " AS " + item.alias));
+            return labels;
+        }
+
+        // col BETWEEN low AND high with literal bounds of the column's kind
+        bool IsIndexableRange(const Expression *expr, std::string *column_name, Value *low, Value *high)
+        {
+            if (expr == nullptr || expr->GetType() != ExpressionType::BETWEEN)
+                return false;
+            const auto *between = static_cast<const BetweenExpression *>(expr);
+            if (between->negated || between->operand->GetType() != ExpressionType::COLUMN_REF ||
+                between->low->GetType() != ExpressionType::LITERAL || between->high->GetType() != ExpressionType::LITERAL)
+                return false;
+            *low = static_cast<const LiteralExpression *>(between->low.get())->value;
+            *high = static_cast<const LiteralExpression *>(between->high.get())->value;
+            if (low->IsNull() || high->IsNull())
+                return false;
+            *column_name = static_cast<const ColumnExpression *>(between->operand.get())->name;
+            return true;
+        }
     } // namespace
 
     std::unique_ptr<LogicalPlanNode> Optimizer::BuildLogicalPlan(const Statement *stmt) const
@@ -192,7 +255,7 @@ namespace sql
 
         auto projection = std::make_unique<LogicalPlanNode>(LogicalPlanType::PROJECTION);
         projection->project_all = select->select_star;
-        projection->projected_columns = select->columns;
+        projection->projected_columns = ProjectionLabels(*select);
         projection->children.push_back(std::move(current));
         return projection;
     }
@@ -339,6 +402,29 @@ namespace sql
                         break;
                     }
                     access_path = std::move(index_scan);
+                }
+            }
+
+            Value range_low, range_high;
+            if (!access_path && IsIndexableRange(predicate, &column_name, &range_low, &range_high))
+            {
+                const std::string unqualified = StripQualifier(column_name);
+                BTree *index = catalog->GetIndex(table_name, unqualified);
+                const int col_idx = target_table->GetColumnIndex(unqualified);
+                if (index != nullptr && col_idx >= 0)
+                {
+                    const Column &column = target_table->GetSchema().GetColumn(static_cast<size_t>(col_idx));
+                    if (column.type == range_low.GetType() && column.type == range_high.GetType())
+                    {
+                        auto index_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_SCAN);
+                        index_scan->table_name = table_name;
+                        index_scan->index_column = unqualified;
+                        index_scan->low_key = range_low;
+                        index_scan->low_inclusive = true;
+                        index_scan->high_key = range_high;
+                        index_scan->high_inclusive = true;
+                        access_path = std::move(index_scan);
+                    }
                 }
             }
 
@@ -493,7 +579,13 @@ namespace sql
 
         auto projection = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::PROJECTION);
         projection->project_all = select->select_star;
-        projection->projected_columns = select->columns;
+        projection->projected_columns = ProjectionLabels(*select);
+        if (select->HasComputedItems())
+        {
+            projection->compute_projection = true;
+            for (const auto &item : select->items)
+                projection->projected_exprs.push_back(item.expr.get());
+        }
         projection->children.push_back(std::move(current));
         return projection;
     }

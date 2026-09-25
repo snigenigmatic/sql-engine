@@ -8,6 +8,12 @@
 namespace sql
 {
 
+    // Index of a column referenced by name in rows shaped like `table`:
+    // an exact match, or else a unique match ignoring "table." qualifiers
+    // (join rows use qualified names). Returns -1 if absent; throws if an
+    // unqualified name matches more than one column.
+    int FindColumnIndex(const Table &table, const std::string &name);
+
     class Filter : public Operator
     {
     public:

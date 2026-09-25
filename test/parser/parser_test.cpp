@@ -636,4 +636,55 @@ namespace sql
         }
     }
 
+    TEST(ParserTest, ArithmeticPrecedence)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a + b * -c = 1 - 2 - 3;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_EQ(ExpressionToSQL(select->where.get()), "(a + (b * (-c))) = ((1 - 2) - 3)");
+    }
+
+    TEST(ParserTest, NegativeLiteralsAreFolded)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a = -5;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *eq = static_cast<BinaryExpression *>(static_cast<SelectStatement *>(stmt.get())->where.get());
+        ASSERT_EQ(eq->right->GetType(), ExpressionType::LITERAL);
+        EXPECT_EQ(static_cast<LiteralExpression *>(eq->right.get())->value.GetAsInt(), -5);
+    }
+
+    TEST(ParserTest, LikeInBetween)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a NOT LIKE 'x%' AND b IN (1, 2 + 3) AND c NOT BETWEEN 1 AND 2 + 1 OR d BETWEEN 0 AND 9;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_EQ(ExpressionToSQL(select->where.get()),
+                  "(((a NOT LIKE 'x%') AND (b IN (1, 2 + 3))) AND (c NOT BETWEEN 1 AND (2 + 1))) OR (d BETWEEN 0 AND 9)");
+    }
+
+    TEST(ParserTest, NotMustPrecedeLikeInOrBetween)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a NOT = 1;");
+        Parser parser(lexer);
+        EXPECT_THROW(parser.ParseStatement(), std::runtime_error);
+    }
+
+    TEST(ParserTest, SelectItemsWithAliases)
+    {
+        Lexer lexer("SELECT a, b * 2 AS doubled, c total FROM t;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        ASSERT_EQ(select->items.size(), 3u);
+        EXPECT_TRUE(select->HasComputedItems());
+        EXPECT_TRUE(select->columns.empty());
+        EXPECT_EQ(select->items[0].alias, "");
+        EXPECT_EQ(select->items[1].alias, "doubled");
+        EXPECT_EQ(ExpressionToSQL(select->items[1].expr.get()), "b * 2");
+        EXPECT_EQ(select->items[2].alias, "total");
+    }
+
 } // namespace sql

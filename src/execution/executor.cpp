@@ -437,6 +437,12 @@ namespace sql
             {
                 projection_join_table = catalog_->GetTable(node->children[0]->right_table_name);
             }
+            if (node->compute_projection)
+            {
+                // Rows from a join are shaped like the qualified join schema
+                Table *context = join_context_table_ ? join_context_table_.get() : table;
+                return std::make_unique<ExpressionProjection>(std::move(child), node->projected_exprs, context);
+            }
             auto column_indices = ResolveProjectionIndices(node, table, projection_join_table);
             return std::make_unique<Projection>(std::move(child), std::move(column_indices), node->project_all);
         }
@@ -486,10 +492,16 @@ namespace sql
             }
             else
             {
-                result.column_names.clear();
-                for (const auto &name : select->columns)
+                // An alias, else the column's name, else the expression's SQL
+                for (const auto &item : select->items)
                 {
-                    result.column_names.push_back(StripQualifier(name));
+                    if (!item.alias.empty())
+                        result.column_names.push_back(item.alias);
+                    else if (item.expr->GetType() == ExpressionType::COLUMN_REF)
+                        result.column_names.push_back(
+                            StripQualifier(static_cast<const ColumnExpression *>(item.expr.get())->name));
+                    else
+                        result.column_names.push_back(ExpressionToSQL(item.expr.get()));
                 }
             }
 

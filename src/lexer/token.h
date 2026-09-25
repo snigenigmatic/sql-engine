@@ -44,6 +44,10 @@ namespace sql
         PRIMARY,
         UNIQUE,
         DEFAULT,
+        AS,
+        LIKE,
+        IN,
+        BETWEEN,
 
         // Identifiers and Literals
         IDENTIFIER,

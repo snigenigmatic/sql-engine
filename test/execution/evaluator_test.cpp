@@ -107,4 +107,70 @@ namespace sql
         EXPECT_EQ(Tri(EvaluateExpression(&expr, no_columns)), "F");
     }
 
+    TEST(EvaluatorTest, LikePatterns)
+    {
+        auto like = [](const std::string &s, const std::string &p) { return Tri(EvaluateLike(Value(s), Value(p))); };
+        EXPECT_EQ(like("apple", "ap%"), "T");
+        EXPECT_EQ(like("apple", "%le"), "T");
+        EXPECT_EQ(like("apple", "%pp%"), "T");
+        EXPECT_EQ(like("apple", "a_ple"), "T");
+        EXPECT_EQ(like("apple", "a_le"), "F");
+        EXPECT_EQ(like("apple", "apple"), "T");
+        EXPECT_EQ(like("apple", "Apple"), "F"); // case-sensitive
+        EXPECT_EQ(like("", "%"), "T");
+        EXPECT_EQ(like("", "_"), "F");
+        EXPECT_EQ(like("a.b", "a.b"), "T");  // no regex meaning
+        EXPECT_EQ(like("axb", "a.b"), "F");
+        EXPECT_EQ(like("mississippi", "%iss%ppi"), "T"); // backtracking
+        EXPECT_EQ(like("abc", "%%%c"), "T");
+        EXPECT_EQ(Tri(EvaluateLike(Value(DataType::VARCHAR), Value("%"))), "N");
+        EXPECT_THROW(EvaluateLike(Value(1), Value("1")), std::runtime_error);
+    }
+
+    TEST(EvaluatorTest, UnaryMinusAndOverflow)
+    {
+        EXPECT_EQ(EvaluateUnaryOp(TokenType::MINUS, Value(5)).GetAsInt(), -5);
+        EXPECT_DOUBLE_EQ(EvaluateUnaryOp(TokenType::MINUS, Value(2.5)).GetAsFloat(), -2.5);
+        EXPECT_TRUE(EvaluateUnaryOp(TokenType::MINUS, Value(DataType::INTEGER)).IsNull());
+        EXPECT_THROW(EvaluateUnaryOp(TokenType::MINUS, Value(INT32_MIN)), std::runtime_error);
+        EXPECT_THROW(EvaluateUnaryOp(TokenType::MINUS, Value("x")), std::runtime_error);
+        EXPECT_THROW(EvaluateBinaryOp(TokenType::PLUS, Value(INT32_MAX), Value(1)), std::runtime_error);
+        EXPECT_THROW(EvaluateBinaryOp(TokenType::MINUS, Value(INT32_MIN), Value(1)), std::runtime_error);
+        EXPECT_THROW(EvaluateBinaryOp(TokenType::STAR, Value(1 << 20), Value(1 << 20)), std::runtime_error);
+        EXPECT_THROW(EvaluateBinaryOp(TokenType::SLASH, Value(INT32_MIN), Value(-1)), std::runtime_error);
+    }
+
+    TEST(EvaluatorTest, InAndBetweenThreeValued)
+    {
+        auto in_list = [](Value operand, std::vector<Value> items, bool negated)
+        {
+            std::vector<std::unique_ptr<Expression>> list;
+            for (auto &v : items)
+                list.push_back(std::make_unique<LiteralExpression>(v));
+            InListExpression expr(std::make_unique<LiteralExpression>(operand), std::move(list), negated);
+            return Tri(EvaluateExpression(&expr, [](const ColumnExpression &) -> Value
+                                          { throw std::runtime_error("no columns"); }));
+        };
+        EXPECT_EQ(in_list(Value(2), {Value(1), Value(2)}, false), "T");
+        EXPECT_EQ(in_list(Value(3), {Value(1), Value(2)}, false), "F");
+        EXPECT_EQ(in_list(Value(3), {Value(1), Value()}, false), "N");  // might have matched
+        EXPECT_EQ(in_list(Value(1), {Value(1), Value()}, false), "T");
+        EXPECT_EQ(in_list(Value(3), {Value(1), Value()}, true), "N");   // NOT IN with a NULL
+        EXPECT_EQ(in_list(Value(), {Value(1)}, false), "N");
+        EXPECT_EQ(in_list(Value(2), {Value(2.0)}, false), "T");          // numeric equality
+
+        auto between = [](Value v, Value lo, Value hi, bool negated)
+        {
+            BetweenExpression expr(std::make_unique<LiteralExpression>(v), std::make_unique<LiteralExpression>(lo),
+                                   std::make_unique<LiteralExpression>(hi), negated);
+            return Tri(EvaluateExpression(&expr, [](const ColumnExpression &) -> Value
+                                          { throw std::runtime_error("no columns"); }));
+        };
+        EXPECT_EQ(between(Value(5), Value(1), Value(5), false), "T"); // inclusive
+        EXPECT_EQ(between(Value(6), Value(1), Value(5), false), "F");
+        EXPECT_EQ(between(Value(6), Value(1), Value(5), true), "T");
+        EXPECT_EQ(between(Value(0), Value(), Value(5), false), "N");
+        EXPECT_EQ(between(Value(9), Value(), Value(5), false), "F");  // NULL AND FALSE
+    }
+
 } // namespace sql

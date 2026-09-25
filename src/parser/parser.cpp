@@ -1,5 +1,6 @@
 #include "parser/parser.h"
 #include <cctype>
+#include <climits>
 #include <stdexcept>
 #include <vector>
 
@@ -78,8 +79,21 @@ namespace sql
         {
             do
             {
-                stmt->columns.push_back(ParseQualifiedColumnName());
+                SelectItem item;
+                item.expr = ParseExpression();
+                // expr AS alias, or expr alias
+                if (Match(TokenType::AS))
+                    item.alias = Expect(TokenType::IDENTIFIER).value;
+                else if (current_token_.type == TokenType::IDENTIFIER)
+                    item.alias = Expect(TokenType::IDENTIFIER).value;
+                stmt->items.push_back(std::move(item));
             } while (Match(TokenType::COMMA));
+
+            if (!stmt->HasComputedItems())
+            {
+                for (const auto &item : stmt->items)
+                    stmt->columns.push_back(static_cast<const ColumnExpression *>(item.expr.get())->name);
+            }
         }
 
         Expect(TokenType::FROM);
@@ -388,13 +402,40 @@ namespace sql
 
     std::unique_ptr<Expression> Parser::ParseComparison()
     {
-        auto left = ParsePrimary();
+        auto left = ParseAdditive();
         if (Match(TokenType::IS))
         {
             const bool negated = Match(TokenType::NOT);
             Expect(TokenType::NULL_KW);
             return std::make_unique<IsNullExpression>(std::move(left), negated);
         }
+
+        // [NOT] LIKE / IN / BETWEEN
+        const bool negated = Match(TokenType::NOT);
+        if (Match(TokenType::LIKE))
+            return std::make_unique<LikeExpression>(std::move(left), ParseAdditive(), negated);
+        if (Match(TokenType::IN))
+        {
+            Expect(TokenType::LPAREN);
+            std::vector<std::unique_ptr<Expression>> list;
+            do
+            {
+                list.push_back(ParseExpression());
+            } while (Match(TokenType::COMMA));
+            Expect(TokenType::RPAREN);
+            return std::make_unique<InListExpression>(std::move(left), std::move(list), negated);
+        }
+        if (Match(TokenType::BETWEEN))
+        {
+            // The AND here separates the bounds; it is not a logical AND
+            auto low = ParseAdditive();
+            Expect(TokenType::AND);
+            auto high = ParseAdditive();
+            return std::make_unique<BetweenExpression>(std::move(left), std::move(low), std::move(high), negated);
+        }
+        if (negated)
+            throw std::runtime_error("Expected LIKE, IN or BETWEEN after NOT, got: " + current_token_.value);
+
         if (current_token_.type == TokenType::EQ ||
             current_token_.type == TokenType::NEQ ||
             current_token_.type == TokenType::LT ||
@@ -404,10 +445,53 @@ namespace sql
         {
             TokenType op = current_token_.type;
             NextToken();
-            auto right = ParsePrimary();
+            auto right = ParseAdditive();
             left = std::make_unique<BinaryExpression>(std::move(left), op, std::move(right));
         }
         return left;
+    }
+
+    std::unique_ptr<Expression> Parser::ParseAdditive()
+    {
+        auto left = ParseMultiplicative();
+        while (current_token_.type == TokenType::PLUS || current_token_.type == TokenType::MINUS)
+        {
+            TokenType op = current_token_.type;
+            NextToken();
+            left = std::make_unique<BinaryExpression>(std::move(left), op, ParseMultiplicative());
+        }
+        return left;
+    }
+
+    std::unique_ptr<Expression> Parser::ParseMultiplicative()
+    {
+        auto left = ParseUnary();
+        while (current_token_.type == TokenType::STAR || current_token_.type == TokenType::SLASH)
+        {
+            TokenType op = current_token_.type;
+            NextToken();
+            left = std::make_unique<BinaryExpression>(std::move(left), op, ParseUnary());
+        }
+        return left;
+    }
+
+    std::unique_ptr<Expression> Parser::ParseUnary()
+    {
+        if (Match(TokenType::MINUS))
+        {
+            auto operand = ParseUnary();
+            // Fold "-5" into a literal so it stays usable as an index key
+            if (operand->GetType() == ExpressionType::LITERAL)
+            {
+                const Value &v = static_cast<LiteralExpression *>(operand.get())->value;
+                if (!v.IsNull() && v.GetType() == DataType::INTEGER && v.GetAsInt() != INT32_MIN)
+                    return std::make_unique<LiteralExpression>(Value(-v.GetAsInt()));
+                if (!v.IsNull() && v.GetType() == DataType::FLOAT)
+                    return std::make_unique<LiteralExpression>(Value(-v.GetAsFloat()));
+            }
+            return std::make_unique<UnaryExpression>(TokenType::MINUS, std::move(operand));
+        }
+        return ParsePrimary();
     }
 
     std::unique_ptr<Expression> Parser::ParsePrimary()

@@ -42,6 +42,10 @@ namespace sql
         case TokenType::PRIMARY: return "PRIMARY";
         case TokenType::UNIQUE: return "UNIQUE";
         case TokenType::DEFAULT: return "DEFAULT";
+        case TokenType::AS: return "AS";
+        case TokenType::LIKE: return "LIKE";
+        case TokenType::IN: return "IN";
+        case TokenType::BETWEEN: return "BETWEEN";
         case TokenType::IDENTIFIER: return "IDENTIFIER";
         case TokenType::STRING_LITERAL: return "STRING_LITERAL";
         case TokenType::INTEGER_LITERAL: return "INTEGER_LITERAL";
