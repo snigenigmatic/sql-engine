@@ -1,219 +1,405 @@
 #include "storage/btree.h"
-#include <cassert>
+#include <cstring>
+#include <stdexcept>
+#include <string>
 
 namespace sql
 {
 
-    std::shared_ptr<BTreeNode> BTree::FindLeaf(const Value &key) const
+    namespace
     {
-        auto node = root_;
-        while (!node->is_leaf)
+        constexpr size_t OFF_IS_LEAF = 4;
+        constexpr size_t OFF_NEXT_LEAF = 8;
+        constexpr size_t OFF_COUNT = 12;
+        constexpr size_t HEADER_SIZE = 16;
+        constexpr size_t CAPACITY = PAGE_SIZE - HEADER_SIZE;
+        constexpr size_t RID_SIZE = sizeof(int32_t) + sizeof(uint32_t);
+        constexpr size_t CHILD_SIZE = sizeof(page_id_t);
+
+        size_t KeySize(const Value &key)
         {
-            size_t i = 0;
-            while (i < node->keys.size() && node->keys[i] < key)
-                i++;
-            node = node->children[i];
+            std::string buf;
+            key.SerializeTo(&buf);
+            return buf.size();
+        }
+
+        int CompareRid(const RID &a, const RID &b)
+        {
+            if (a < b)
+                return -1;
+            if (b < a)
+                return 1;
+            return 0;
+        }
+
+        template <typename T>
+        void Put(std::string *out, T v)
+        {
+            out->append(reinterpret_cast<const char *>(&v), sizeof(T));
+        }
+
+        template <typename T>
+        T Take(const char **cursor, const char *end)
+        {
+            if (end - *cursor < static_cast<std::ptrdiff_t>(sizeof(T)))
+                throw std::runtime_error("Corrupt B+tree node");
+            T v;
+            std::memcpy(&v, *cursor, sizeof(T));
+            *cursor += sizeof(T);
+            return v;
+        }
+    } // namespace
+
+    int BTree::CompareKeys(const Value &a, const Value &b)
+    {
+        if (a.GetType() != b.GetType())
+            return static_cast<int>(a.GetType()) < static_cast<int>(b.GetType()) ? -1 : 1;
+        if (a.IsNull() || b.IsNull())
+            return a.IsNull() == b.IsNull() ? 0 : (a.IsNull() ? -1 : 1);
+        if (a < b)
+            return -1;
+        if (b < a)
+            return 1;
+        return 0;
+    }
+
+    void BTree::CheckKey(const Value &key)
+    {
+        if (key.IsNull())
+            throw std::invalid_argument("NULL values are not indexed");
+        const size_t size = KeySize(key);
+        if (size > MAX_KEY_SIZE)
+            throw std::invalid_argument("Index key too large: " + std::to_string(size) +
+                                        " bytes (max " + std::to_string(MAX_KEY_SIZE) + ")");
+    }
+
+    // ── Node (de)serialization ───────────────────────────────────────────────
+
+    size_t BTree::EncodedSize(const Node &node)
+    {
+        size_t size = node.is_leaf ? 0 : CHILD_SIZE;
+        for (const auto &key : node.keys)
+            size += KeySize(key) + RID_SIZE + (node.is_leaf ? 0 : CHILD_SIZE);
+        return size;
+    }
+
+    BTree::Node BTree::Load(page_id_t page_id) const
+    {
+        PageGuard guard = bpm_->FetchPageGuarded(page_id);
+        if (!guard)
+            throw std::runtime_error("Buffer pool exhausted or unreadable index page " + std::to_string(page_id));
+        const Page *page = guard.GetPage();
+
+        Node node;
+        node.is_leaf = page->Read<uint8_t>(OFF_IS_LEAF) != 0;
+        node.next_leaf = page->Read<page_id_t>(OFF_NEXT_LEAF);
+        const auto count = page->Read<uint16_t>(OFF_COUNT);
+
+        const char *cursor = page->GetData() + HEADER_SIZE;
+        const char *end = page->GetData() + PAGE_SIZE;
+        // +1 leaves room for the insert that usually follows a load
+        node.keys.reserve(count + 1u);
+        node.rids.reserve(count + 1u);
+        if (!node.is_leaf)
+        {
+            node.children.reserve(count + 2u);
+            node.children.push_back(Take<page_id_t>(&cursor, end));
+        }
+        for (uint16_t i = 0; i < count; ++i)
+        {
+            node.keys.emplace_back();
+            if (!Value::DeserializeFrom(&cursor, end, &node.keys.back()))
+                throw std::runtime_error("Corrupt B+tree key on page " + std::to_string(page_id));
+            RID rid;
+            rid.page_id = Take<int32_t>(&cursor, end);
+            rid.slot = Take<uint32_t>(&cursor, end);
+            node.rids.push_back(rid);
+            if (!node.is_leaf)
+                node.children.push_back(Take<page_id_t>(&cursor, end));
         }
         return node;
     }
 
-    std::shared_ptr<BTreeNode> BTree::FindLeftmostLeaf() const
+    std::string BTree::Encode(const Node &node)
     {
-        auto node = root_;
-        while (!node->is_leaf)
-            node = node->children[0];
-        return node;
-    }
-
-    void BTree::Insert(const Value &key, RID rid)
-    {
-        auto result = InsertInternal(root_, key, rid);
-        if (result)
+        std::string body;
+        if (!node.is_leaf)
+            Put(&body, node.children[0]);
+        for (size_t i = 0; i < node.keys.size(); ++i)
         {
-            // Root was split, create new root
-            auto new_root = std::make_shared<BTreeNode>();
-            new_root->is_leaf = false;
-            new_root->keys.push_back(result->median_key);
-            new_root->children.push_back(root_);
-            new_root->children.push_back(result->new_node);
-            root_ = new_root;
+            node.keys[i].SerializeTo(&body);
+            Put(&body, node.rids[i].page_id);
+            Put(&body, node.rids[i].slot);
+            if (!node.is_leaf)
+                Put(&body, node.children[i + 1]);
         }
+        return body;
     }
 
-    std::optional<BTree::SplitResult> BTree::InsertInternal(
-        std::shared_ptr<BTreeNode> node, const Value &key, RID rid)
+    void BTree::Store(page_id_t page_id, const Node &node)
     {
-        if (node->is_leaf)
+        StoreEncoded(page_id, node, Encode(node));
+    }
+
+    void BTree::StoreEncoded(page_id_t page_id, const Node &node, const std::string &body)
+    {
+        if (body.size() > CAPACITY)
+            throw std::logic_error("B+tree node overflow");
+
+        PageGuard guard = bpm_->FetchPageGuarded(page_id);
+        if (!guard)
+            throw std::runtime_error("Buffer pool exhausted or unreadable index page " + std::to_string(page_id));
+        Page *page = guard.GetPage();
+        std::memset(page->GetData() + OFF_IS_LEAF, 0, PAGE_SIZE - OFF_IS_LEAF); // keep the LSN
+        page->Write<uint8_t>(OFF_IS_LEAF, node.is_leaf ? 1 : 0);
+        page->Write<page_id_t>(OFF_NEXT_LEAF, node.next_leaf);
+        page->Write<uint16_t>(OFF_COUNT, static_cast<uint16_t>(node.keys.size()));
+        std::memcpy(page->GetData() + HEADER_SIZE, body.data(), body.size());
+        guard.MarkDirty();
+    }
+
+    page_id_t BTree::AllocateNode(const Node &node)
+    {
+        page_id_t page_id;
         {
-            // Find insertion position
-            size_t pos = 0;
-            while (pos < node->keys.size() && node->keys[pos] < key)
-                pos++;
+            PageGuard guard = bpm_->NewPageGuarded(&page_id);
+            if (!guard)
+                throw std::runtime_error("Unable to allocate index page");
+        }
+        Store(page_id, node);
+        return page_id;
+    }
 
-            node->keys.insert(node->keys.begin() + static_cast<long>(pos), key);
-            node->rids.insert(node->rids.begin() + static_cast<long>(pos), rid);
+    // ── Construction ─────────────────────────────────────────────────────────
 
-            // Check if we need to split
-            if (static_cast<int>(node->keys.size()) > BTREE_MAX_KEYS)
-            {
-                auto new_leaf = std::make_shared<BTreeNode>();
-                new_leaf->is_leaf = true;
+    std::unique_ptr<BTree> BTree::Create(BufferPoolManager *bpm)
+    {
+        auto tree = std::make_unique<BTree>(bpm, INVALID_PAGE_ID);
+        tree->root_page_id_ = tree->AllocateNode(Node{});
+        return tree;
+    }
 
-                size_t mid = node->keys.size() / 2;
+    BTree::BTree(BufferPoolManager *bpm, page_id_t root_page_id)
+        : bpm_(bpm), root_page_id_(root_page_id) {}
 
-                new_leaf->keys.assign(node->keys.begin() + static_cast<long>(mid), node->keys.end());
-                new_leaf->rids.assign(node->rids.begin() + static_cast<long>(mid),
-                                             node->rids.end());
+    // ── Insert ───────────────────────────────────────────────────────────────
 
-                Value median = new_leaf->keys[0];
+    BTree::Split BTree::SplitNode(Node &node, Node *right)
+    {
+        // Split by encoded bytes so both halves fit even with uneven keys
+        const size_t total = EncodedSize(node);
+        size_t acc = node.is_leaf ? 0 : CHILD_SIZE;
+        size_t mid = 0;
+        while (mid < node.keys.size() - 1 && acc < total / 2)
+        {
+            acc += KeySize(node.keys[mid]) + RID_SIZE + (node.is_leaf ? 0 : CHILD_SIZE);
+            ++mid;
+        }
+        if (mid == 0)
+            mid = 1;
 
-                node->keys.resize(mid);
-                node->rids.resize(mid);
-
-                // Maintain leaf linked list
-                new_leaf->next_leaf = node->next_leaf;
-                node->next_leaf = new_leaf;
-
-                return SplitResult{median, new_leaf};
-            }
-            return std::nullopt;
+        right->is_leaf = node.is_leaf;
+        Split split;
+        if (node.is_leaf)
+        {
+            // Right half starts at mid; its first entry becomes the separator
+            right->keys.assign(node.keys.begin() + static_cast<long>(mid), node.keys.end());
+            right->rids.assign(node.rids.begin() + static_cast<long>(mid), node.rids.end());
+            node.keys.resize(mid);
+            node.rids.resize(mid);
+            split.key = right->keys.front();
+            split.rid = right->rids.front();
         }
         else
         {
-            // Internal node: find child
-            size_t i = 0;
-            while (i < node->keys.size() && !(key < node->keys[i]))
-                i++;
+            // Entry at mid moves up; its right child starts the new node
+            split.key = node.keys[mid];
+            split.rid = node.rids[mid];
+            right->keys.assign(node.keys.begin() + static_cast<long>(mid) + 1, node.keys.end());
+            right->rids.assign(node.rids.begin() + static_cast<long>(mid) + 1, node.rids.end());
+            right->children.assign(node.children.begin() + static_cast<long>(mid) + 1, node.children.end());
+            node.keys.resize(mid);
+            node.rids.resize(mid);
+            node.children.resize(mid + 1);
+        }
+        return split;
+    }
 
-            auto result = InsertInternal(node->children[i], key, rid);
-            if (!result)
-                return std::nullopt;
+    std::optional<BTree::Split> BTree::InsertInto(page_id_t page_id, const Value &key, const RID &rid, bool *inserted)
+    {
+        Node node = Load(page_id);
 
-            // Insert the median key from child split
-            size_t pos = i;
-            node->keys.insert(node->keys.begin() + static_cast<long>(pos), result->median_key);
-            node->children.insert(node->children.begin() + static_cast<long>(pos) + 1, result->new_node);
-
-            if (static_cast<int>(node->keys.size()) > BTREE_MAX_KEYS)
+        // First position whose entry is > (key, rid)
+        size_t pos = 0;
+        while (pos < node.keys.size())
+        {
+            int c = CompareKeys(node.keys[pos], key);
+            if (c == 0)
+                c = CompareRid(node.rids[pos], rid);
+            if (c > 0)
+                break;
+            if (c == 0 && node.is_leaf)
             {
-                auto new_internal = std::make_shared<BTreeNode>();
-                new_internal->is_leaf = false;
-
-                size_t mid = node->keys.size() / 2;
-                Value median = node->keys[mid];
-
-                new_internal->keys.assign(node->keys.begin() + static_cast<long>(mid) + 1,
-                                          node->keys.end());
-                new_internal->children.assign(node->children.begin() + static_cast<long>(mid) + 1,
-                                              node->children.end());
-
-                node->keys.resize(mid);
-                node->children.resize(mid + 1);
-
-                return SplitResult{median, new_internal};
+                *inserted = false; // exact duplicate
+                return std::nullopt;
             }
+            ++pos;
+        }
+
+        if (node.is_leaf)
+        {
+            node.keys.insert(node.keys.begin() + static_cast<long>(pos), key);
+            node.rids.insert(node.rids.begin() + static_cast<long>(pos), rid);
+            *inserted = true;
+        }
+        else
+        {
+            // children[pos] holds entries in [sep[pos-1], sep[pos])
+            auto child_split = InsertInto(node.children[pos], key, rid, inserted);
+            if (!child_split)
+                return std::nullopt;
+            node.keys.insert(node.keys.begin() + static_cast<long>(pos), child_split->key);
+            node.rids.insert(node.rids.begin() + static_cast<long>(pos), child_split->rid);
+            node.children.insert(node.children.begin() + static_cast<long>(pos) + 1, child_split->right_page);
+        }
+
+        std::string body = Encode(node);
+        if (body.size() <= CAPACITY)
+        {
+            StoreEncoded(page_id, node, body);
             return std::nullopt;
+        }
+
+        Node right;
+        Split split = SplitNode(node, &right);
+        if (node.is_leaf)
+            right.next_leaf = node.next_leaf;
+        split.right_page = AllocateNode(right);
+        if (node.is_leaf)
+            node.next_leaf = split.right_page;
+        Store(page_id, node);
+        return split;
+    }
+
+    bool BTree::Insert(const Value &key, const RID &rid)
+    {
+        CheckKey(key);
+        bool inserted = false;
+        auto split = InsertInto(root_page_id_, key, rid, &inserted);
+        if (split)
+        {
+            // Keep the root page id stable: move the (already split) left half
+            // out of the root page and make the root a new internal node.
+            Node left = Load(root_page_id_);
+            const page_id_t left_page = AllocateNode(left);
+            Node root;
+            root.is_leaf = false;
+            root.keys.push_back(split->key);
+            root.rids.push_back(split->rid);
+            root.children = {left_page, split->right_page};
+            Store(root_page_id_, root);
+        }
+        return inserted;
+    }
+
+    // ── Lookup ───────────────────────────────────────────────────────────────
+
+    page_id_t BTree::FindLeafForKey(const Value &key) const
+    {
+        page_id_t page_id = root_page_id_;
+        while (true)
+        {
+            Node node = Load(page_id);
+            if (node.is_leaf)
+                return page_id;
+            // Descend into the child after all separators with key < target
+            size_t i = 0;
+            while (i < node.keys.size() && CompareKeys(node.keys[i], key) < 0)
+                ++i;
+            page_id = node.children[i];
         }
     }
 
-    void BTree::Remove(const Value &key)
+    page_id_t BTree::FindLeftmostLeaf() const
     {
-        // Simple removal: find leaf, remove all matching entries
-        // (No rebalancing for simplicity - educational project)
-        auto leaf = FindLeaf(key);
-        auto node = leaf;
-
-        while (node)
+        page_id_t page_id = root_page_id_;
+        while (true)
         {
-            size_t i = 0;
-            while (i < node->keys.size())
+            Node node = Load(page_id);
+            if (node.is_leaf)
+                return page_id;
+            page_id = node.children[0];
+        }
+    }
+
+    bool BTree::Remove(const Value &key, const RID &rid)
+    {
+        if (key.IsNull())
+            return false;
+        page_id_t page_id = root_page_id_;
+        while (true)
+        {
+            Node node = Load(page_id);
+            if (node.is_leaf)
             {
-                                 if (node->keys[i] == key)
-                 {
-                     node->keys.erase(node->keys.begin() + static_cast<long>(i));
-                     node->rids.erase(node->rids.begin() + static_cast<long>(i));
-                 }
-                 else if (key < node->keys[i])
-                 {
-                     // Keys are ordered; once we pass 'key', no further matches exist
-                     return;
-                 }
-                 else
-                 {
-                     ++i;
-                 }
+                for (size_t i = 0; i < node.keys.size(); ++i)
+                {
+                    if (CompareKeys(node.keys[i], key) == 0 && node.rids[i] == rid)
+                    {
+                        node.keys.erase(node.keys.begin() + static_cast<long>(i));
+                        node.rids.erase(node.rids.begin() + static_cast<long>(i));
+                        Store(page_id, node);
+                        return true;
+                    }
+                }
+                return false;
             }
-            node = node->next_leaf;
+            // Route by the exact (key, rid) entry
+            size_t i = 0;
+            while (i < node.keys.size())
+            {
+                int c = CompareKeys(node.keys[i], key);
+                if (c == 0)
+                    c = CompareRid(node.rids[i], rid);
+                if (c > 0)
+                    break;
+                ++i;
+            }
+            page_id = node.children[i];
         }
     }
 
     std::vector<RID> BTree::Search(const Value &key) const
     {
-        std::vector<RID> results;
-        auto leaf = FindLeaf(key);
-
-        // Scan this leaf and subsequent leaves for matching keys (handles duplicates)
-        auto node = leaf;
-        while (node)
-        {
-            for (size_t i = 0; i < node->keys.size(); ++i)
-            {
-                if (node->keys[i] == key)
-                    results.push_back(node->rids[i]);
-                else if (key < node->keys[i])
-                    return results; // Past our key, done
-            }
-            node = node->next_leaf;
-        }
-        return results;
+        return RangeScan(key, true, key, true);
     }
 
     std::vector<RID> BTree::RangeScan(const std::optional<Value> &low, bool low_inclusive,
-                                          const std::optional<Value> &high, bool high_inclusive) const
+                                      const std::optional<Value> &high, bool high_inclusive) const
     {
         std::vector<RID> results;
-
-        std::shared_ptr<BTreeNode> node;
-        if (low.has_value())
-            node = FindLeaf(low.value());
-        else
-            node = FindLeftmostLeaf();
-
-        while (node)
+        page_id_t page_id = low ? FindLeafForKey(*low) : FindLeftmostLeaf();
+        while (page_id != INVALID_PAGE_ID)
         {
-            for (size_t i = 0; i < node->keys.size(); ++i)
+            Node node = Load(page_id);
+            for (size_t i = 0; i < node.keys.size(); ++i)
             {
-                const Value &k = node->keys[i];
-
-                // Check low bound
-                if (low.has_value())
+                const Value &k = node.keys[i];
+                if (low)
                 {
-                    if (low_inclusive)
-                    {
-                        if (k < low.value()) continue;
-                    }
-                    else
-                    {
-                        if (k < low.value() || k == low.value()) continue;
-                    }
+                    const int c = CompareKeys(k, *low);
+                    if (c < 0 || (c == 0 && !low_inclusive))
+                        continue;
                 }
-
-                // Check high bound
-                if (high.has_value())
+                if (high)
                 {
-                    if (high_inclusive)
-                    {
-                        if (high.value() < k) return results;
-                    }
-                    else
-                    {
-                        if (high.value() < k || k == high.value()) return results;
-                    }
+                    const int c = CompareKeys(k, *high);
+                    if (c > 0 || (c == 0 && !high_inclusive))
+                        return results;
                 }
-
-                results.push_back(node->rids[i]);
+                results.push_back(node.rids[i]);
             }
-            node = node->next_leaf;
+            page_id = node.next_leaf;
         }
         return results;
     }
@@ -221,28 +407,68 @@ namespace sql
     std::vector<BTreeEntry> BTree::GetAllEntries() const
     {
         std::vector<BTreeEntry> entries;
-        auto node = FindLeftmostLeaf();
-        while (node)
+        page_id_t page_id = FindLeftmostLeaf();
+        while (page_id != INVALID_PAGE_ID)
         {
-            for (size_t i = 0; i < node->keys.size(); ++i)
-                entries.push_back({node->keys[i], node->rids[i]});
-            node = node->next_leaf;
+            Node node = Load(page_id);
+            for (size_t i = 0; i < node.keys.size(); ++i)
+                entries.push_back({node.keys[i], node.rids[i]});
+            page_id = node.next_leaf;
         }
         return entries;
     }
 
-    void BTree::BulkLoad(const std::vector<std::pair<Value, RID>> &entries)
+    bool BTree::IsEmpty() const
     {
-        // Reset tree
-        root_ = std::make_shared<BTreeNode>();
+        page_id_t page_id = FindLeftmostLeaf();
+        while (page_id != INVALID_PAGE_ID)
+        {
+            Node node = Load(page_id);
+            if (!node.keys.empty())
+                return false;
+            page_id = node.next_leaf;
+        }
+        return true;
+    }
 
-        // Sort and insert (simple approach)
-        auto sorted = entries;
-        std::sort(sorted.begin(), sorted.end(),
-                  [](const auto &a, const auto &b) { return a.first < b.first; });
+    int BTree::GetHeight() const
+    {
+        int height = 1;
+        page_id_t page_id = root_page_id_;
+        while (true)
+        {
+            Node node = Load(page_id);
+            if (node.is_leaf)
+                return height;
+            page_id = node.children[0];
+            ++height;
+        }
+    }
 
-        for (const auto &e : sorted)
-            Insert(e.first, e.second);
+    void BTree::Drop()
+    {
+        std::vector<page_id_t> stack{root_page_id_};
+        std::vector<page_id_t> pages;
+        while (!stack.empty())
+        {
+            page_id_t page_id = stack.back();
+            stack.pop_back();
+            Node node = Load(page_id);
+            pages.push_back(page_id);
+            if (!node.is_leaf)
+                stack.insert(stack.end(), node.children.begin(), node.children.end());
+        }
+        for (page_id_t page_id : pages)
+        {
+            if (bpm_->IsPinned(page_id))
+                throw std::runtime_error("Cannot drop index: page " + std::to_string(page_id) + " is in use");
+        }
+        root_page_id_ = INVALID_PAGE_ID;
+        for (page_id_t page_id : pages)
+        {
+            if (!bpm_->DeletePage(page_id))
+                throw std::runtime_error("Failed to free index page " + std::to_string(page_id));
+        }
     }
 
 } // namespace sql

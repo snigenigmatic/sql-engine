@@ -3,6 +3,7 @@
 #include "execution/executor.h"
 #include "lexer/lexer.h"
 #include "parser/parser.h"
+#include <cstring>
 
 namespace sql
 {
@@ -632,18 +633,23 @@ namespace sql
         RunSQL(catalog, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
         RunSQL(catalog, "CREATE INDEX idx_s ON t (s);");
 
-        // Row 1 grows and is applied; row 2's new value is too large and fails
-        std::string ok_value(2000, 'k');
+        // Row 1 grows (and may move) and its index entry follows it
+        std::string ok_value(600, 'k');
         auto update = RunSQL(catalog, "UPDATE t SET s = '" + ok_value + "' WHERE id = 1;");
-        ASSERT_TRUE(update.success);
-        auto failing = RunSQL(catalog, "UPDATE t SET s = '" + std::string(5000, 'z') + "' WHERE id >= 2;");
+        ASSERT_TRUE(update.success) << update.message;
+
+        // A value too large to index is rejected before the row is modified
+        auto failing = RunSQL(catalog, "UPDATE t SET s = '" + std::string(2000, 'z') + "' WHERE id >= 2;");
         EXPECT_FALSE(failing.success);
+        EXPECT_NE(failing.message.find("Index key too large"), std::string::npos) << failing.message;
 
         auto via_index = RunSQL(catalog, "SELECT id FROM t WHERE s = '" + ok_value + "';");
         ASSERT_EQ(via_index.tuples.size(), 1u);
         EXPECT_EQ(via_index.tuples[0].GetValue(0).GetAsInt(), 1);
         auto untouched = RunSQL(catalog, "SELECT id FROM t WHERE s = 'b';");
         EXPECT_EQ(untouched.tuples.size(), 1u);
+        auto also_untouched = RunSQL(catalog, "SELECT id FROM t WHERE s = 'c';");
+        EXPECT_EQ(also_untouched.tuples.size(), 1u);
     }
 
     TEST(IntegrationTest, DropTableRemovesItsIndexes)
@@ -662,6 +668,94 @@ namespace sql
         auto result = RunSQL(catalog, "SELECT * FROM t WHERE id = 1;");
         ASSERT_TRUE(result.success);
         EXPECT_TRUE(result.tuples.empty());
+    }
+
+    // ── Index maintenance when storage fails mid-operation ───────────────────────
+
+    // Overwrite an index page with garbage so the next access to it throws,
+    // simulating a storage failure after key validation has passed
+    static void CorruptPage(Catalog &catalog, page_id_t page_id)
+    {
+        PageGuard guard = catalog.GetBufferPool()->FetchPageGuarded(page_id);
+        ASSERT_TRUE(guard);
+        std::memset(guard.GetData() + 4, 0xFF, PAGE_SIZE - 4);
+        guard.MarkDirty();
+    }
+
+    static size_t CountRows(Catalog &catalog, const std::string &table)
+    {
+        return RunSQL(catalog, "SELECT * FROM " + table + ";").tuples.size(); // SeqScan
+    }
+
+    TEST(IntegrationTest, InsertIsUndoneWhenAnIndexWriteFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, name VARCHAR(20));");
+        RunSQL(catalog, "INSERT INTO t VALUES (1, 'a'), (2, 'b');");
+        // Indexes are maintained in name order: the healthy one is written
+        // first, so the failure on the second must undo it
+        RunSQL(catalog, "CREATE INDEX a_idx_id ON t (id);");
+        RunSQL(catalog, "CREATE INDEX z_idx_name ON t (name);");
+        CorruptPage(catalog, catalog.GetIndex("t", "name")->GetRootPageId());
+
+        auto result = RunSQL(catalog, "INSERT INTO t VALUES (3, 'c');");
+        EXPECT_FALSE(result.success);
+        EXPECT_EQ(CountRows(catalog, "t"), 2u);
+        EXPECT_TRUE(catalog.GetIndex("t", "id")->Search(Value(3)).empty());
+    }
+
+    TEST(IntegrationTest, DeleteKeepsRowAndIndexEntriesWhenAnIndexWriteFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, name VARCHAR(20));");
+        RunSQL(catalog, "INSERT INTO t VALUES (1, 'a'), (2, 'b');");
+        // Indexes are maintained in name order: the healthy one is written
+        // first, so the failure on the second must undo it
+        RunSQL(catalog, "CREATE INDEX a_idx_id ON t (id);");
+        RunSQL(catalog, "CREATE INDEX z_idx_name ON t (name);");
+        CorruptPage(catalog, catalog.GetIndex("t", "name")->GetRootPageId());
+
+        auto result = RunSQL(catalog, "DELETE FROM t WHERE id = 1;");
+        EXPECT_FALSE(result.success);
+        EXPECT_EQ(CountRows(catalog, "t"), 2u);
+
+        // The healthy index still finds the row
+        auto via_index = RunSQL(catalog, "SELECT name FROM t WHERE id = 1;");
+        ASSERT_EQ(via_index.tuples.size(), 1u);
+        EXPECT_EQ(via_index.tuples[0].GetValue(0).GetAsString(), "a");
+    }
+
+    TEST(IntegrationTest, UpdateRestoresRowWhenNewIndexEntryFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, pad VARCHAR(100));");
+        std::string sql = "INSERT INTO t VALUES ";
+        for (int i = 0; i < 600; ++i)
+            sql += std::string(i ? ", " : "") + "(" + std::to_string(i) + ", 'row-" + std::to_string(i) + "')";
+        ASSERT_TRUE(RunSQL(catalog, sql + ";").success);
+        RunSQL(catalog, "CREATE INDEX idx_id ON t (id);");
+
+        // Removing the old key (5) succeeds; inserting the new key lands in
+        // a different, corrupted leaf and fails
+        BTree *index = catalog.GetIndex("t", "id");
+        const page_id_t old_leaf = index->GetLeafPageForKey(Value(5));
+        const page_id_t new_leaf = index->GetLeafPageForKey(Value(100000));
+        ASSERT_NE(old_leaf, new_leaf);
+        CorruptPage(catalog, new_leaf);
+
+        auto result = RunSQL(catalog, "UPDATE t SET id = 100000 WHERE id = 5;");
+        EXPECT_FALSE(result.success);
+        EXPECT_EQ(CountRows(catalog, "t"), 600u);
+
+        // Row content and its index entry are back
+        auto via_index = RunSQL(catalog, "SELECT pad FROM t WHERE id = 5;");
+        ASSERT_EQ(via_index.tuples.size(), 1u);
+        EXPECT_EQ(via_index.tuples[0].GetValue(0).GetAsString(), "row-5");
+        auto rids = index->Search(Value(5));
+        ASSERT_EQ(rids.size(), 1u);
+        Tuple row;
+        ASSERT_TRUE(catalog.GetTable("t")->GetTuple(rids[0], &row));
+        EXPECT_EQ(row.GetValue(0).GetAsInt(), 5);
     }
 
 } // namespace sql

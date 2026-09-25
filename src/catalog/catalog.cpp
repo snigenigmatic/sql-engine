@@ -92,6 +92,7 @@ namespace sql
         struct IndexDef
         {
             std::string name, table, column;
+            page_id_t root_page;
         };
         std::vector<IndexDef> index_defs;
 
@@ -116,7 +117,12 @@ namespace sql
             }
             else if (type == TYPE_INDEX)
             {
-                index_defs.push_back({name, tbl_name, definition});
+                // INVALID_PAGE_ID marks an index written before indexes were
+                // stored on disk; it is rebuilt below
+                if (root_page != INVALID_PAGE_ID &&
+                    (root_page < 1 || static_cast<uint32_t>(root_page) >= pager_->GetPageCount()))
+                    throw std::runtime_error("Index '" + name + "' has invalid root page " + std::to_string(root_page));
+                index_defs.push_back({name, tbl_name, definition, root_page});
             }
             else
             {
@@ -125,15 +131,31 @@ namespace sql
             schema_rows_[SchemaKey(type, name)] = rid;
         }
 
-        // Indexes are in-memory for now: rebuild them from table data
         for (const auto &def : index_defs)
         {
             Table *table = GetTable(def.table);
             const int col_idx = table ? table->GetColumnIndex(def.column) : -1;
             if (col_idx < 0)
                 throw std::runtime_error("Index " + def.name + " refers to missing " + def.table + "." + def.column);
-            BuildIndex(table, col_idx, &indexes_[def.table][def.column]);
-            index_registry_[def.name] = {def.table, def.column};
+
+            auto index = std::make_unique<IndexInfo>();
+            index->name = def.name;
+            index->table = def.table;
+            index->column = def.column;
+            index->column_index = col_idx;
+            if (def.root_page != INVALID_PAGE_ID)
+            {
+                index->tree = std::make_unique<BTree>(bpm_, def.root_page);
+            }
+            else
+            {
+                // Written before indexes were stored on disk: build it now
+                // and record its root
+                PopulateIndex(table, index.get());
+                DeleteSchemaRow(TYPE_INDEX, def.name);
+                InsertSchemaRow(TYPE_INDEX, def.name, def.table, index->tree->GetRootPageId(), def.column);
+            }
+            indexes_[def.name] = std::move(index);
         }
     }
 
@@ -156,20 +178,223 @@ namespace sql
         schema_rows_.erase(it);
     }
 
-    void Catalog::BuildIndex(Table *table, int col_idx, BTree *btree)
+    void Catalog::PopulateIndex(Table *table, IndexInfo *index)
     {
-        std::vector<std::pair<Value, RID>> entries;
-        entries.reserve(table->GetTupleCount());
-        for (auto it = table->begin(); it != table->end(); ++it)
+        index->tree = BTree::Create(bpm_);
+        try
         {
-            Value value = it->GetValue(static_cast<size_t>(col_idx));
-            // Skip NULL values to avoid undefined behavior in sorting/comparison
-            if (!value.IsNull())
+            for (auto it = table->begin(); it != table->end(); ++it)
             {
-                entries.push_back({value, it.GetRID()});
+                const Value &value = it->GetValue(static_cast<size_t>(index->column_index));
+                if (!value.IsNull()) // NULLs are not indexed
+                    index->tree->Insert(value, it.GetRID());
             }
         }
-        btree->BulkLoad(entries);
+        catch (...)
+        {
+            index->tree->Drop();
+            index->tree.reset();
+            throw;
+        }
+    }
+
+    void Catalog::CheckIndexKeys(const std::vector<IndexInfo *> &indexes, const Tuple &tuple) const
+    {
+        for (const IndexInfo *index : indexes)
+        {
+            const Value &value = tuple.GetValue(static_cast<size_t>(index->column_index));
+            if (!value.IsNull())
+                BTree::CheckKey(value);
+        }
+    }
+
+    std::vector<IndexInfo *> Catalog::GetTableIndexes(const std::string &table_name)
+    {
+        std::vector<IndexInfo *> result;
+        for (auto &entry : indexes_)
+        {
+            if (entry.second->table == table_name)
+                result.push_back(entry.second.get());
+        }
+        // Deterministic order (by name) so row operations are reproducible
+        std::sort(result.begin(), result.end(), [](const IndexInfo *a, const IndexInfo *b)
+                  { return a->name < b->name; });
+        return result;
+    }
+
+    namespace
+    {
+        // An index entry touched by a row operation, kept so the operation
+        // can be undone if a later step fails
+        struct IndexEntry
+        {
+            BTree *tree;
+            Value key;
+        };
+
+        // Undo helpers are best effort: storage that just failed may fail
+        // again, and the original error is the one worth reporting
+        void InsertEntries(const std::vector<IndexEntry> &entries, const RID &rid) noexcept
+        {
+            for (const auto &entry : entries)
+            {
+                try
+                {
+                    entry.tree->Insert(entry.key, rid);
+                }
+                catch (...)
+                {
+                }
+            }
+        }
+
+        void RemoveEntries(const std::vector<IndexEntry> &entries, const RID &rid) noexcept
+        {
+            for (const auto &entry : entries)
+            {
+                try
+                {
+                    entry.tree->Remove(entry.key, rid);
+                }
+                catch (...)
+                {
+                }
+            }
+        }
+    } // namespace
+
+    RID Catalog::InsertRow(Table *table, const Tuple &tuple)
+    {
+        auto indexes = GetTableIndexes(table->GetName());
+        CheckIndexKeys(indexes, tuple);
+        RID rid = table->Insert(tuple);
+
+        std::vector<IndexEntry> inserted;
+        try
+        {
+            for (IndexInfo *index : indexes)
+            {
+                const Value &value = tuple.GetValue(static_cast<size_t>(index->column_index));
+                if (value.IsNull())
+                    continue;
+                index->tree->Insert(value, rid);
+                inserted.push_back({index->tree.get(), value});
+            }
+        }
+        catch (...)
+        {
+            RemoveEntries(inserted, rid);
+            try
+            {
+                table->DeleteTuple(rid);
+            }
+            catch (...)
+            {
+            }
+            throw;
+        }
+        return rid;
+    }
+
+    bool Catalog::DeleteRow(Table *table, const RID &rid)
+    {
+        Tuple old_tuple;
+        if (!table->GetTuple(rid, &old_tuple))
+            return false;
+
+        // Remove index entries first so a failure never leaves entries
+        // pointing at a deleted row
+        std::vector<IndexEntry> removed;
+        try
+        {
+            for (IndexInfo *index : GetTableIndexes(table->GetName()))
+            {
+                const Value &value = old_tuple.GetValue(static_cast<size_t>(index->column_index));
+                if (!value.IsNull() && index->tree->Remove(value, rid))
+                    removed.push_back({index->tree.get(), value});
+            }
+            if (!table->DeleteTuple(rid))
+            {
+                InsertEntries(removed, rid);
+                return false;
+            }
+        }
+        catch (...)
+        {
+            InsertEntries(removed, rid);
+            throw;
+        }
+        return true;
+    }
+
+    bool Catalog::UpdateRow(Table *table, const RID &rid, const Tuple &tuple)
+    {
+        Tuple old_tuple;
+        if (!table->GetTuple(rid, &old_tuple))
+            return false;
+        auto indexes = GetTableIndexes(table->GetName());
+        CheckIndexKeys(indexes, tuple);
+
+        // 1. Remove the old entries, then 2. rewrite the row (it may move)
+        std::vector<IndexEntry> removed;
+        RID new_rid;
+        try
+        {
+            for (IndexInfo *index : indexes)
+            {
+                const Value &old_value = old_tuple.GetValue(static_cast<size_t>(index->column_index));
+                if (!old_value.IsNull() && index->tree->Remove(old_value, rid))
+                    removed.push_back({index->tree.get(), old_value});
+            }
+            if (!table->UpdateTuple(rid, tuple, &new_rid))
+            {
+                InsertEntries(removed, rid);
+                return false;
+            }
+        }
+        catch (...)
+        {
+            InsertEntries(removed, rid);
+            throw;
+        }
+
+        // 3. Add the new entries at the row's final location
+        std::vector<IndexEntry> new_entries;
+        for (IndexInfo *index : indexes)
+        {
+            const Value &new_value = tuple.GetValue(static_cast<size_t>(index->column_index));
+            if (!new_value.IsNull())
+                new_entries.push_back({index->tree.get(), new_value});
+        }
+        size_t inserted = 0;
+        try
+        {
+            for (; inserted < new_entries.size(); ++inserted)
+                new_entries[inserted].tree->Insert(new_entries[inserted].key, new_rid);
+        }
+        catch (...)
+        {
+            RemoveEntries(std::vector<IndexEntry>(new_entries.begin(), new_entries.begin() + static_cast<long>(inserted)),
+                          new_rid);
+            // Put the old contents back (the row may move again) and point
+            // the old entries at it. If that fails too, index the row as it
+            // is actually stored.
+            RID restored = new_rid;
+            bool reverted = false;
+            try
+            {
+                reverted = table->UpdateTuple(new_rid, old_tuple, &restored);
+            }
+            catch (...)
+            {
+            }
+            if (reverted)
+                InsertEntries(removed, restored);
+            else
+                InsertEntries(new_entries, new_rid);
+            throw;
+        }
+        return true;
     }
 
     bool Catalog::CreateTable(const std::string &name, const Schema &schema)
@@ -201,18 +426,18 @@ namespace sql
         tables_.erase(it);
         DeleteSchemaRow(TYPE_TABLE, name);
 
-        // Indexes on the table point into freed pages; remove them too
-        indexes_.erase(name);
-        for (auto reg = index_registry_.begin(); reg != index_registry_.end();)
+        // Drop the table's indexes and free their pages
+        for (auto idx = indexes_.begin(); idx != indexes_.end();)
         {
-            if (reg->second.first == name)
+            if (idx->second->table == name)
             {
-                DeleteSchemaRow(TYPE_INDEX, reg->first);
-                reg = index_registry_.erase(reg);
+                idx->second->tree->Drop();
+                DeleteSchemaRow(TYPE_INDEX, idx->first);
+                idx = indexes_.erase(idx);
             }
             else
             {
-                ++reg;
+                ++idx;
             }
         }
         return true;
@@ -248,7 +473,7 @@ namespace sql
     bool Catalog::CreateIndex(const std::string &index_name, const std::string &table_name,
                               const std::string &column_name)
     {
-        if (index_registry_.count(index_name))
+        if (indexes_.count(index_name))
             return false; // index name already taken
 
         Table *table = GetTable(table_name);
@@ -259,43 +484,26 @@ namespace sql
         if (col_idx < 0)
             return false;
 
-        // Build BTree from existing rows
-        BuildIndex(table, col_idx, &indexes_[table_name][column_name]);
+        auto index = std::make_unique<IndexInfo>();
+        index->name = index_name;
+        index->table = table_name;
+        index->column = column_name;
+        index->column_index = col_idx;
+        PopulateIndex(table, index.get());
 
-        index_registry_[index_name] = {table_name, column_name};
-        InsertSchemaRow(TYPE_INDEX, index_name, table_name, INVALID_PAGE_ID, column_name);
+        InsertSchemaRow(TYPE_INDEX, index_name, table_name, index->tree->GetRootPageId(), column_name);
+        indexes_[index_name] = std::move(index);
         return true;
     }
 
     BTree *Catalog::GetIndex(const std::string &table_name, const std::string &column_name)
     {
-        auto t_it = indexes_.find(table_name);
-        if (t_it == indexes_.end())
-            return nullptr;
-        auto c_it = t_it->second.find(column_name);
-        if (c_it == t_it->second.end())
-            return nullptr;
-        return &c_it->second;
-    }
-
-    void Catalog::RebuildIndexesForTable(const std::string &table_name)
-    {
-        auto t_it = indexes_.find(table_name);
-        if (t_it == indexes_.end())
-            return;
-
-        Table *table = GetTable(table_name);
-        if (!table)
-            return;
-
-        for (auto &[col_name, btree] : t_it->second)
+        for (auto &entry : indexes_)
         {
-            int col_idx = table->GetColumnIndex(col_name);
-            if (col_idx < 0)
-                continue;
-
-            BuildIndex(table, col_idx, &btree);
+            if (entry.second->table == table_name && entry.second->column == column_name)
+                return entry.second->tree.get();
         }
+        return nullptr;
     }
 
 } // namespace sql

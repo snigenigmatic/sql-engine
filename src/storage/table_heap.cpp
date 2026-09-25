@@ -115,7 +115,11 @@ namespace sql
 
         // Does not fit on its page any more: move it
         RID moved = InsertTuple(tuple);
-        DeleteTuple(rid);
+        if (!DeleteTuple(rid))
+        {
+            DeleteTuple(moved); // never leave two copies of the row
+            return false;
+        }
         if (new_rid)
             *new_rid = moved;
         return true;

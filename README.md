@@ -11,7 +11,7 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Full DML/DDL: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
 - `WHERE` clause with comparison and logical operators
 - Column projection (`SELECT col1, col2 ...`)
-- BTree index support: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`)
+- Disk-resident B+tree indexes: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`), maintained row by row on INSERT/UPDATE/DELETE
 - Query planner: automatically uses index scan when an index exists on the filtered column
 - Single-file database: tables and index definitions are stored in 4 KB pages (slotted heaps + a `sqlite_master`-style schema table) behind an LRU buffer pool
 - Interactive REPL
@@ -157,6 +157,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
 - [x] **M1**: Page layer, single-file `Pager`, LRU `BufferPoolManager` with RAII `PageGuard`
 - [x] **M2**: Slotted-page `TableHeap` with RIDs; tables, scans, joins and indexes run on pages
 - [x] **M3**: Persistent catalog in the database file; REPL opens `sqlengine <file.db>` (replaces `.sqlengine/` text snapshots)
+- [x] **M4**: On-disk B+tree indexes keyed by (value, RID), maintained incrementally
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

@@ -589,21 +589,17 @@ namespace sql
                 for (auto &expr : row)
                     values.push_back(EvaluateExpr(expr.get()));
 
-                table->Insert(Tuple(std::move(values)));
+                catalog_->InsertRow(table, Tuple(std::move(values)));
                 rows_inserted++;
             }
 
             result.success = true;
             result.message = std::to_string(rows_inserted) + " row(s) inserted.";
-            catalog_->RebuildIndexesForTable(insert->table);
         }
         catch (const std::exception &e)
         {
             result.success = false;
             result.message = e.what();
-            // Rows changed before the failure stay changed until transactions
-            // land; keep indexes consistent with what is actually stored.
-            catalog_->RebuildIndexesForTable(insert->table);
         }
         return result;
     }
@@ -634,8 +630,10 @@ namespace sql
             }
 
             for (const RID &rid : to_delete)
-                table->DeleteTuple(rid);
-            catalog_->RebuildIndexesForTable(del->table);
+            {
+                if (!catalog_->DeleteRow(table, rid))
+                    throw std::runtime_error("Failed to delete row " + rid.ToString());
+            }
             result.success = true;
             result.message = std::to_string(to_delete.size()) + " row(s) deleted.";
         }
@@ -643,9 +641,6 @@ namespace sql
         {
             result.success = false;
             result.message = e.what();
-            // Rows changed before the failure stay changed until transactions
-            // land; keep indexes consistent with what is actually stored.
-            catalog_->RebuildIndexesForTable(del->table);
         }
         return result;
     }
@@ -693,9 +688,11 @@ namespace sql
 
             // Apply all updates
             for (const auto &update_pair : updates)
-                table->UpdateTuple(update_pair.first, update_pair.second);
+            {
+                if (!catalog_->UpdateRow(table, update_pair.first, update_pair.second))
+                    throw std::runtime_error("Failed to update row " + update_pair.first.ToString());
+            }
 
-            catalog_->RebuildIndexesForTable(update->table);
             result.success = true;
             result.message = std::to_string(updates.size()) + " row(s) updated.";
         }
@@ -703,9 +700,6 @@ namespace sql
         {
             result.success = false;
             result.message = e.what();
-            // Rows changed before the failure stay changed until transactions
-            // land; keep indexes consistent with what is actually stored.
-            catalog_->RebuildIndexesForTable(update->table);
         }
         return result;
     }
@@ -713,7 +707,18 @@ namespace sql
     ExecutionResult Executor::ExecuteCreateIndex(CreateIndexStatement *create)
     {
         ExecutionResult result;
-        if (!catalog_->CreateIndex(create->index_name, create->table, create->column))
+        bool created = false;
+        try
+        {
+            created = catalog_->CreateIndex(create->index_name, create->table, create->column);
+        }
+        catch (const std::exception &e)
+        {
+            result.success = false;
+            result.message = "Failed to create index '" + create->index_name + "': " + e.what();
+            return result;
+        }
+        if (!created)
         {
             result.success = false;
             result.message = "Failed to create index '" + create->index_name +

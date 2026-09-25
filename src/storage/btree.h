@@ -1,78 +1,126 @@
 #pragma once
 
 #include "common/value.h"
+#include "storage/buffer_pool.h"
 #include "storage/rid.h"
-#include <vector>
 #include <memory>
 #include <optional>
-#include <algorithm>
-#include <functional>
+#include <string>
+#include <vector>
 
-namespace sql{
-    //Basic B+ tree implementation for indexing (not fully featured, just a starting point)
-    constexpr int BTREE_ORDER = 4; // Max keys per node
-    // max keys - order-1
-    constexpr int BTREE_MAX_KEYS = BTREE_ORDER - 1;
-    constexpr int BTREE_MIN_KEYS = (BTREE_ORDER / 2) - 1; // Min keys per node (except root)
+namespace sql
+{
 
-    struct BTreeEntry{
+    struct BTreeEntry
+    {
         Value key;
         RID rid; // Location of the tuple in the table heap
     };
 
-    struct BTreeNode{
-        bool is_leaf = true;
-        std::vector<Value> keys;
-        std::vector<RID> rids;                  // only for leaf nodes, parallel to keys
-        std::vector<std::shared_ptr<BTreeNode>> children; // only for internal nodes
-        std::shared_ptr<BTreeNode> next_leaf = nullptr;   // leaf linked list
-
-        BTreeNode() = default;
-    };
-
+    // Disk-resident B+ tree mapping column values to RIDs.
+    //
+    // Every entry is a unique (key, RID) pair ordered by key then RID, so
+    // duplicate keys need no special handling and a specific row's entry can
+    // be removed exactly. Internal nodes hold (key, RID) separators; leaves
+    // are linked left to right for range scans.
+    //
+    // Each node occupies one page and is (de)serialized on access:
+    //   [0..4)   page LSN (reserved for the WAL)
+    //   [4]      is_leaf
+    //   [8..12)  next leaf page id (leaves only)
+    //   [12..14) entry count
+    //   [16..)   leaf:     { key, rid } * count
+    //            internal: child0, { key, rid, child } * count
+    // Keys use Value's binary encoding. The root page id never changes (a
+    // root split moves the old root's contents to a new page), so the catalog
+    // only records it once.
+    //
+    // Deletes remove entries without merging underfull nodes; empty leaves
+    // stay linked and are skipped by scans.
     class BTree
     {
     public:
-        BTree() : root_(std::make_shared<BTreeNode>()) {}
+        // Maximum encoded key size; guarantees at least three entries per node
+        static constexpr size_t MAX_KEY_SIZE = 1024;
 
-        // Insert a key with its row index
-        void Insert(const Value &key, RID rid);
+        // Allocate an empty tree. Throws on allocation failure.
+        static std::unique_ptr<BTree> Create(BufferPoolManager *bpm);
 
-        // Remove all entries with the given key
-        void Remove(const Value &key);
+        // Attach to an existing tree
+        BTree(BufferPoolManager *bpm, page_id_t root_page_id);
 
-        // Point lookup: find all row indices matching key
+        page_id_t GetRootPageId() const { return root_page_id_; }
+
+        // Throws std::invalid_argument if the key is NULL or too large to
+        // index. Use CheckKey to validate before modifying the table.
+        static void CheckKey(const Value &key);
+
+        // Insert (key, rid). Returns false if that exact pair already exists.
+        bool Insert(const Value &key, const RID &rid);
+
+        // Remove the exact (key, rid) entry. Returns false if absent.
+        bool Remove(const Value &key, const RID &rid);
+
+        // Point lookup: RIDs of all entries with this key, in RID order
         std::vector<RID> Search(const Value &key) const;
 
-        // Range scan: find all row indices where key is in [low, high]
-        // Pass nullopt for unbounded side
+        // Range scan: RIDs with key in [low, high] (bounds optional,
+        // inclusiveness configurable), in key order
         std::vector<RID> RangeScan(const std::optional<Value> &low, bool low_inclusive,
-                                       const std::optional<Value> &high, bool high_inclusive) const;
+                                   const std::optional<Value> &high, bool high_inclusive) const;
 
-        // Get all entries (for debugging / full scan fallback)
+        // All entries in order (debugging / tests)
         std::vector<BTreeEntry> GetAllEntries() const;
 
-        // Rebuild the index from scratch given column values and their row indices
-        void BulkLoad(const std::vector<std::pair<Value, RID>> &entries);
+        bool IsEmpty() const;
 
-        bool IsEmpty() const { return root_->keys.empty(); }
+        // Height of the tree (1 = root is a leaf)
+        int GetHeight() const;
+
+        // Leaf page where a lookup for key starts (diagnostics and tests)
+        page_id_t GetLeafPageForKey(const Value &key) const { return FindLeafForKey(key); }
+
+        // Return every page to the free list. The tree is unusable afterwards.
+        // Throws std::runtime_error (before freeing anything) if a page is
+        // still pinned, or if the pager fails to free a page.
+        void Drop();
+
+        // Total order used by the tree: by type first, then by value
+        static int CompareKeys(const Value &a, const Value &b);
 
     private:
-        struct SplitResult
+        struct Node
         {
-            Value median_key;
-            std::shared_ptr<BTreeNode> new_node;
+            bool is_leaf = true;
+            page_id_t next_leaf = INVALID_PAGE_ID;
+            std::vector<Value> keys;
+            std::vector<RID> rids;
+            std::vector<page_id_t> children; // internal: keys.size() + 1
         };
 
-        std::optional<SplitResult> InsertInternal(std::shared_ptr<BTreeNode> node,
-                                                   const Value &key, RID rid);
+        struct Split
+        {
+            Value key;
+            RID rid;
+            page_id_t right_page;
+        };
 
-        // Find the leaf node where key should go
-        std::shared_ptr<BTreeNode> FindLeaf(const Value &key) const;
+        Node Load(page_id_t page_id) const;
+        static std::string Encode(const Node &node);
+        void Store(page_id_t page_id, const Node &node);
+        void StoreEncoded(page_id_t page_id, const Node &node, const std::string &body);
+        page_id_t AllocateNode(const Node &node);
+        static size_t EncodedSize(const Node &node);
 
-        // Find the leftmost leaf
-        std::shared_ptr<BTreeNode> FindLeftmostLeaf() const;
+        std::optional<Split> InsertInto(page_id_t page_id, const Value &key, const RID &rid, bool *inserted);
+        Split SplitNode(Node &node, Node *right);
 
-        std::shared_ptr<BTreeNode> root_;
+        // Leaf page holding the first entry whose key is >= key
+        page_id_t FindLeafForKey(const Value &key) const;
+        page_id_t FindLeftmostLeaf() const;
+
+        BufferPoolManager *bpm_;
+        page_id_t root_page_id_;
     };
+
 } // namespace sql
