@@ -12,6 +12,8 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - `WHERE` clause with comparison and logical operators (`AND`, `OR`, `NOT`)
 - SQL `NULL`: `NULL` literals, `IS [NOT] NULL`, three-valued logic (a comparison with `NULL` is unknown, and `WHERE` keeps only true rows), and joins never match `NULL` keys
 - `INTEGER` and `FLOAT` values compare and combine numerically
+- Constraints: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`, and `CREATE UNIQUE INDEX`; values are type-checked on write and `VARCHAR(n)` lengths are enforced
+- `INSERT INTO t (col, ...) VALUES ...`: columns left out take their default
 - Column projection (`SELECT col1, col2 ...`)
 - Disk-resident B+tree indexes: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`), maintained row by row on INSERT/UPDATE/DELETE
 - Query planner: automatically uses index scan when an index exists on the filtered column
@@ -22,7 +24,7 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, with statement-level rollback inside a transaction
 
 ### Planned
-- SQL coverage: constraints, expressions in SELECT, `ORDER BY` / `LIMIT`, aggregates and `GROUP BY`, outer and multi-way joins (see [docs/roadmap.md](docs/roadmap.md))
+- SQL coverage: expressions in SELECT, `ORDER BY` / `LIMIT`, aggregates and `GROUP BY`, outer and multi-way joins (see [docs/roadmap.md](docs/roadmap.md))
 
 ## Building
 
@@ -100,7 +102,7 @@ Each statement is atomic and durable: it is committed to the write-ahead log (`<
 
 ```sql
 -- DDL
-CREATE TABLE users (id INTEGER, name VARCHAR(50), age INTEGER);
+CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(50) NOT NULL, age INTEGER DEFAULT 0);
 DROP TABLE users;
 
 -- DML
@@ -171,6 +173,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
 - [x] **M6**: `BEGIN` / `COMMIT` / `ROLLBACK` with savepoint-based statement rollback (single connection, so serializable)
 - [ ] **M7**: SQL coverage
   - [x] NULL semantics and a single shared expression evaluator
+  - [x] Constraints (`PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`), type checking, `INSERT` column lists
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

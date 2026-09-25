@@ -276,6 +276,9 @@ namespace sql
              {"TRANSACTION", TokenType::TRANSACTION},
              {"NULL", TokenType::NULL_KW},
              {"IS", TokenType::IS},
+             {"PRIMARY", TokenType::PRIMARY},
+             {"UNIQUE", TokenType::UNIQUE},
+             {"DEFAULT", TokenType::DEFAULT},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

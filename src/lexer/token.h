@@ -41,6 +41,9 @@ namespace sql
         TRANSACTION,
         NULL_KW,
         IS,
+        PRIMARY,
+        UNIQUE,
+        DEFAULT,
 
         // Identifiers and Literals
         IDENTIFIER,

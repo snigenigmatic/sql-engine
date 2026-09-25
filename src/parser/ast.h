@@ -105,6 +105,10 @@ namespace sql
         std::string name;
         TokenType type_token; // INTEGER, VARCHAR, FLOAT, BOOLEAN
         int length = 0;       // For VARCHAR(n)
+        bool not_null = false;
+        bool primary_key = false;
+        bool unique = false;
+        std::optional<Value> default_value;
     };
 
     struct CreateTableStatement : public Statement
@@ -123,6 +127,7 @@ namespace sql
     struct InsertStatement : public Statement
     {
         std::string table;
+        std::vector<std::string> columns;                           // empty = every column, in order
         std::vector<std::vector<std::unique_ptr<Expression>>> rows; // VALUES (...), (...)
         StatementType GetType() const override { return StatementType::INSERT; }
     };
@@ -132,6 +137,7 @@ namespace sql
         std::string index_name;
         std::string table;
         std::string column;
+        bool unique = false;
         StatementType GetType() const override { return StatementType::CREATE_INDEX; }
     };
 

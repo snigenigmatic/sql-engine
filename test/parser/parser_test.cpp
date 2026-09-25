@@ -588,4 +588,52 @@ namespace sql
         EXPECT_THROW(parser.ParseStatement(), std::runtime_error);
     }
 
+    TEST(ParserTest, ParseColumnConstraints)
+    {
+        Lexer lexer("CREATE TABLE t (id INTEGER PRIMARY KEY, email VARCHAR(20) NOT NULL UNIQUE, "
+                    "n INTEGER NULL DEFAULT -5, s VARCHAR(5) DEFAULT 'x', key INTEGER);");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *create = static_cast<CreateTableStatement *>(stmt.get());
+        ASSERT_EQ(create->columns.size(), 5u);
+        EXPECT_TRUE(create->columns[0].primary_key);
+        EXPECT_TRUE(create->columns[1].not_null);
+        EXPECT_TRUE(create->columns[1].unique);
+        EXPECT_FALSE(create->columns[2].not_null);
+        ASSERT_TRUE(create->columns[2].default_value.has_value());
+        EXPECT_EQ(create->columns[2].default_value->GetAsInt(), -5);
+        EXPECT_EQ(create->columns[3].default_value->GetAsString(), "x");
+        EXPECT_EQ(create->columns[4].name, "key"); // KEY is not reserved
+    }
+
+    TEST(ParserTest, ParseConstraintErrors)
+    {
+        for (const char *sql : {"CREATE TABLE t (id INTEGER PRIMARY);", "CREATE TABLE t (id INTEGER DEFAULT id);",
+                                "CREATE TABLE t (id INTEGER NOT 5);"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
+    }
+
+    TEST(ParserTest, ParseUniqueIndexAndInsertColumns)
+    {
+        {
+            Lexer lexer("CREATE UNIQUE INDEX idx ON t (c);");
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            ASSERT_EQ(stmt->GetType(), StatementType::CREATE_INDEX);
+            EXPECT_TRUE(static_cast<CreateIndexStatement *>(stmt.get())->unique);
+        }
+        {
+            Lexer lexer("INSERT INTO t (b, a) VALUES (1, 2), (3, 4);");
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            auto *insert = static_cast<InsertStatement *>(stmt.get());
+            EXPECT_EQ(insert->columns, (std::vector<std::string>{"b", "a"}));
+            EXPECT_EQ(insert->rows.size(), 2u);
+        }
+    }
+
 } // namespace sql

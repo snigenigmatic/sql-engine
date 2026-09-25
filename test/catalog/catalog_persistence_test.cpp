@@ -270,6 +270,64 @@ namespace sql
         EXPECT_TRUE(Run(*db, "CREATE INDEX idx_s ON t (s);").success);
     }
 
+    TEST_F(CatalogPersistenceTest, ConstraintsSurviveReopen)
+    {
+        {
+            auto db = OpenDb();
+            ASSERT_TRUE(Run(*db, "CREATE TABLE t (id INTEGER PRIMARY KEY, email VARCHAR(30) NOT NULL UNIQUE, "
+                                 "note VARCHAR(40) DEFAULT 'a, b: c', n FLOAT DEFAULT 1);")
+                            .success);
+            ASSERT_TRUE(Run(*db, "CREATE TABLE u (x INTEGER);").success);
+            ASSERT_TRUE(Run(*db, "CREATE UNIQUE INDEX idx_x ON u (x);").success);
+            ASSERT_TRUE(Run(*db, "INSERT INTO t (id, email) VALUES (1, 'a@x');").success);
+            ASSERT_TRUE(Run(*db, "INSERT INTO u VALUES (5);").success);
+        }
+        auto db = OpenDb();
+        const Schema &schema = db->GetCatalog().GetTable("t")->GetSchema();
+        EXPECT_TRUE(schema.GetColumn(0).primary_key);
+        EXPECT_TRUE(schema.GetColumn(1).not_null);
+        EXPECT_TRUE(schema.GetColumn(1).unique);
+        ASSERT_TRUE(schema.GetColumn(2).default_value.has_value());
+        EXPECT_EQ(schema.GetColumn(2).default_value->GetAsString(), "a, b: c");
+        EXPECT_EQ(schema.GetColumn(3).default_value->GetType(), DataType::FLOAT);
+
+        EXPECT_FALSE(Run(*db, "INSERT INTO t (id, email) VALUES (1, 'b@x');").success);
+        EXPECT_FALSE(Run(*db, "INSERT INTO t (id, email) VALUES (2, 'a@x');").success);
+        EXPECT_FALSE(Run(*db, "INSERT INTO t (id) VALUES (3);").success);
+        EXPECT_FALSE(Run(*db, "INSERT INTO u VALUES (5);").success);
+        ASSERT_TRUE(Run(*db, "INSERT INTO t (id, email) VALUES (4, 'd@x');").success);
+        auto row = Run(*db, "SELECT note FROM t WHERE id = 4;");
+        ASSERT_EQ(row.tuples.size(), 1u);
+        EXPECT_EQ(row.tuples[0].GetValue(0).GetAsString(), "a, b: c");
+    }
+
+    TEST_F(CatalogPersistenceTest, SchemaRowsWithoutConstraintsStillLoad)
+    {
+        // Tables written before constraints existed store "name:type:length"
+        {
+            auto db = OpenDb();
+            Run(*db, "CREATE TABLE placeholder (x INTEGER);");
+        }
+        {
+            Pager pager;
+            ASSERT_TRUE(pager.Open(path_));
+            BufferPoolManager bpm(8, &pager);
+            auto heap = TableHeap::Create(&bpm);
+            heap->InsertTuple(Tuple({Value(7), Value("seven")}));
+            TableHeap schema(&bpm, pager.GetCatalogRoot());
+            schema.InsertTuple(Tuple({Value("table"), Value("old"), Value("old"),
+                                      Value(static_cast<int32_t>(heap->GetFirstPageId())), Value("id:0:0,name:2:20")}));
+        }
+        auto db = OpenDb();
+        Table *old = db->GetCatalog().GetTable("old");
+        ASSERT_NE(old, nullptr);
+        EXPECT_FALSE(old->GetSchema().GetColumn(0).not_null);
+        EXPECT_EQ(old->GetSchema().GetColumn(1).length, 20);
+        auto rows = Run(*db, "SELECT name FROM old WHERE id = 7;");
+        ASSERT_EQ(rows.tuples.size(), 1u);
+        EXPECT_EQ(rows.tuples[0].GetValue(0).GetAsString(), "seven");
+    }
+
     // ── Corrupt files ─────────────────────────────────────────────────────────────
 
     TEST_F(CatalogPersistenceTest, FileWithPagesButNoSchemaIsRejected)

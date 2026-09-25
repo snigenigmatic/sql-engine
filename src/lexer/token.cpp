@@ -39,6 +39,9 @@ namespace sql
         case TokenType::TRANSACTION: return "TRANSACTION";
         case TokenType::NULL_KW: return "NULL";
         case TokenType::IS: return "IS";
+        case TokenType::PRIMARY: return "PRIMARY";
+        case TokenType::UNIQUE: return "UNIQUE";
+        case TokenType::DEFAULT: return "DEFAULT";
         case TokenType::IDENTIFIER: return "IDENTIFIER";
         case TokenType::STRING_LITERAL: return "STRING_LITERAL";
         case TokenType::INTEGER_LITERAL: return "INTEGER_LITERAL";

@@ -290,6 +290,18 @@ namespace sql
         EXPECT_EQ(CountAfterReopen("t"), 3u);
     }
 
+    TEST_F(SessionTest, ConstraintViolationRollsBackTheWholeStatement)
+    {
+        auto db = Open();
+        Session session(db.get());
+        session.Execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s VARCHAR(10));");
+        auto result = session.Execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (1, 'dup');");
+        EXPECT_FALSE(result.success);
+        EXPECT_NE(result.message.find("UNIQUE constraint failed: t.id"), std::string::npos) << result.message;
+        EXPECT_EQ(Count(session, "t"), 0u);
+        EXPECT_TRUE(session.Execute("INSERT INTO t VALUES (1, 'a'), (2, 'b');").success);
+    }
+
     // ── Crashes ───────────────────────────────────────────────────────────────────
 
     static bool RunAndCrash(const std::function<bool()> &body)
