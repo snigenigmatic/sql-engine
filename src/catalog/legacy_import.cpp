@@ -1,4 +1,4 @@
-#include "storage/disk_manager.h"
+#include "catalog/legacy_import.h"
 #include <sys/stat.h>
 #include <fstream>
 #include <sstream>
@@ -7,121 +7,25 @@
 namespace sql
 {
 
-    DiskManager::DiskManager(const std::string &db_directory) : db_directory_(db_directory)
-    {
-        EnsureDirectory();
-    }
+    LegacyImporter::LegacyImporter(const std::string &db_directory) : db_directory_(db_directory) {}
 
-    bool DiskManager::EnsureDirectory()
+    bool LegacyImporter::HasSnapshot() const
     {
         struct stat st;
-        if (stat(db_directory_.c_str(), &st) != 0)
-        {
-            // Directory doesn't exist, create it
-            return mkdir(db_directory_.c_str(), 0755) == 0;
-        }
-        return true;
+        return stat(GetCatalogPath().c_str(), &st) == 0;
     }
 
-    std::string DiskManager::GetTablePath(const std::string &table_name) const
+    std::string LegacyImporter::GetTablePath(const std::string &table_name) const
     {
         return db_directory_ + "/" + table_name + ".tbl";
     }
 
-    std::string DiskManager::GetCatalogPath() const
+    std::string LegacyImporter::GetCatalogPath() const
     {
         return db_directory_ + "/catalog.meta";
     }
 
-    bool DiskManager::SaveCatalog(const Catalog &catalog)
-    {
-        // Save catalog metadata (list of table names)
-        std::ofstream meta_file(GetCatalogPath());
-        if (!meta_file)
-        {
-            return false;
-        }
-
-        auto table_names = catalog.GetTableNames();
-        meta_file << table_names.size() << "\n";
-        for (const auto &name : table_names)
-        {
-            meta_file << name << "\n";
-            // Save each table
-            Table *table = const_cast<Catalog &>(catalog).GetTable(name);
-            if (table && !SaveTable(*table))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    bool DiskManager::SaveTable(const Table &table)
-    {
-        std::ofstream file(GetTablePath(table.GetName()));
-        if (!file)
-        {
-            return false;
-        }
-
-        const Schema &schema = table.GetSchema();
-        const auto &columns = schema.GetColumns();
-
-        // Write schema: num_columns
-        file << columns.size() << "\n";
-
-        // Write each column: name type length
-        for (const auto &col : columns)
-        {
-            file << col.name << " " << static_cast<int>(col.type) << " " << col.length << "\n";
-        }
-
-        // Write tuples: num_tuples
-        file << table.GetTupleCount() << "\n";
-
-        // Write each tuple
-        for (const auto &tuple : table)
-        {
-            for (size_t i = 0; i < columns.size(); ++i)
-            {
-                const Value &val = tuple.GetValue(i);
-                file << static_cast<int>(val.GetType()) << " ";
-                if (val.IsNull())
-                {
-                    file << "NULL";
-                }
-                else
-                {
-                    switch (val.GetType())
-                    {
-                    case DataType::INTEGER:
-                        file << val.GetAsInt();
-                        break;
-                    case DataType::FLOAT:
-                        file << val.GetAsFloat();
-                        break;
-                    case DataType::BOOLEAN:
-                        file << (val.GetAsBool() ? "true" : "false");
-                        break;
-                    case DataType::VARCHAR:
-                    {
-                        // Escape string: write length then content
-                        std::string s = val.GetAsString();
-                        file << s.length() << ":" << s;
-                        break;
-                    }
-                    }
-                }
-                file << "\n";
-            }
-        }
-
-        return true;
-    }
-
-    bool DiskManager::LoadCatalog(Catalog &catalog)
+    bool LegacyImporter::LoadCatalog(Catalog &catalog)
     {
         std::ifstream meta_file(GetCatalogPath());
         if (!meta_file)
@@ -145,7 +49,7 @@ namespace sql
         return true;
     }
 
-    bool DiskManager::LoadTable(const std::string &table_name, Catalog &catalog)
+    bool LegacyImporter::LoadTable(const std::string &table_name, Catalog &catalog)
     {
         std::ifstream file(GetTablePath(table_name));
         if (!file)

@@ -13,7 +13,7 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Column projection (`SELECT col1, col2 ...`)
 - BTree index support: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`)
 - Query planner: automatically uses index scan when an index exists on the filtered column
-- Disk-based persistence via `DiskManager`
+- Single-file database: tables and index definitions are stored in 4 KB pages (slotted heaps + a `sqlite_master`-style schema table) behind an LRU buffer pool
 - Interactive REPL
 
 ### Planned
@@ -42,8 +42,8 @@ cmake --build build
 # Run tests
 ctest --test-dir build --output-on-failure
 
-# Run the REPL
-./build/src/sqlengine
+# Run the REPL (creates/opens mydb.db; default is sqlengine.db)
+./build/src/sqlengine mydb.db
 ```
 
 ### Build Options
@@ -74,9 +74,9 @@ sql-engine/
 │   ├── common/    # Value, Schema, Tuple
 │   ├── lexer/     # Tokenizer
 │   ├── parser/    # SQL parser + AST
-│   ├── catalog/   # Table and index registry
+│   ├── catalog/   # Catalog (schema table), Database, legacy snapshot importer
 │   ├── execution/ # Operators: SeqScan, Filter, Projection, IndexScan, Executor
-│   ├── storage/   # Pager, BufferPool, TablePage/TableHeap, Table, BTree, DiskManager
+│   ├── storage/   # Pager, BufferPool, TablePage/TableHeap, Table, BTree
 │   └── optimizer/ # (stub, planned)
 ├── test/
 │   ├── integration/  # End-to-end SQL tests
@@ -90,8 +90,10 @@ sql-engine/
 ### REPL
 
 ```bash
-./build/src/sqlengine
+./build/src/sqlengine [database-file]   # default: sqlengine.db
 ```
+
+Changes are written to the database file after every statement. A text snapshot left in `.sqlengine/` by older versions is imported automatically the first time a new database file is created.
 
 ```sql
 -- DDL
@@ -116,7 +118,7 @@ SELECT * FROM users WHERE id > 1;   -- uses index range scan
 | Command | Description |
 |---|---|
 | `tables` | List all tables and their columns |
-| `save` | Persist all tables to disk |
+| `save` | Flush all pages to the database file (also done after every statement) |
 | `help` | Show SQL syntax reference |
 | `quit` / `exit` | Save and exit |
 
@@ -153,7 +155,8 @@ ctest --test-dir build --output-on-failure --verbose
 
 The path to a fully working embedded database (page storage, WAL, transactions, SQL coverage) is tracked in [docs/roadmap.md](docs/roadmap.md).
 - [x] **M1**: Page layer, single-file `Pager`, LRU `BufferPoolManager` with RAII `PageGuard`
-- [x] **M2**: Slotted-page `TableHeap` with RIDs; tables, scans, joins and indexes run on pages (in-memory database by default until M3)
+- [x] **M2**: Slotted-page `TableHeap` with RIDs; tables, scans, joins and indexes run on pages
+- [x] **M3**: Persistent catalog in the database file; REPL opens `sqlengine <file.db>` (replaces `.sqlengine/` text snapshots)
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture
