@@ -14,6 +14,7 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Disk-resident B+tree indexes: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`), maintained row by row on INSERT/UPDATE/DELETE
 - Query planner: automatically uses index scan when an index exists on the filtered column
 - Single-file database: tables and index definitions are stored in 4 KB pages (slotted heaps + a `sqlite_master`-style schema table) behind an LRU buffer pool
+- Crash safety: a write-ahead log makes every statement atomic and durable; committed work is recovered after a crash, anything uncommitted is discarded
 - Interactive REPL
 
 ### Planned
@@ -93,7 +94,7 @@ sql-engine/
 ./build/src/sqlengine [database-file]   # default: sqlengine.db
 ```
 
-Changes are written to the database file after every statement. A text snapshot left in `.sqlengine/` by older versions is imported automatically the first time a new database file is created.
+Each statement is atomic and durable: it is committed to the write-ahead log (`<file>-wal`) when it succeeds and rolled back when it fails. The log is copied into the database file by checkpoints (automatically, on `save`, and on exit), and replayed on the next start if the process crashes. Only one process can have a database open at a time. A text snapshot left in `.sqlengine/` by older versions is imported automatically the first time a new database file is created.
 
 ```sql
 -- DDL
@@ -118,7 +119,7 @@ SELECT * FROM users WHERE id > 1;   -- uses index range scan
 | Command | Description |
 |---|---|
 | `tables` | List all tables and their columns |
-| `save` | Flush all pages to the database file (also done after every statement) |
+| `save` | Checkpoint: copy the write-ahead log into the database file |
 | `help` | Show SQL syntax reference |
 | `quit` / `exit` | Save and exit |
 
@@ -158,6 +159,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
 - [x] **M2**: Slotted-page `TableHeap` with RIDs; tables, scans, joins and indexes run on pages
 - [x] **M3**: Persistent catalog in the database file; REPL opens `sqlengine <file.db>` (replaces `.sqlengine/` text snapshots)
 - [x] **M4**: On-disk B+tree indexes keyed by (value, RID), maintained incrementally
+- [x] **M5**: Write-ahead log with crash recovery, checkpoints, and atomic per-statement commit/rollback
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

@@ -113,15 +113,16 @@ namespace sql
             ASSERT_TRUE(Run(*db, "DROP TABLE doomed;").success);
         }
 
-        auto db = OpenDb();
-        EXPECT_EQ(db->GetCatalog().GetTableNames(), (std::vector<std::string>{"keeper"}));
-        EXPECT_EQ(db->GetCatalog().GetIndex("doomed", "id"), nullptr);
         // The dropped table's pages went onto the free list
         {
             Pager probe;
-            ASSERT_TRUE(probe.Open(path_));
+            ASSERT_TRUE(probe.Open(path_)) << probe.GetLastError();
             EXPECT_NE(probe.GetFreeListHead(), INVALID_PAGE_ID);
         }
+
+        auto db = OpenDb();
+        EXPECT_EQ(db->GetCatalog().GetTableNames(), (std::vector<std::string>{"keeper"}));
+        EXPECT_EQ(db->GetCatalog().GetIndex("doomed", "id"), nullptr);
 
         // Index name can be reused after the drop
         Run(*db, "CREATE TABLE doomed (id INTEGER);");
@@ -152,6 +153,16 @@ namespace sql
             ASSERT_EQ(result.tuples.size(), 1u);
             EXPECT_EQ(result.tuples[0].GetValue(0).GetAsInt(), t);
         }
+    }
+
+    TEST_F(CatalogPersistenceTest, SecondConnectionIsRefused)
+    {
+        auto db = OpenDb();
+        std::string error;
+        EXPECT_EQ(Database::Open(path_, &error), nullptr);
+        EXPECT_NE(error.find("locked"), std::string::npos) << error;
+        db.reset();
+        EXPECT_NE(OpenDb(), nullptr); // lock released on close
     }
 
     TEST_F(CatalogPersistenceTest, RejectsNonDatabaseFile)

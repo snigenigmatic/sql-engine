@@ -1,5 +1,6 @@
 #include "storage/pager.h"
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <array>
@@ -46,6 +47,12 @@ namespace sql
         {
             return static_cast<off_t>(page_id) * static_cast<off_t>(PAGE_SIZE);
         }
+
+        bool FileExists(const std::string &path)
+        {
+            struct stat st;
+            return stat(path.c_str(), &st) == 0;
+        }
     } // namespace
 
     Pager::~Pager()
@@ -53,42 +60,82 @@ namespace sql
         Close();
     }
 
+    bool Pager::Fail(const std::string &message)
+    {
+        last_error_ = message;
+        wal_.Close(false);
+        if (fd_ >= 0)
+        {
+            close(fd_);
+            fd_ = -1;
+        }
+        return false;
+    }
+
     bool Pager::Open(const std::string &path)
     {
         Close();
+        last_error_.clear();
+
         fd_ = open(path.c_str(), O_RDWR | O_CREAT, 0644);
         if (fd_ < 0)
-            return false;
+            return Fail("cannot open '" + path + "'");
+        // One connection at a time: two writers would each think they own
+        // the log
+        if (flock(fd_, LOCK_EX | LOCK_NB) != 0)
+            return Fail("database '" + path + "' is locked by another connection");
 
         struct stat st;
         if (fstat(fd_, &st) != 0)
-        {
-            Close();
-            return false;
-        }
+            return Fail("cannot stat '" + path + "'");
 
+        const std::string wal_path = path + "-wal";
         if (st.st_size == 0)
         {
+            // New database. A log left behind by an earlier database with
+            // the same name must not be replayed into it.
+            unlink(wal_path.c_str());
             page_count_ = 1;
             free_list_head_ = INVALID_PAGE_ID;
             catalog_root_ = INVALID_PAGE_ID;
-            if (!WriteHeader())
+            std::array<char, PAGE_SIZE> buf{};
+            BuildHeader(buf.data());
+            if (!RawWrite(0, buf.data()) || fsync(fd_) != 0)
+                return Fail("cannot initialize '" + path + "'");
+        }
+        else
+        {
+            // Reject foreign files before touching any log
+            std::array<char, sizeof(MAGIC)> magic{};
+            if (!PreadFull(fd_, magic.data(), magic.size(), 0) ||
+                std::memcmp(magic.data(), MAGIC, sizeof(MAGIC)) != 0)
+                return Fail("'" + path + "' is not a database file");
+
+            // Replay transactions committed before a crash
+            if (FileExists(wal_path))
             {
-                Close();
-                return false;
+                if (!wal_.Open(wal_path))
+                    return Fail("cannot read write-ahead log '" + wal_path + "'");
+                if (wal_.GetCommittedFrameCount() > 0 && !CheckpointLog())
+                    return Fail("recovery from '" + wal_path + "' failed");
             }
-            return true;
+
+            if (fstat(fd_, &st) != 0)
+                return Fail("cannot stat '" + path + "'");
+            // Every declared page must exist and header page ids must be in
+            // range
+            if (!ReadHeader() ||
+                static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(page_count_) * PAGE_SIZE ||
+                !IsValidHeaderPageId(free_list_head_) || !IsValidHeaderPageId(catalog_root_))
+                return Fail("'" + path + "' has a corrupt header");
         }
 
-        // Reject corrupt headers: every declared page must exist in the file
-        // and the page ids stored in the header must be in range.
-        if (!ReadHeader() ||
-            static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(page_count_) * PAGE_SIZE ||
-            !IsValidHeaderPageId(free_list_head_) || !IsValidHeaderPageId(catalog_root_))
-        {
-            Close();
-            return false;
-        }
+        if (!wal_.IsOpen() && !wal_.Open(wal_path))
+            return Fail("cannot create write-ahead log '" + wal_path + "'");
+
+        committed_header_ = CurrentHeader();
+        header_dirty_ = false;
+        fresh_pages_.clear();
         return true;
     }
 
@@ -102,6 +149,27 @@ namespace sql
         mem_pages_.clear();
         mem_pages_.push_back(std::make_unique<std::array<char, PAGE_SIZE>>());
         WriteHeader();
+    }
+
+    void Pager::Close()
+    {
+        if (in_memory_)
+        {
+            in_memory_ = false;
+            mem_pages_.clear();
+        }
+        if (fd_ >= 0)
+        {
+            // Outstanding writes are committed on close. Keep the log if
+            // anything fails so recovery can finish the job.
+            const bool clean = Commit() && Checkpoint();
+            wal_.Close(clean);
+            fsync(fd_);
+            close(fd_); // also releases the lock
+            fd_ = -1;
+        }
+        fresh_pages_.clear();
+        header_dirty_ = false;
     }
 
     bool Pager::RawRead(page_id_t page_id, char *out)
@@ -124,21 +192,6 @@ namespace sql
             return true;
         }
         return PwriteFull(fd_, data, PAGE_SIZE, PageOffset(page_id));
-    }
-
-    void Pager::Close()
-    {
-        if (in_memory_)
-        {
-            in_memory_ = false;
-            mem_pages_.clear();
-        }
-        if (fd_ >= 0)
-        {
-            fsync(fd_);
-            close(fd_);
-            fd_ = -1;
-        }
     }
 
     bool Pager::ReadHeader()
@@ -165,15 +218,27 @@ namespace sql
         return page_id == INVALID_PAGE_ID || (page_id >= 1 && static_cast<uint32_t>(page_id) < page_count_);
     }
 
+    void Pager::BuildHeader(char *buf) const
+    {
+        std::memset(buf, 0, PAGE_SIZE);
+        std::memcpy(buf, MAGIC, sizeof(MAGIC));
+        uint32_t version = FORMAT_VERSION;
+        std::memcpy(buf + OFF_VERSION, &version, sizeof(version));
+        std::memcpy(buf + OFF_PAGE_COUNT, &page_count_, sizeof(page_count_));
+        std::memcpy(buf + OFF_FREE_HEAD, &free_list_head_, sizeof(free_list_head_));
+        std::memcpy(buf + OFF_CATALOG_ROOT, &catalog_root_, sizeof(catalog_root_));
+    }
+
     bool Pager::WriteHeader()
     {
+        if (!in_memory_)
+        {
+            // Written to the log as the next commit frame
+            header_dirty_ = true;
+            return true;
+        }
         std::array<char, PAGE_SIZE> buf{};
-        std::memcpy(buf.data(), MAGIC, sizeof(MAGIC));
-        uint32_t version = FORMAT_VERSION;
-        std::memcpy(buf.data() + OFF_VERSION, &version, sizeof(version));
-        std::memcpy(buf.data() + OFF_PAGE_COUNT, &page_count_, sizeof(page_count_));
-        std::memcpy(buf.data() + OFF_FREE_HEAD, &free_list_head_, sizeof(free_list_head_));
-        std::memcpy(buf.data() + OFF_CATALOG_ROOT, &catalog_root_, sizeof(catalog_root_));
+        BuildHeader(buf.data());
         return RawWrite(0, buf.data());
     }
 
@@ -181,6 +246,15 @@ namespace sql
     {
         if (!IsOpen() || page_id <= 0 || static_cast<uint32_t>(page_id) >= page_count_)
             return false;
+        if (in_memory_)
+            return RawRead(page_id, out);
+        if (fresh_pages_.count(page_id))
+        {
+            std::memset(out, 0, PAGE_SIZE);
+            return true;
+        }
+        if (wal_.ReadPage(page_id, out))
+            return true;
         return RawRead(page_id, out);
     }
 
@@ -188,7 +262,10 @@ namespace sql
     {
         if (!IsOpen() || page_id <= 0 || static_cast<uint32_t>(page_id) >= page_count_)
             return false;
-        return RawWrite(page_id, data);
+        if (in_memory_)
+            return RawWrite(page_id, data);
+        fresh_pages_.erase(page_id);
+        return wal_.AppendFrame(page_id, data, 0);
     }
 
     page_id_t Pager::AllocatePage()
@@ -196,29 +273,35 @@ namespace sql
         if (!IsOpen())
             return INVALID_PAGE_ID;
 
-        std::array<char, PAGE_SIZE> zeros{};
-
+        page_id_t page_id;
         if (free_list_head_ != INVALID_PAGE_ID)
         {
-            page_id_t page_id = free_list_head_;
+            page_id = free_list_head_;
             std::array<char, PAGE_SIZE> buf{};
-            if (!RawRead(page_id, buf.data()))
+            if (!ReadPage(page_id, buf.data()))
                 return INVALID_PAGE_ID;
             page_id_t next;
             std::memcpy(&next, buf.data(), sizeof(next));
+            if (!IsValidHeaderPageId(next))
+                return INVALID_PAGE_ID; // corrupt free list
             free_list_head_ = next;
-            if (!RawWrite(page_id, zeros.data()) || !WriteHeader())
-                return INVALID_PAGE_ID;
-            return page_id;
+        }
+        else
+        {
+            page_id = static_cast<page_id_t>(page_count_);
+            page_count_++;
         }
 
-        page_id_t page_id = static_cast<page_id_t>(page_count_);
-        page_count_++;
-        if (!RawWrite(page_id, zeros.data()) || !WriteHeader())
+        if (in_memory_)
         {
-            page_count_--;
-            return INVALID_PAGE_ID;
+            std::array<char, PAGE_SIZE> zeros{};
+            RawWrite(page_id, zeros.data());
         }
+        else
+        {
+            fresh_pages_.insert(page_id);
+        }
+        WriteHeader();
         return page_id;
     }
 
@@ -229,7 +312,7 @@ namespace sql
 
         std::array<char, PAGE_SIZE> buf{};
         std::memcpy(buf.data(), &free_list_head_, sizeof(free_list_head_));
-        if (!RawWrite(page_id, buf.data()))
+        if (!WritePage(page_id, buf.data()))
             return false;
         free_list_head_ = page_id;
         return WriteHeader();
@@ -241,11 +324,99 @@ namespace sql
         return WriteHeader();
     }
 
+    bool Pager::HasUncommittedChanges() const
+    {
+        return !in_memory_ && fd_ >= 0 &&
+               (wal_.HasUncommittedFrames() || header_dirty_ || !fresh_pages_.empty());
+    }
+
+    bool Pager::Commit()
+    {
+        if (!HasUncommittedChanges())
+            return true;
+
+        // Pages allocated but never written still have to exist
+        std::array<char, PAGE_SIZE> buf{};
+        for (page_id_t page_id : fresh_pages_)
+        {
+            if (!wal_.AppendFrame(page_id, buf.data(), 0))
+                return false;
+        }
+        fresh_pages_.clear();
+
+        // The header page is the commit frame
+        BuildHeader(buf.data());
+        if (!wal_.AppendFrame(0, buf.data(), page_count_))
+            return false;
+        committed_header_ = CurrentHeader();
+        header_dirty_ = false;
+
+        if (wal_.GetFrameCount() >= checkpoint_threshold_)
+            Checkpoint(); // best effort; the commit is already durable
+        return true;
+    }
+
+    bool Pager::Rollback()
+    {
+        if (in_memory_)
+        {
+            last_error_ = "rollback is not supported for in-memory databases";
+            return false;
+        }
+        if (fd_ < 0)
+            return false;
+        fresh_pages_.clear();
+        header_dirty_ = false;
+        page_count_ = committed_header_.page_count;
+        free_list_head_ = committed_header_.free_list_head;
+        catalog_root_ = committed_header_.catalog_root;
+        return wal_.Rollback();
+    }
+
+    bool Pager::CheckpointLog()
+    {
+        std::array<char, PAGE_SIZE> buf{};
+        for (const auto &entry : wal_.GetCommittedPages())
+        {
+            if (!wal_.ReadFrameData(entry.second, buf.data()) || !RawWrite(entry.first, buf.data()))
+                return false;
+        }
+
+        // Every page counted by the last commit must exist in the file
+        const uint64_t min_size = static_cast<uint64_t>(wal_.GetCommittedPageCount()) * PAGE_SIZE;
+        struct stat st;
+        if (fstat(fd_, &st) != 0)
+            return false;
+        if (static_cast<uint64_t>(st.st_size) < min_size && ftruncate(fd_, static_cast<off_t>(min_size)) != 0)
+            return false;
+
+        // The database file must be durable before the log is emptied
+        if (fsync(fd_) != 0)
+            return false;
+        return wal_.Reset();
+    }
+
+    bool Pager::Checkpoint()
+    {
+        if (in_memory_)
+            return true;
+        if (fd_ < 0)
+            return false;
+        if (HasUncommittedChanges())
+        {
+            last_error_ = "cannot checkpoint with uncommitted changes";
+            return false;
+        }
+        if (wal_.GetCommittedFrameCount() == 0)
+            return true;
+        return CheckpointLog();
+    }
+
     bool Pager::Sync()
     {
         if (in_memory_)
             return true;
-        return fd_ >= 0 && fsync(fd_) == 0;
+        return wal_.Sync();
     }
 
 } // namespace sql

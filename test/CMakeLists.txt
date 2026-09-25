@@ -35,3 +35,7 @@ add_sqlengine_test(table_heap_test storage/table_heap_test.cpp)
 # Catalog tests
 add_sqlengine_test(catalog_persistence_test catalog/catalog_persistence_test.cpp)
 add_sqlengine_test(btree_test storage/btree_test.cpp)
+
+# Recovery tests
+add_sqlengine_test(wal_test recovery/wal_test.cpp)
+add_sqlengine_test(crash_recovery_test recovery/crash_recovery_test.cpp)

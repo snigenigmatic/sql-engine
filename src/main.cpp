@@ -29,7 +29,7 @@ void PrintHelp()
     std::cout << "Available commands:\n";
     std::cout << "  help   - Show this help message\n";
     std::cout << "  quit   - Exit the program\n";
-    std::cout << "  save   - Flush all pages to the database file\n";
+    std::cout << "  save   - Checkpoint: copy the write-ahead log into the database file\n";
     std::cout << "  tables - List all tables\n";
     std::cout << "\nSQL commands (end with semicolon):\n";
     std::cout << "  CREATE TABLE t (col1 INTEGER, col2 VARCHAR(50), col3 BOOLEAN);\n";
@@ -38,8 +38,9 @@ void PrintHelp()
     std::cout << "  SELECT col1, col2 FROM t WHERE col1 > 5;\n";
     std::cout << "  UPDATE t SET col1 = 10 WHERE col2 = 'hello';\n";
     std::cout << "  DELETE FROM t WHERE col1 = 1;\n";
-    std::cout << "\nData is stored in: " << g_db->GetPath()
-              << " (written after every statement)\n";
+    std::cout << "\nData is stored in: " << g_db->GetPath() << " (write-ahead log: "
+              << g_db->GetPath() << "-wal)\n";
+    std::cout << "Each statement is atomic: committed when it succeeds, rolled back when it fails.\n";
 }
 
 void PrintResults(const sql::ExecutionResult &result)
@@ -119,6 +120,18 @@ void ListTables()
     }
 }
 
+// Undo a failed statement's partial changes, if it made any
+void RollbackStatement()
+{
+    if (!g_db->HasUncommittedChanges())
+        return;
+    std::string error;
+    if (g_db->Rollback(&error))
+        std::cout << "(statement rolled back)\n";
+    else
+        std::cout << "Warning: " << error << "\n";
+}
+
 void ExecuteSQL(const std::string &sql_input)
 {
     try
@@ -133,20 +146,31 @@ void ExecuteSQL(const std::string &sql_input)
             return;
         }
 
-        sql::Executor executor(&g_db->GetCatalog());
-        auto result = executor.Execute(stmt.get());
+        sql::ExecutionResult result;
+        {
+            sql::Executor executor(&g_db->GetCatalog());
+            result = executor.Execute(stmt.get());
+        }
         PrintResults(result);
 
-        const auto type = stmt->GetType();
-        if (type != sql::StatementType::SELECT && type != sql::StatementType::EXPLAIN_STMT &&
-            !g_db->Flush())
+        // Each statement is its own transaction: all of it or none of it
+        if (result.success)
         {
-            std::cout << "Warning: failed to write changes to " << g_db->GetPath() << "\n";
+            if (!g_db->Commit())
+            {
+                std::cout << "Error: failed to commit to " << g_db->GetPath() << "\n";
+                RollbackStatement();
+            }
+        }
+        else
+        {
+            RollbackStatement();
         }
     }
     catch (const std::exception &e)
     {
         std::cout << "Error: " << e.what() << "\n";
+        RollbackStatement();
     }
 }
 
@@ -246,10 +270,10 @@ int main(int argc, char **argv)
             }
             else if (command == "save")
             {
-                if (g_db->Flush())
-                    std::cout << "All changes written to " << g_db->GetPath() << ".\n";
+                if (g_db->Checkpoint())
+                    std::cout << "Checkpoint complete: all changes are in " << g_db->GetPath() << ".\n";
                 else
-                    std::cout << "Error writing to " << g_db->GetPath() << ".\n";
+                    std::cout << "Error: checkpoint of " << g_db->GetPath() << " failed.\n";
                 continue;
             }
             else if (command == "help" || command == "h")
@@ -273,8 +297,6 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!g_db->Flush())
-        std::cerr << "Warning: failed to write changes to " << g_db->GetPath() << "\n";
-    g_db.reset();
+    g_db.reset(); // checkpoints and removes the write-ahead log
     return 0;
 }
