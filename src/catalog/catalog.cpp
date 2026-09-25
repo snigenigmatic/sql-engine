@@ -73,6 +73,12 @@ namespace sql
         const page_id_t root = pager_->GetCatalogRoot();
         if (root == INVALID_PAGE_ID)
         {
+            // Only a brand-new file (just the header page) may lack a schema;
+            // anything else is corrupt or an interrupted initialization, and
+            // creating a new schema would orphan its pages.
+            if (pager_->GetPageCount() != 1)
+                throw std::runtime_error("Database has " + std::to_string(pager_->GetPageCount()) +
+                                         " pages but no schema table");
             schema_heap_ = TableHeap::Create(bpm_);
             // Make the schema page durable before the header points at it
             if (!bpm_->FlushPage(schema_heap_->GetFirstPageId()) ||
@@ -103,6 +109,8 @@ namespace sql
 
             if (type == TYPE_TABLE)
             {
+                if (root_page < 1 || static_cast<uint32_t>(root_page) >= pager_->GetPageCount())
+                    throw std::runtime_error("Table '" + name + "' has invalid root page " + std::to_string(root_page));
                 tables_[name] = std::make_unique<Table>(
                     name, DecodeSchema(definition), std::make_unique<TableHeap>(bpm_, root_page));
             }
