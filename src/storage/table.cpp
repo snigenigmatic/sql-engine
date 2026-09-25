@@ -1,48 +1,118 @@
 #include "storage/table.h"
-#include <algorithm>
+#include <stdexcept>
 
 namespace sql
 {
 
-    void Table::Insert(const Tuple &tuple)
+    // ── TableIterator ────────────────────────────────────────────────────────
+
+    TableIterator &TableIterator::operator++()
     {
-        tuples_.push_back(tuple);
+        if (!at_end_ && table_)
+            at_end_ = !table_->Advance(&rid_, &rid_, &tuple_);
+        return *this;
     }
 
-    void Table::DeleteByIndices(std::vector<size_t> indices)
+    // ── Table ────────────────────────────────────────────────────────────────
+
+    Table::Table(std::string name, Schema schema, std::unique_ptr<TableHeap> heap)
+        : name_(std::move(name)), schema_(std::move(schema)), heap_(std::move(heap))
     {
-        if (indices.empty() || tuples_.empty())
-            return;
+        RID rid;
+        Tuple tuple;
+        for (bool ok = heap_->FirstTuple(&rid, &tuple); ok; ok = heap_->NextTuple(rid, &rid, &tuple))
+            ++tuple_count_;
+    }
 
-        // Sort and remove duplicates to avoid deleting the same row multiple times
-        std::sort(indices.begin(), indices.end());
-        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
-
-        // Rebuild vector in one pass (O(n) instead of O(k*n))
-        std::vector<Tuple> new_tuples;
-        const std::size_t max_deletions = std::min(tuples_.size(), indices.size());
-        new_tuples.reserve(tuples_.size() - max_deletions);
-
-        std::size_t delete_pos = 0;
-        for (std::size_t i = 0; i < tuples_.size(); ++i)
+    RID Table::Insert(const Tuple &tuple)
+    {
+        RID rid;
+        if (heap_)
         {
-            // Skip tuple if its index matches the next delete index
-            if (delete_pos < indices.size() && i == indices[delete_pos])
+            rid = heap_->InsertTuple(tuple);
+        }
+        else
+        {
+            rid = RID(INVALID_PAGE_ID, static_cast<uint32_t>(temp_rows_.size()));
+            temp_rows_.emplace_back(tuple);
+        }
+        ++tuple_count_;
+        return rid;
+    }
+
+    bool Table::GetTuple(const RID &rid, Tuple *tuple) const
+    {
+        if (heap_)
+            return heap_->GetTuple(rid, tuple);
+        if (rid.page_id != INVALID_PAGE_ID || rid.slot >= temp_rows_.size() || !temp_rows_[rid.slot])
+            return false;
+        *tuple = *temp_rows_[rid.slot];
+        return true;
+    }
+
+    bool Table::UpdateTuple(const RID &rid, const Tuple &tuple, RID *new_rid)
+    {
+        if (heap_)
+            return heap_->UpdateTuple(rid, tuple, new_rid);
+        if (rid.page_id != INVALID_PAGE_ID || rid.slot >= temp_rows_.size() || !temp_rows_[rid.slot])
+            return false;
+        temp_rows_[rid.slot] = tuple;
+        if (new_rid)
+            *new_rid = rid;
+        return true;
+    }
+
+    bool Table::DeleteTuple(const RID &rid)
+    {
+        bool deleted = false;
+        if (heap_)
+        {
+            deleted = heap_->DeleteTuple(rid);
+        }
+        else if (rid.page_id == INVALID_PAGE_ID && rid.slot < temp_rows_.size() && temp_rows_[rid.slot])
+        {
+            temp_rows_[rid.slot].reset();
+            deleted = true;
+        }
+        if (deleted)
+            --tuple_count_;
+        return deleted;
+    }
+
+    void Table::Drop()
+    {
+        if (heap_)
+        {
+            heap_->Drop();
+            heap_.reset();
+        }
+        temp_rows_.clear();
+        tuple_count_ = 0;
+    }
+
+    bool Table::Advance(const RID *after, RID *rid, Tuple *tuple) const
+    {
+        if (heap_)
+            return after ? heap_->NextTuple(*after, rid, tuple) : heap_->FirstTuple(rid, tuple);
+
+        size_t pos = after ? static_cast<size_t>(after->slot) + 1 : 0;
+        for (; pos < temp_rows_.size(); ++pos)
+        {
+            if (temp_rows_[pos])
             {
-                ++delete_pos;
-                continue;
+                *rid = RID(INVALID_PAGE_ID, static_cast<uint32_t>(pos));
+                *tuple = *temp_rows_[pos];
+                return true;
             }
-            new_tuples.push_back(std::move(tuples_[i]));
         }
-        tuples_ = std::move(new_tuples);
+        return false;
     }
 
-    void Table::UpdateTuple(size_t index, const Tuple &tuple)
+    TableIterator Table::begin() const
     {
-        if (index < tuples_.size())
-        {
-            tuples_[index] = tuple;
-        }
+        TableIterator it(this, false);
+        it.at_end_ = !Advance(nullptr, &it.rid_, &it.tuple_);
+        return it;
     }
 
     int Table::GetColumnIndex(const std::string &column_name) const

@@ -559,4 +559,109 @@ namespace sql
         ASSERT_EQ(result.tuples.size(), 2);
     }
 
+    // ── Page-backed storage ───────────────────────────────────────────────────────
+
+    TEST(IntegrationTest, ManyRowsSpanPagesAndStayIndexed)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE big (id INTEGER, payload VARCHAR(100));");
+        for (int batch = 0; batch < 30; ++batch)
+        {
+            std::string sql = "INSERT INTO big VALUES ";
+            for (int i = 0; i < 100; ++i)
+            {
+                const int id = batch * 100 + i;
+                if (i > 0)
+                    sql += ", ";
+                sql += "(" + std::to_string(id) + ", 'payload-for-row-" + std::to_string(id) + "')";
+            }
+            ASSERT_TRUE(RunSQL(catalog, sql + ";").success);
+        }
+        EXPECT_EQ(catalog.GetTable("big")->GetTupleCount(), 3000u);
+
+        RunSQL(catalog, "CREATE INDEX idx_big ON big (id);");
+        auto point = RunSQL(catalog, "SELECT payload FROM big WHERE id = 2718;");
+        ASSERT_TRUE(point.success);
+        ASSERT_EQ(point.tuples.size(), 1u);
+        EXPECT_EQ(point.tuples[0].GetValue(0).GetAsString(), "payload-for-row-2718");
+
+        auto del = RunSQL(catalog, "DELETE FROM big WHERE id >= 1000;");
+        ASSERT_TRUE(del.success);
+        auto remaining = RunSQL(catalog, "SELECT * FROM big WHERE id > 990;");
+        EXPECT_EQ(remaining.tuples.size(), 9u);
+    }
+
+    TEST(IntegrationTest, UpdateGrowingRowsKeepsAllRows)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, s VARCHAR(2000));");
+        std::string sql = "INSERT INTO t VALUES ";
+        for (int i = 0; i < 200; ++i)
+        {
+            if (i > 0)
+                sql += ", ";
+            sql += "(" + std::to_string(i) + ", 'x')";
+        }
+        RunSQL(catalog, sql + ";");
+
+        // Each row grows ~10x, forcing rows to move to new pages
+        std::string long_value(1000, 'y');
+        auto update = RunSQL(catalog, "UPDATE t SET s = '" + long_value + "' WHERE id < 50;");
+        ASSERT_TRUE(update.success);
+        EXPECT_EQ(update.message, "50 row(s) updated.");
+
+        auto all = RunSQL(catalog, "SELECT * FROM t;");
+        ASSERT_EQ(all.tuples.size(), 200u);
+        auto grown = RunSQL(catalog, "SELECT id FROM t WHERE s = '" + long_value + "';");
+        EXPECT_EQ(grown.tuples.size(), 50u);
+    }
+
+    TEST(IntegrationTest, InsertOversizedRowFails)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (s VARCHAR(10000));");
+        auto result = RunSQL(catalog, "INSERT INTO t VALUES ('" + std::string(5000, 'z') + "');");
+        EXPECT_FALSE(result.success);
+        EXPECT_NE(result.message.find("Row too large"), std::string::npos);
+    }
+
+    TEST(IntegrationTest, FailedUpdateLeavesIndexConsistent)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, s VARCHAR(10000));");
+        RunSQL(catalog, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+        RunSQL(catalog, "CREATE INDEX idx_s ON t (s);");
+
+        // Row 1 grows and is applied; row 2's new value is too large and fails
+        std::string ok_value(2000, 'k');
+        auto update = RunSQL(catalog, "UPDATE t SET s = '" + ok_value + "' WHERE id = 1;");
+        ASSERT_TRUE(update.success);
+        auto failing = RunSQL(catalog, "UPDATE t SET s = '" + std::string(5000, 'z') + "' WHERE id >= 2;");
+        EXPECT_FALSE(failing.success);
+
+        auto via_index = RunSQL(catalog, "SELECT id FROM t WHERE s = '" + ok_value + "';");
+        ASSERT_EQ(via_index.tuples.size(), 1u);
+        EXPECT_EQ(via_index.tuples[0].GetValue(0).GetAsInt(), 1);
+        auto untouched = RunSQL(catalog, "SELECT id FROM t WHERE s = 'b';");
+        EXPECT_EQ(untouched.tuples.size(), 1u);
+    }
+
+    TEST(IntegrationTest, DropTableRemovesItsIndexes)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (1), (2);");
+        ASSERT_TRUE(RunSQL(catalog, "CREATE INDEX idx_t ON t (id);").success);
+        ASSERT_TRUE(RunSQL(catalog, "DROP TABLE t;").success);
+        EXPECT_EQ(catalog.GetIndex("t", "id"), nullptr);
+
+        // Recreate: the index name is free again and lookups see only new rows
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER);");
+        RunSQL(catalog, "INSERT INTO t VALUES (5);");
+        ASSERT_TRUE(RunSQL(catalog, "CREATE INDEX idx_t ON t (id);").success);
+        auto result = RunSQL(catalog, "SELECT * FROM t WHERE id = 1;");
+        ASSERT_TRUE(result.success);
+        EXPECT_TRUE(result.tuples.empty());
+    }
+
 } // namespace sql

@@ -43,9 +43,10 @@ namespace sql
         bool outer_is_left_;
 
         int outer_col_idx_ = -1;
-        size_t outer_cursor_ = 0;
+        TableIterator outer_it_;
+        bool outer_started_ = false;
         Tuple current_outer_;
-        std::vector<size_t> inner_matches_;
+        std::vector<RID> inner_matches_;
         size_t inner_cursor_ = 0;
     };
 

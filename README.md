@@ -76,7 +76,7 @@ sql-engine/
 │   ├── parser/    # SQL parser + AST
 │   ├── catalog/   # Table and index registry
 │   ├── execution/ # Operators: SeqScan, Filter, Projection, IndexScan, Executor
-│   ├── storage/   # Table, BTree, DiskManager, BufferPool
+│   ├── storage/   # Pager, BufferPool, TablePage/TableHeap, Table, BTree, DiskManager
 │   └── optimizer/ # (stub, planned)
 ├── test/
 │   ├── integration/  # End-to-end SQL tests
@@ -150,6 +150,10 @@ ctest --test-dir build --output-on-failure --verbose
   - [x] Add `EXPLAIN` command in REPL to print physical plan (`SeqScan`/`IndexScan`/`Join` path)
   - [x] Add join-condition index matching (`IndexNestedLoopJoin` when index exists on join column)
 - [ ] **Phase 6**: Transactions
+
+The path to a fully working embedded database (page storage, WAL, transactions, SQL coverage) is tracked in [docs/roadmap.md](docs/roadmap.md).
+- [x] **M1**: Page layer, single-file `Pager`, LRU `BufferPoolManager` with RAII `PageGuard`
+- [x] **M2**: Slotted-page `TableHeap` with RIDs; tables, scans, joins and indexes run on pages (in-memory database by default until M3)
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

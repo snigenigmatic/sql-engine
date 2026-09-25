@@ -5,7 +5,7 @@ namespace sql
 
     void SeqScan::Open()
     {
-        cursor_ = 0;
+        started_ = false;
     }
 
     bool SeqScan::Next(Tuple *tuple)
@@ -15,20 +15,29 @@ namespace sql
             return false;
         }
 
-        const auto &tuples = table_->GetTuples();
-        if (cursor_ >= tuples.size())
+        if (!started_)
+        {
+            it_ = table_->begin();
+            started_ = true;
+        }
+        else if (it_ != table_->end())
+        {
+            ++it_;
+        }
+
+        if (it_ == table_->end())
         {
             return false;
         }
 
-        *tuple = tuples[cursor_];
-        cursor_++;
+        *tuple = *it_;
         return true;
     }
 
     void SeqScan::Close()
     {
-        cursor_ = 0;
+        it_ = TableIterator();
+        started_ = false;
     }
 
 } // namespace sql

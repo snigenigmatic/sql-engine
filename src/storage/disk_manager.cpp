@@ -79,11 +79,10 @@ namespace sql
         }
 
         // Write tuples: num_tuples
-        const auto &tuples = table.GetTuples();
-        file << tuples.size() << "\n";
+        file << table.GetTupleCount() << "\n";
 
         // Write each tuple
-        for (const auto &tuple : tuples)
+        for (const auto &tuple : table)
         {
             for (size_t i = 0; i < columns.size(); ++i)
             {

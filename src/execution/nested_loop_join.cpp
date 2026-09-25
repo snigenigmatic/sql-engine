@@ -36,30 +36,46 @@ namespace sql
             throw std::runtime_error("Unknown join column on right table: " + right_column_);
         }
 
-        left_cursor_ = 0;
-        right_cursor_ = 0;
+        outer_started_ = false;
+        inner_active_ = false;
     }
 
     bool NestedLoopJoin::Next(Tuple *tuple)
     {
-        const auto &left_rows = left_table_->GetTuples();
-        const auto &right_rows = right_table_->GetTuples();
+        Table *outer_table = right_as_outer_ ? right_table_ : left_table_;
+        Table *inner_table = right_as_outer_ ? left_table_ : right_table_;
+        const auto outer_index = static_cast<size_t>(right_as_outer_ ? right_column_index_ : left_column_index_);
+        const auto inner_index = static_cast<size_t>(right_as_outer_ ? left_column_index_ : right_column_index_);
 
-        while ((!right_as_outer_ && left_cursor_ < left_rows.size()) ||
-               (right_as_outer_ && right_cursor_ < right_rows.size()))
+        while (true)
         {
-            const auto &outer_row = right_as_outer_ ? right_rows[right_cursor_] : left_rows[left_cursor_];
-            Value outer_key = right_as_outer_
-                                  ? outer_row.GetValue(static_cast<size_t>(right_column_index_))
-                                  : outer_row.GetValue(static_cast<size_t>(left_column_index_));
-
-            const size_t inner_size = right_as_outer_ ? left_rows.size() : right_rows.size();
-            while ((right_as_outer_ ? left_cursor_ : right_cursor_) < inner_size)
+            if (!inner_active_)
             {
-                const auto &inner_row = right_as_outer_ ? left_rows[left_cursor_++] : right_rows[right_cursor_++];
-                Value inner_key = right_as_outer_
-                                      ? inner_row.GetValue(static_cast<size_t>(left_column_index_))
-                                      : inner_row.GetValue(static_cast<size_t>(right_column_index_));
+                // Advance to the next outer row and restart the inner scan
+                if (!outer_started_)
+                {
+                    outer_it_ = outer_table->begin();
+                    outer_started_ = true;
+                }
+                else
+                {
+                    ++outer_it_;
+                }
+                if (outer_it_ == outer_table->end())
+                {
+                    return false;
+                }
+                current_outer_ = *outer_it_;
+                inner_it_ = inner_table->begin();
+                inner_active_ = true;
+            }
+
+            const Value &outer_key = current_outer_.GetValue(outer_index);
+            while (inner_it_ != inner_table->end())
+            {
+                const Tuple inner_row = *inner_it_;
+                ++inner_it_;
+                const Value &inner_key = inner_row.GetValue(inner_index);
 
                 if (outer_key.GetType() != inner_key.GetType())
                 {
@@ -69,8 +85,8 @@ namespace sql
                 if (outer_key == inner_key)
                 {
                     std::vector<Value> joined_values;
-                    const auto &left_row = right_as_outer_ ? inner_row : outer_row;
-                    const auto &right_row = right_as_outer_ ? outer_row : inner_row;
+                    const auto &left_row = right_as_outer_ ? inner_row : current_outer_;
+                    const auto &right_row = right_as_outer_ ? current_outer_ : inner_row;
                     joined_values.reserve(left_row.GetValueCount() + right_row.GetValueCount());
 
                     for (size_t i = 0; i < left_row.GetValueCount(); ++i)
@@ -87,25 +103,16 @@ namespace sql
                 }
             }
 
-            if (right_as_outer_)
-            {
-                ++right_cursor_;
-                left_cursor_ = 0;
-            }
-            else
-            {
-                ++left_cursor_;
-                right_cursor_ = 0;
-            }
+            inner_active_ = false;
         }
-
-        return false;
     }
 
     void NestedLoopJoin::Close()
     {
-        left_cursor_ = 0;
-        right_cursor_ = 0;
+        outer_it_ = TableIterator();
+        inner_it_ = TableIterator();
+        outer_started_ = false;
+        inner_active_ = false;
         left_column_index_ = -1;
         right_column_index_ = -1;
     }

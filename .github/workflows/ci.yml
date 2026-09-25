@@ -8,6 +8,8 @@ on:
   pull_request:
     branches:
       - master
+      # Stacked milestone PRs target the previous milestone's branch
+      - 'cc/**'
 
 jobs:
   build-and-test:

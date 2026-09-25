@@ -100,37 +100,33 @@ namespace sql
             throw std::runtime_error("HashJoin column not found in schema");
         }
 
-        const auto &left_rows = left_table_->GetTuples();
-        const auto &right_rows = right_table_->GetTuples();
-
-        const std::vector<Tuple> *build_rows = build_right_ ? &right_rows : &left_rows;
-        const std::vector<Tuple> *probe_rows = build_right_ ? &left_rows : &right_rows;
-        int build_index = build_right_ ? right_column_index_ : left_column_index_;
+        Table *build_table = build_right_ ? right_table_ : left_table_;
+        const auto build_index = static_cast<size_t>(build_right_ ? right_column_index_ : left_column_index_);
 
         hash_table_.clear();
-        hash_table_.reserve(build_rows->size());
-        for (size_t i = 0; i < build_rows->size(); ++i)
+        build_rows_.clear();
+        build_rows_.reserve(build_table->GetTupleCount());
+        for (auto it = build_table->begin(); it != build_table->end(); ++it)
         {
-            const Tuple &build_tuple = (*build_rows)[i];
-            if (build_index < 0 || static_cast<size_t>(build_index) >= build_tuple.GetValueCount())
+            if (build_index >= it->GetValueCount())
             {
                 continue;
             }
-            const Value &key = build_tuple.GetValue(static_cast<size_t>(build_index));
-            hash_table_[MakeJoinKey(key)].push_back(i);
+            hash_table_[MakeJoinKey(it->GetValue(build_index))].push_back(build_rows_.size());
+            build_rows_.push_back(*it);
         }
 
-        build_rows_ = build_rows;
-        probe_rows_ = probe_rows;
+        probe_table_ = build_right_ ? left_table_ : right_table_;
         probe_is_left_ = build_right_;
-        probe_cursor_ = 0;
+        probe_started_ = false;
+        probe_valid_ = false;
         match_cursor_ = 0;
         current_matches_.clear();
     }
 
     bool HashJoin::Next(Tuple *tuple)
     {
-        if (tuple == nullptr || probe_rows_ == nullptr || build_rows_ == nullptr)
+        if (tuple == nullptr || probe_table_ == nullptr)
         {
             return false;
         }
@@ -138,30 +134,44 @@ namespace sql
         const int probe_key_index = probe_is_left_ ? left_column_index_ : right_column_index_;
         const int build_key_index = probe_is_left_ ? right_column_index_ : left_column_index_;
 
-        while (probe_cursor_ < probe_rows_->size())
+        while (true)
         {
-            const Tuple &probe_tuple = (*probe_rows_)[probe_cursor_];
-            if (probe_key_index < 0 || static_cast<size_t>(probe_key_index) >= probe_tuple.GetValueCount())
+            if (!probe_valid_)
             {
-                ++probe_cursor_;
+                if (!probe_started_)
+                {
+                    probe_it_ = probe_table_->begin();
+                    probe_started_ = true;
+                }
+                else
+                {
+                    ++probe_it_;
+                }
+                if (probe_it_ == probe_table_->end())
+                {
+                    return false;
+                }
+                probe_tuple_ = *probe_it_;
+                probe_valid_ = true;
                 match_cursor_ = 0;
                 current_matches_.clear();
-                continue;
-            }
 
-            if (current_matches_.empty() && match_cursor_ == 0)
-            {
-                const Value &probe_key = probe_tuple.GetValue(static_cast<size_t>(probe_key_index));
-                auto it = hash_table_.find(MakeJoinKey(probe_key));
+                if (probe_key_index < 0 || static_cast<size_t>(probe_key_index) >= probe_tuple_.GetValueCount())
+                {
+                    probe_valid_ = false;
+                    continue;
+                }
+                auto it = hash_table_.find(MakeJoinKey(probe_tuple_.GetValue(static_cast<size_t>(probe_key_index))));
                 if (it != hash_table_.end())
                 {
                     current_matches_ = it->second;
                 }
             }
 
+            const Tuple &probe_tuple = probe_tuple_;
             while (match_cursor_ < current_matches_.size())
             {
-                const Tuple &build_tuple = (*build_rows_)[current_matches_[match_cursor_++]];
+                const Tuple &build_tuple = build_rows_[current_matches_[match_cursor_++]];
                 if (build_key_index < 0 || static_cast<size_t>(build_key_index) >= build_tuple.GetValueCount())
                 {
                     continue;
@@ -176,46 +186,32 @@ namespace sql
 
                 std::vector<Value> joined_values;
                 joined_values.reserve(probe_tuple.GetValueCount() + build_tuple.GetValueCount());
-                if (probe_is_left_)
+                const Tuple &left_row = probe_is_left_ ? probe_tuple : build_tuple;
+                const Tuple &right_row = probe_is_left_ ? build_tuple : probe_tuple;
+                for (size_t i = 0; i < left_row.GetValueCount(); ++i)
                 {
-                    for (size_t i = 0; i < probe_tuple.GetValueCount(); ++i)
-                    {
-                        joined_values.push_back(probe_tuple.GetValue(i));
-                    }
-                    for (size_t i = 0; i < build_tuple.GetValueCount(); ++i)
-                    {
-                        joined_values.push_back(build_tuple.GetValue(i));
-                    }
+                    joined_values.push_back(left_row.GetValue(i));
                 }
-                else
+                for (size_t i = 0; i < right_row.GetValueCount(); ++i)
                 {
-                    for (size_t i = 0; i < build_tuple.GetValueCount(); ++i)
-                    {
-                        joined_values.push_back(build_tuple.GetValue(i));
-                    }
-                    for (size_t i = 0; i < probe_tuple.GetValueCount(); ++i)
-                    {
-                        joined_values.push_back(probe_tuple.GetValue(i));
-                    }
+                    joined_values.push_back(right_row.GetValue(i));
                 }
                 *tuple = Tuple(std::move(joined_values));
                 return true;
             }
 
-            ++probe_cursor_;
-            match_cursor_ = 0;
-            current_matches_.clear();
+            probe_valid_ = false;
         }
-
-        return false;
     }
 
     void HashJoin::Close()
     {
         hash_table_.clear();
-        probe_rows_ = nullptr;
-        build_rows_ = nullptr;
-        probe_cursor_ = 0;
+        build_rows_.clear();
+        probe_table_ = nullptr;
+        probe_it_ = TableIterator();
+        probe_started_ = false;
+        probe_valid_ = false;
         match_cursor_ = 0;
         current_matches_.clear();
     }

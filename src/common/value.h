@@ -40,6 +40,13 @@ namespace sql
         // String representation
         std::string ToString() const;
 
+        // Binary encoding: 1 tag byte (type, high bit = NULL) + fixed or
+        // length-prefixed payload. Self-describing, so no schema is needed.
+        void SerializeTo(std::string *out) const;
+        // Decodes one value starting at *cursor and advances it. Returns false
+        // on malformed or truncated input.
+        static bool DeserializeFrom(const char **cursor, const char *end, Value *out);
+
     private:
         DataType type_;
         bool is_null_;

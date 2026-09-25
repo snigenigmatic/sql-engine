@@ -24,22 +24,21 @@ namespace sql
         if (outer_col_idx_ < 0)
             throw std::runtime_error("IndexNestedLoopJoin: unknown outer column: " + outer_col_);
 
-        outer_cursor_ = 0;
+        outer_started_ = false;
         inner_matches_.clear();
         inner_cursor_ = 0;
     }
 
     bool IndexNestedLoopJoin::Next(Tuple *tuple)
     {
-        const auto &outer_rows = outer_table_->GetTuples();
-
         while (true)
         {
             // Consume remaining inner matches for current outer row
             while (inner_cursor_ < inner_matches_.size())
             {
-                size_t inner_row_idx = inner_matches_[inner_cursor_++];
-                const Tuple &inner_row = inner_table_->GetTuple(inner_row_idx);
+                Tuple inner_row;
+                if (!inner_table_->GetTuple(inner_matches_[inner_cursor_++], &inner_row))
+                    continue;
 
                 std::vector<Value> joined;
                 const Tuple &left_row = outer_is_left_ ? current_outer_ : inner_row;
@@ -55,10 +54,19 @@ namespace sql
             }
 
             // Advance to next outer row
-            if (outer_cursor_ >= outer_rows.size())
+            if (!outer_started_)
+            {
+                outer_it_ = outer_table_->begin();
+                outer_started_ = true;
+            }
+            else if (outer_it_ != outer_table_->end())
+            {
+                ++outer_it_;
+            }
+            if (outer_it_ == outer_table_->end())
                 return false;
 
-            current_outer_ = outer_rows[outer_cursor_++];
+            current_outer_ = *outer_it_;
             Value probe_key = current_outer_.GetValue(static_cast<size_t>(outer_col_idx_));
             inner_matches_ = inner_index_->Search(probe_key);
             inner_cursor_ = 0;
@@ -67,7 +75,8 @@ namespace sql
 
     void IndexNestedLoopJoin::Close()
     {
-        outer_cursor_ = 0;
+        outer_it_ = TableIterator();
+        outer_started_ = false;
         inner_matches_.clear();
         inner_cursor_ = 0;
         outer_col_idx_ = -1;

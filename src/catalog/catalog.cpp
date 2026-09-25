@@ -3,13 +3,23 @@
 namespace sql
 {
 
+    Catalog::Catalog()
+        : owned_pager_(std::make_unique<Pager>())
+    {
+        owned_pager_->OpenInMemory();
+        owned_bpm_ = std::make_unique<BufferPoolManager>(DEFAULT_POOL_SIZE, owned_pager_.get());
+        bpm_ = owned_bpm_.get();
+    }
+
+    Catalog::Catalog(BufferPoolManager *bpm) : bpm_(bpm) {}
+
     bool Catalog::CreateTable(const std::string &name, const Schema &schema)
     {
         if (TableExists(name))
         {
             return false; // Table already exists
         }
-        tables_[name] = std::make_unique<Table>(name, schema);
+        tables_[name] = std::make_unique<Table>(name, schema, TableHeap::Create(bpm_));
         return true;
     }
 
@@ -20,7 +30,18 @@ namespace sql
         {
             return false; // Table doesn't exist
         }
+        it->second->Drop();
         tables_.erase(it);
+
+        // Indexes on the table point into freed pages; remove them too
+        indexes_.erase(name);
+        for (auto reg = index_registry_.begin(); reg != index_registry_.end();)
+        {
+            if (reg->second.first == name)
+                reg = index_registry_.erase(reg);
+            else
+                ++reg;
+        }
         return true;
     }
 
@@ -66,16 +87,15 @@ namespace sql
 
         // Build BTree from existing rows
         BTree &btree = indexes_[table_name][column_name];
-        const auto &tuples = table->GetTuples();
-        std::vector<std::pair<Value, size_t>> entries;
-        entries.reserve(tuples.size());
-        for (size_t i = 0; i < tuples.size(); ++i)
+        std::vector<std::pair<Value, RID>> entries;
+        entries.reserve(table->GetTupleCount());
+        for (auto it = table->begin(); it != table->end(); ++it)
         {
-            Value value = tuples[i].GetValue(static_cast<size_t>(col_idx));
+            Value value = it->GetValue(static_cast<size_t>(col_idx));
             // Skip NULL values to avoid undefined behavior in sorting/comparison
             if (!value.IsNull())
             {
-                entries.push_back({value, i});
+                entries.push_back({value, it.GetRID()});
             }
         }
         btree.BulkLoad(entries);
@@ -105,22 +125,21 @@ namespace sql
         if (!table)
             return;
 
-        const auto &tuples = table->GetTuples();
         for (auto &[col_name, btree] : t_it->second)
         {
             int col_idx = table->GetColumnIndex(col_name);
             if (col_idx < 0)
                 continue;
 
-            std::vector<std::pair<Value, size_t>> entries;
-            entries.reserve(tuples.size());
-            for (size_t i = 0; i < tuples.size(); ++i)
+            std::vector<std::pair<Value, RID>> entries;
+            entries.reserve(table->GetTupleCount());
+            for (auto it = table->begin(); it != table->end(); ++it)
             {
-                Value value = tuples[i].GetValue(static_cast<size_t>(col_idx));
+                Value value = it->GetValue(static_cast<size_t>(col_idx));
                 // Skip NULL values to avoid undefined behavior in sorting/comparison
                 if (!value.IsNull())
                 {
-                    entries.push_back({value, i});
+                    entries.push_back({value, it.GetRID()});
                 }
             }
             btree.BulkLoad(entries);
