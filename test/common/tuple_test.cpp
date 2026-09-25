@@ -50,4 +50,14 @@ namespace sql
         EXPECT_FALSE(Tuple::DeserializeFrom(bytes.data(), bytes.size(), &decoded));
     }
 
+    TEST(TupleTest, DeserializeRejectsInvalidBooleanByte)
+    {
+        std::string bytes;
+        Tuple({Value(true)}).SerializeTo(&bytes);
+        ASSERT_EQ(bytes.back(), 1);
+        bytes.back() = 2;
+        Tuple decoded;
+        EXPECT_FALSE(Tuple::DeserializeFrom(bytes.data(), bytes.size(), &decoded));
+    }
+
 } // namespace sql

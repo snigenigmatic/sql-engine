@@ -728,8 +728,15 @@ namespace sql
 
     ExecutionResult Executor::ExecuteDropTable(DropTableStatement *drop)
     {
-        if (!catalog_->DropTable(drop->table))
-            return {false, "Table '" + drop->table + "' does not exist.", {}, {}};
+        try
+        {
+            if (!catalog_->DropTable(drop->table))
+                return {false, "Table '" + drop->table + "' does not exist.", {}, {}};
+        }
+        catch (const std::exception &e)
+        {
+            return {false, e.what(), {}, {}};
+        }
         return {true, "Table '" + drop->table + "' dropped.", {}, {}};
     }
 
