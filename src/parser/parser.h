@@ -14,6 +14,9 @@ namespace sql
 
         std::unique_ptr<Statement> ParseStatement();
 
+        // True once every statement in the input has been parsed
+        bool AtEnd() const { return current_token_.type == TokenType::END_OF_FILE; }
+
     private:
         void NextToken();
         Token Expect(TokenType type);

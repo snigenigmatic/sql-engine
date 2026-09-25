@@ -57,14 +57,15 @@ namespace sql
         catalog_.reset();
         if (!bpm_)
             return;
-        if (opened_)
+        if (opened_ && !broken_)
         {
             Commit();
         }
         else
         {
-            // Failed open: leave the database file and its log exactly as
-            // they were
+            // Failed open, or state we cannot vouch for: leave the database
+            // file and its log as they are; the next open recovers the last
+            // commit
             bpm_->DiscardAll();
             pager_->Abandon();
         }
@@ -77,7 +78,7 @@ namespace sql
 
     bool Database::Commit()
     {
-        return bpm_->WriteDirtyPages() && pager_->Commit();
+        return !broken_ && bpm_->WriteDirtyPages() && pager_->Commit();
     }
 
     bool Database::Rollback(std::string *error)
@@ -110,9 +111,12 @@ namespace sql
         if (pager_->IsInMemory())
             return fail("rollback is not supported for in-memory databases");
         if (!bpm_->DiscardAll())
-            return fail("cannot roll back while pages are in use");
+            return fail("cannot roll back while pages are in use"); // nothing changed
         if (!rollback_pager())
+        {
+            broken_ = true;
             return fail("rollback failed: " + pager_->GetLastError());
+        }
 
         // Tables, indexes and cached counts are rebuilt from the rolled-back
         // pages
@@ -123,6 +127,7 @@ namespace sql
         }
         catch (const std::exception &e)
         {
+            broken_ = true;
             return fail(std::string("cannot reload schema after rollback: ") + e.what());
         }
         return true;

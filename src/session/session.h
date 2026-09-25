@@ -4,6 +4,7 @@
 #include "execution/executor.h"
 #include "parser/ast.h"
 #include <string>
+#include <vector>
 
 namespace sql
 {
@@ -28,9 +29,14 @@ namespace sql
         Session(const Session &) = delete;
         Session &operator=(const Session &) = delete;
 
-        // Parse and run one statement
+        // Parse and run exactly one statement. Input with more than one
+        // statement is rejected without running any of it.
         ExecutionResult Execute(const std::string &sql);
         ExecutionResult Execute(Statement *stmt);
+
+        // Run every statement in the input, in order, returning one result
+        // each. Stops after a statement that cannot be parsed.
+        std::vector<ExecutionResult> ExecuteScript(const std::string &sql);
 
         bool InTransaction() const { return in_transaction_; }
 

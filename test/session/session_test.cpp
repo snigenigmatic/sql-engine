@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "catalog/database.h"
 #include "session/session.h"
+#include "storage/buffer_pool.h"
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -204,6 +205,89 @@ namespace sql
         ASSERT_TRUE(session.Execute(InsertRows(0, 3)).success);
         EXPECT_EQ(Count(session, "t"), 3u);
         EXPECT_FALSE(session.Execute("BEGIN;").success);
+    }
+
+    TEST_F(SessionTest, ExecuteRejectsMoreThanOneStatement)
+    {
+        auto db = Open();
+        Session session(db.get());
+        auto result = session.Execute("BEGIN; COMMIT;");
+        EXPECT_FALSE(result.success);
+        EXPECT_FALSE(session.InTransaction()); // nothing ran
+        EXPECT_FALSE(session.Execute("CREATE TABLE t (x INTEGER); DROP TABLE t;").success);
+        EXPECT_FALSE(db->GetCatalog().TableExists("t"));
+    }
+
+    TEST_F(SessionTest, ScriptRunsEveryStatementInOrder)
+    {
+        auto db = Open();
+        Session session(db.get());
+        auto results = session.ExecuteScript(
+            "CREATE TABLE t (id INTEGER, s VARCHAR(10)); INSERT INTO t VALUES (1, 'a');"
+            " BEGIN; INSERT INTO t VALUES (2, 'b'); COMMIT; SELECT * FROM t;");
+        ASSERT_EQ(results.size(), 6u);
+        for (const auto &r : results)
+            EXPECT_TRUE(r.success) << r.message;
+        EXPECT_EQ(results.back().tuples.size(), 2u);
+        EXPECT_FALSE(session.InTransaction());
+    }
+
+    TEST_F(SessionTest, ScriptStopsAtUnparsableStatement)
+    {
+        auto db = Open();
+        Session session(db.get());
+        session.Execute("CREATE TABLE t (id INTEGER, s VARCHAR(10));");
+        auto results = session.ExecuteScript("INSERT INTO t VALUES (1, 'a'); SELEKT oops; INSERT INTO t VALUES (2, 'b');");
+        ASSERT_EQ(results.size(), 2u);
+        EXPECT_TRUE(results[0].success);
+        EXPECT_FALSE(results[1].success);
+        EXPECT_EQ(Count(session, "t"), 1u);
+    }
+
+    TEST_F(SessionTest, FailedRollbackLeavesTransactionOpen)
+    {
+        auto db = Open();
+        Session session(db.get());
+        session.Execute("CREATE TABLE t (id INTEGER, s VARCHAR(10));");
+        session.Execute(InsertRows(0, 3));
+        session.Execute("BEGIN;");
+        session.Execute(InsertRows(3, 6));
+        {
+            // A pinned page makes the rollback fail before it changes anything
+            PageGuard pin = db->GetCatalog().GetBufferPool()->FetchPageGuarded(
+                db->GetCatalog().GetTable("t")->GetHeap()->GetFirstPageId());
+            EXPECT_FALSE(session.Execute("ROLLBACK;").success);
+            EXPECT_TRUE(session.InTransaction());
+        }
+        ASSERT_TRUE(session.Execute("ROLLBACK;").success); // retry works
+        EXPECT_FALSE(session.InTransaction());
+        EXPECT_EQ(Count(session, "t"), 3u);
+    }
+
+    TEST_F(SessionTest, TransactionThatCannotBeRolledBackIsNeverCommitted)
+    {
+        {
+            auto db = Open();
+            {
+                Session session(db.get());
+                session.Execute("CREATE TABLE t (id INTEGER, s VARCHAR(10));");
+                session.Execute(InsertRows(0, 3));
+                session.Execute("BEGIN;");
+                session.Execute(InsertRows(3, 6));
+
+                PageGuard pin = db->GetCatalog().GetBufferPool()->FetchPageGuarded(
+                    db->GetCatalog().GetTable("t")->GetHeap()->GetFirstPageId());
+                session.Close(); // its rollback fails
+                EXPECT_TRUE(db->IsBroken());
+            }
+            // A broken database refuses work...
+            Session other(db.get());
+            auto refused = other.Execute("INSERT INTO t VALUES (99, 'x');");
+            EXPECT_FALSE(refused.success);
+            EXPECT_NE(refused.message.find("reopen"), std::string::npos) << refused.message;
+            EXPECT_FALSE(db->Commit());
+        } // ...and closing it must not commit the transaction
+        EXPECT_EQ(CountAfterReopen("t"), 3u);
     }
 
     // ── Crashes ───────────────────────────────────────────────────────────────────

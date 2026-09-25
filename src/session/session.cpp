@@ -37,6 +37,8 @@ namespace sql
             Lexer lexer(sql);
             Parser parser(lexer);
             stmt = parser.ParseStatement();
+            if (!parser.AtEnd())
+                return Error("Expected a single statement; use ExecuteScript for several.");
         }
         catch (const std::exception &e)
         {
@@ -47,8 +49,43 @@ namespace sql
         return Execute(stmt.get());
     }
 
+    std::vector<ExecutionResult> Session::ExecuteScript(const std::string &sql)
+    {
+        std::vector<ExecutionResult> results;
+        Lexer lexer(sql);
+        std::unique_ptr<Parser> parser;
+        try
+        {
+            parser = std::make_unique<Parser>(lexer);
+        }
+        catch (const std::exception &e)
+        {
+            results.push_back(Error(std::string("Parse error: ") + e.what()));
+            return results;
+        }
+        while (!parser->AtEnd())
+        {
+            std::unique_ptr<Statement> stmt;
+            try
+            {
+                stmt = parser->ParseStatement();
+            }
+            catch (const std::exception &e)
+            {
+                results.push_back(Error(std::string("Parse error: ") + e.what()));
+                break;
+            }
+            results.push_back(Execute(stmt.get()));
+        }
+        return results;
+    }
+
     ExecutionResult Session::Execute(Statement *stmt)
     {
+        if (db_->IsBroken())
+            return Error("The database hit an error it could not roll back; reopen it to recover the "
+                         "last committed state.");
+
         if (stmt->GetType() == StatementType::TRANSACTION_STMT)
             return ExecuteTransaction(static_cast<TransactionStatement *>(stmt));
 
@@ -72,9 +109,15 @@ namespace sql
             {
                 std::string error;
                 if (db_->RollbackTo(savepoint, &error))
+                {
                     result.message += " (statement rolled back; transaction still open)";
+                }
                 else
+                {
+                    // The failed statement's changes could still be committed
+                    db_->MarkBroken();
                     result.message += " (" + error + ")";
+                }
             }
             return result;
         }
@@ -92,9 +135,15 @@ namespace sql
         {
             std::string error;
             if (db_->Rollback(&error))
+            {
                 result.message += " (statement rolled back)";
+            }
             else
+            {
+                // The next commit would include the failed statement
+                db_->MarkBroken();
                 result.message += " (" + error + ")";
+            }
         }
         return result;
     }
@@ -116,25 +165,35 @@ namespace sql
             return Ok("Transaction started.");
 
         case TransactionStatement::Kind::COMMIT:
+        {
             if (!in_transaction_)
                 return Error("No transaction is in progress.");
-            in_transaction_ = false;
-            if (!db_->Commit())
+            if (db_->Commit())
             {
-                std::string error;
-                db_->Rollback(&error);
+                in_transaction_ = false;
+                return Ok("Transaction committed.");
+            }
+            std::string error;
+            if (db_->Rollback(&error))
+            {
+                in_transaction_ = false;
                 return Error("Commit failed; the transaction was rolled back.");
             }
-            return Ok("Transaction committed.");
+            // Nothing may commit this transaction's partial work, not even
+            // closing the database
+            db_->MarkBroken();
+            return Error("Commit failed and the transaction could not be rolled back (" + error +
+                         "); reopen the database to recover the last committed state.");
+        }
 
         case TransactionStatement::Kind::ROLLBACK:
         {
             if (!in_transaction_)
                 return Error("No transaction is in progress.");
-            in_transaction_ = false;
             std::string error;
             if (!db_->Rollback(&error))
-                return Error(error);
+                return Error(error); // still open: ROLLBACK can be retried
+            in_transaction_ = false;
             return Ok("Transaction rolled back.");
         }
         }
@@ -163,7 +222,10 @@ namespace sql
         if (in_transaction_)
         {
             in_transaction_ = false;
-            db_->Rollback();
+            // If the rollback fails, closing the database must not commit
+            // the transaction instead
+            if (!db_->IsBroken() && !db_->Rollback())
+                db_->MarkBroken();
         }
     }
 

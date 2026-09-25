@@ -16,7 +16,8 @@ namespace sql
     // Changes become durable, atomically, at Commit(); Rollback() discards
     // everything since the last commit. The REPL commits after every
     // successful statement and rolls back a failed one, so each statement is
-    // atomic. Closing a database commits outstanding changes.
+    // atomic. Closing a database commits outstanding changes, unless it is
+    // broken (see IsBroken).
     class Database
     {
     public:
@@ -47,8 +48,16 @@ namespace sql
         // Anything changed since the last commit (cached or in the log)
         bool HasUncommittedChanges();
 
-        // Make all changes since the last commit durable, atomically
+        // Make all changes since the last commit durable, atomically.
+        // Refused once the database is broken.
         bool Commit();
+
+        // After a rollback fails partway, what is cached can no longer be
+        // trusted. A broken database refuses to commit, and closing it
+        // discards uncommitted changes instead of committing them; reopening
+        // recovers the last commit from the log.
+        bool IsBroken() const { return broken_; }
+        void MarkBroken() { broken_ = true; }
 
         // Discard all changes since the last commit and reload the catalog.
         // Not supported for in-memory databases.
@@ -80,6 +89,7 @@ namespace sql
         std::string path_;
         bool was_created_ = false;
         bool opened_ = false;
+        bool broken_ = false;
 
         // Destruction order matters: catalog, then buffer pool, then pager
         // (which commits and closes the file).

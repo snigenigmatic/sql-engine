@@ -131,7 +131,8 @@ void ExecuteSQL(const std::string &sql_input)
 {
     try
     {
-        PrintResults(g_session->Execute(sql_input));
+        for (const auto &result : g_session->ExecuteScript(sql_input))
+            PrintResults(result);
     }
     catch (const std::exception &e)
     {
