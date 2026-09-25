@@ -130,6 +130,13 @@ namespace sql
         std::string alias; // empty if none
     };
 
+    // ORDER BY entry: an expression, an output alias, or a 1-based position
+    struct OrderItem
+    {
+        std::unique_ptr<Expression> expr;
+        bool descending = false;
+    };
+
     struct SelectStatement : public Statement
     {
         std::string table;
@@ -139,6 +146,10 @@ namespace sql
         std::vector<SelectItem> items;    // the SELECT list (empty for SELECT *)
         std::vector<std::string> columns; // column names, when every item is a bare column
         bool select_star = false;
+        bool distinct = false;
+        std::vector<OrderItem> order_by;
+        std::optional<int64_t> limit;
+        int64_t offset = 0;
 
         // True when some item is more than a bare column reference
         bool HasComputedItems() const

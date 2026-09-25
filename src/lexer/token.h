@@ -48,6 +48,13 @@ namespace sql
         LIKE,
         IN,
         BETWEEN,
+        ORDER,
+        BY,
+        ASC,
+        DESC,
+        LIMIT,
+        OFFSET,
+        DISTINCT,
 
         // Identifiers and Literals
         IDENTIFIER,

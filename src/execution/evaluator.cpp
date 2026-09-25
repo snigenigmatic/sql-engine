@@ -317,6 +317,17 @@ namespace sql
         return Value(static_cast<int32_t>(d));
     }
 
+    int CompareForSort(const Value &a, const Value &b)
+    {
+        if (a.IsNull() || b.IsNull())
+            return a.IsNull() == b.IsNull() ? 0 : (a.IsNull() ? -1 : 1);
+        if (IsNumeric(a) && IsNumeric(b))
+            return Compare(a, b);
+        if (a.GetType() != b.GetType())
+            return static_cast<int>(a.GetType()) < static_cast<int>(b.GetType()) ? -1 : 1;
+        return a < b ? -1 : (b < a ? 1 : 0);
+    }
+
     bool IsTrue(const Value &value)
     {
         if (value.IsNull())

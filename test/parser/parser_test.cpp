@@ -687,4 +687,30 @@ namespace sql
         EXPECT_EQ(select->items[2].alias, "total");
     }
 
+    TEST(ParserTest, OrderByLimitOffsetDistinct)
+    {
+        Lexer lexer("SELECT DISTINCT a, b FROM t WHERE a > 1 ORDER BY b DESC, a + 1 ASC, 2 LIMIT 10 OFFSET 5;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_TRUE(select->distinct);
+        ASSERT_EQ(select->order_by.size(), 3u);
+        EXPECT_TRUE(select->order_by[0].descending);
+        EXPECT_FALSE(select->order_by[1].descending);
+        EXPECT_EQ(ExpressionToSQL(select->order_by[1].expr.get()), "a + 1");
+        ASSERT_TRUE(select->limit.has_value());
+        EXPECT_EQ(*select->limit, 10);
+        EXPECT_EQ(select->offset, 5);
+    }
+
+    TEST(ParserTest, LimitNeedsAnInteger)
+    {
+        for (const char *sql : {"SELECT * FROM t LIMIT -1;", "SELECT * FROM t LIMIT 'x';", "SELECT * FROM t ORDER a;"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
+    }
+
 } // namespace sql

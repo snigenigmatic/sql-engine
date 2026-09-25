@@ -5,6 +5,9 @@
 #include "execution/filter.h"
 #include "execution/projection.h"
 #include "execution/expression_projection.h"
+#include "execution/sort.h"
+#include "execution/distinct.h"
+#include "execution/limit.h"
 #include "execution/index_scan.h"
 #include "execution/nested_loop_join.h"
 #include "execution/hash_join.h"
@@ -62,6 +65,7 @@ namespace sql
 
         Catalog *catalog_;
         std::unique_ptr<Table> join_context_table_;
+        std::unique_ptr<PhysicalPlanNode> physical_plan_;
         std::vector<std::unique_ptr<Table>> materialized_tables_;
     };
 

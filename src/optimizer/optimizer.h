@@ -43,7 +43,10 @@ namespace sql
         HASH_JOIN,
         INDEX_NESTED_LOOP_JOIN,
         FILTER,
-        PROJECTION
+        PROJECTION,
+        SORT,
+        DISTINCT,
+        LIMIT
     };
 
     struct PhysicalPlanNode
@@ -84,6 +87,16 @@ namespace sql
         // instead of copying columns (non-owning, AST owned by Statement)
         bool compute_projection = false;
         std::vector<const Expression *> projected_exprs;
+
+        // SORT: keys evaluated on the rows below the projection (non-owning,
+        // except keys the planner had to create, kept in owned_exprs)
+        std::vector<const Expression *> sort_keys;
+        std::vector<bool> sort_descending;
+        std::vector<std::unique_ptr<Expression>> owned_exprs;
+
+        // LIMIT
+        std::optional<int64_t> limit;
+        int64_t offset = 0;
     };
 
     class Optimizer
@@ -97,6 +110,11 @@ namespace sql
         std::string ExplainPhysicalPlan(const PhysicalPlanNode *root) const;
 
     private:
+        // ORDER BY items as sort keys: positions and output aliases become the
+        // selected expression they name
+        void ResolveSortKeys(const SelectStatement &select, Table *table, Table *join_table,
+                             PhysicalPlanNode *sort) const;
+
         std::unique_ptr<LogicalPlanNode> BuildSelectLogicalPlan(const SelectStatement *select) const;
         std::unique_ptr<PhysicalPlanNode> BuildSelectPhysicalPlan(const SelectStatement *select, Catalog *catalog) const;
         std::string ExplainNode(const LogicalPlanNode *node, int indent) const;

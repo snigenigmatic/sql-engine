@@ -1199,4 +1199,92 @@ namespace sql
         EXPECT_NE(ambiguous.message.find("Ambiguous"), std::string::npos) << ambiguous.message;
     }
 
+    // ── ORDER BY / LIMIT / DISTINCT ──────────────────────────────────────────────
+
+    static void CreatePeopleWithCities(Catalog &catalog)
+    {
+        RunSQL(catalog, "CREATE TABLE p (id INTEGER PRIMARY KEY, name VARCHAR(10), city VARCHAR(10), age INTEGER);");
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO p VALUES (1, 'ann', 'oslo', 30), (2, 'bo', 'rome', NULL), "
+                                    "(3, 'cy', 'oslo', 25), (4, 'di', 'lima', 41), (5, 'ed', 'rome', 25);")
+                        .success);
+    }
+
+    TEST(IntegrationTest, OrderByKeysDirectionsAndNulls)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        // NULL sorts first ascending (so last descending); ties use the next key
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM p ORDER BY age;")), (std::vector<int>{2, 3, 5, 1, 4}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM p ORDER BY age DESC, name DESC;")), (std::vector<int>{4, 1, 5, 3, 2}));
+        // Stable: equal keys keep their input order
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM p ORDER BY city;")), (std::vector<int>{4, 1, 3, 2, 5}));
+    }
+
+    TEST(IntegrationTest, OrderByAliasPositionExpressionAndHiddenColumn)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id, age * -1 AS neg FROM p WHERE age IS NOT NULL ORDER BY neg;")),
+                  (std::vector<int>{4, 1, 3, 5}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id, name FROM p ORDER BY 2 DESC;")), (std::vector<int>{5, 4, 3, 2, 1}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT * FROM p ORDER BY 3, 1 DESC;")), (std::vector<int>{4, 3, 1, 5, 2}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM p ORDER BY age + id DESC;")), (std::vector<int>{4, 1, 5, 3, 2}));
+        // name is not selected but can still order the rows
+        auto hidden = RunSQL(catalog, "SELECT age FROM p WHERE age > 20 ORDER BY name DESC;");
+        ASSERT_EQ(hidden.tuples.size(), 4u);
+        EXPECT_EQ(hidden.tuples[0].GetValue(0).GetAsInt(), 25); // ed
+        EXPECT_FALSE(RunSQL(catalog, "SELECT id FROM p ORDER BY 3;").success);
+        EXPECT_FALSE(RunSQL(catalog, "SELECT id FROM p ORDER BY 0;").success);
+        EXPECT_FALSE(RunSQL(catalog, "SELECT id FROM p ORDER BY nosuch;").success);
+    }
+
+    TEST(IntegrationTest, LimitAndOffset)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM p ORDER BY id LIMIT 2;")), (std::vector<int>{1, 2}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM p ORDER BY id LIMIT 2 OFFSET 3;")), (std::vector<int>{4, 5}));
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM p ORDER BY id LIMIT 10 OFFSET 4;")), (std::vector<int>{5}));
+        EXPECT_TRUE(RunSQL(catalog, "SELECT id FROM p LIMIT 0;").tuples.empty());
+        EXPECT_TRUE(RunSQL(catalog, "SELECT id FROM p ORDER BY id LIMIT 5 OFFSET 99;").tuples.empty());
+        EXPECT_EQ(RunSQL(catalog, "SELECT id FROM p LIMIT 3;").tuples.size(), 3u);
+    }
+
+    TEST(IntegrationTest, SelectDistinct)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        auto cities = RunSQL(catalog, "SELECT DISTINCT city FROM p ORDER BY city;");
+        ASSERT_EQ(cities.tuples.size(), 3u);
+        EXPECT_EQ(cities.tuples[0].GetValue(0).GetAsString(), "lima");
+        EXPECT_EQ(cities.tuples[2].GetValue(0).GetAsString(), "rome");
+        // NULLs count as one value; DISTINCT applies to whole rows
+        RunSQL(catalog, "INSERT INTO p VALUES (6, 'fi', 'oslo', NULL);");
+        EXPECT_EQ(RunSQL(catalog, "SELECT DISTINCT age FROM p;").tuples.size(), 4u);
+        EXPECT_EQ(RunSQL(catalog, "SELECT DISTINCT city, age FROM p;").tuples.size(), 6u);
+        EXPECT_EQ(RunSQL(catalog, "SELECT DISTINCT city FROM p ORDER BY city DESC LIMIT 1;").tuples.at(0).GetValue(0).GetAsString(),
+                  "rome");
+        auto bad = RunSQL(catalog, "SELECT DISTINCT city FROM p ORDER BY age;");
+        EXPECT_FALSE(bad.success);
+        EXPECT_NE(bad.message.find("must appear in the select list"), std::string::npos);
+    }
+
+    TEST(IntegrationTest, OrderByOverAJoinAndAnIndexScan)
+    {
+        Catalog catalog;
+        CreateOrdersAndCustomers(catalog);
+        auto joined = RunSQL(catalog, "SELECT oid, name FROM orders JOIN customers ON orders.cid = customers.id "
+                                      "ORDER BY customers.name DESC, orders.oid DESC LIMIT 3;");
+        ASSERT_TRUE(joined.success) << joined.message;
+        EXPECT_EQ(Ids(joined), (std::vector<int>{2, 3, 1})); // Bob, then Alice's orders; NULL name sorts last
+
+        CreatePeopleWithCities(catalog);
+        auto explain = RunSQL(catalog, "EXPLAIN SELECT id FROM p WHERE id > 1 ORDER BY age DESC LIMIT 2;");
+        EXPECT_NE(explain.message.find("Limit(limit=2, offset=0)"), std::string::npos) << explain.message;
+        EXPECT_NE(explain.message.find("Sort(keys=[age DESC])"), std::string::npos) << explain.message;
+        EXPECT_NE(explain.message.find("IndexScan"), std::string::npos) << explain.message;
+        EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM p WHERE id > 1 ORDER BY age DESC LIMIT 2;")),
+                  (std::vector<int>{4, 3}));
+    }
+
 } // namespace sql

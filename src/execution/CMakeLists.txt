@@ -5,6 +5,9 @@ add_library(execution
     filter.cpp
     projection.cpp
     expression_projection.cpp
+    sort.cpp
+    distinct.cpp
+    limit.cpp
     index_scan.cpp
     nested_loop_join.cpp
     hash_join.cpp

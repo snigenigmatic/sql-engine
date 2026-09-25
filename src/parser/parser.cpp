@@ -70,6 +70,7 @@ namespace sql
     {
         auto stmt = std::make_unique<SelectStatement>();
         Expect(TokenType::SELECT);
+        stmt->distinct = Match(TokenType::DISTINCT);
 
         if (Match(TokenType::STAR))
         {
@@ -126,6 +127,28 @@ namespace sql
         if (Match(TokenType::WHERE))
         {
             stmt->where = ParseExpression();
+        }
+
+        if (Match(TokenType::ORDER))
+        {
+            Expect(TokenType::BY);
+            do
+            {
+                OrderItem item;
+                item.expr = ParseExpression();
+                if (Match(TokenType::DESC))
+                    item.descending = true;
+                else
+                    Match(TokenType::ASC);
+                stmt->order_by.push_back(std::move(item));
+            } while (Match(TokenType::COMMA));
+        }
+
+        if (Match(TokenType::LIMIT))
+        {
+            stmt->limit = std::stoll(Expect(TokenType::INTEGER_LITERAL).value);
+            if (Match(TokenType::OFFSET))
+                stmt->offset = std::stoll(Expect(TokenType::INTEGER_LITERAL).value);
         }
 
         Expect(TokenType::SEMICOLON);
