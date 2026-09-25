@@ -7,6 +7,7 @@
 #include "execution/expression_projection.h"
 #include "execution/sort.h"
 #include "execution/distinct.h"
+#include "execution/aggregate.h"
 #include "execution/limit.h"
 #include "execution/index_scan.h"
 #include "execution/nested_loop_join.h"
@@ -61,10 +62,15 @@ namespace sql
         int ResolveColumnIndexForSelect(const std::string &name, Table *base_table, Table *join_table, bool *from_join_table = nullptr) const;
         void EnsureJoinContextTable(Table *left, Table *right);
         std::pair<std::string, std::string> ResolveJoinColumns(const PhysicalPlanNode *node, Table *left, Table *right) const;
+        // Rows reaching a FILTER / SORT / PROJECTION node are shaped like this
+        Table *RowContext(const PhysicalPlanNode *node, Table *table) const;
         Table *MaterializeOperatorToTable(std::unique_ptr<Operator> op, Table *source_table, const std::string &name_suffix);
 
         Catalog *catalog_;
         std::unique_ptr<Table> join_context_table_;
+        // Shape of an AGGREGATE's output rows (group keys, then aggregates);
+        // only the column names are used, to resolve references
+        std::unique_ptr<Table> aggregate_context_table_;
         std::unique_ptr<PhysicalPlanNode> physical_plan_;
         std::vector<std::unique_ptr<Table>> materialized_tables_;
     };

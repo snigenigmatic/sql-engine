@@ -14,6 +14,7 @@ namespace sql
     {
         SEQ_SCAN,
         FILTER,
+        AGGREGATE,
         PROJECTION
     };
 
@@ -29,6 +30,9 @@ namespace sql
 
         // FILTER
         const Expression *predicate = nullptr; // non-owning, refers to AST owned by Statement
+
+        // AGGREGATE: SQL text of the GROUP BY expressions
+        std::vector<std::string> group_labels;
 
         // PROJECTION
         bool project_all = false;
@@ -46,7 +50,8 @@ namespace sql
         PROJECTION,
         SORT,
         DISTINCT,
-        LIMIT
+        LIMIT,
+        AGGREGATE
     };
 
     struct PhysicalPlanNode
@@ -97,6 +102,17 @@ namespace sql
         // LIMIT
         std::optional<int64_t> limit;
         int64_t offset = 0;
+
+        // AGGREGATE: group keys and aggregates, evaluated on the input rows
+        // (non-owning, AST owned by Statement). Output rows hold the key
+        // values, then the aggregate results, in columns with these names.
+        std::vector<const Expression *> group_keys;
+        std::vector<const AggregateExpression *> aggregates;
+        std::vector<std::string> aggregate_columns;
+
+        // FILTER / SORT / PROJECTION: the rows are an AGGREGATE's output, and
+        // the expressions refer to its columns
+        bool over_aggregate = false;
     };
 
     class Optimizer
@@ -114,6 +130,12 @@ namespace sql
         // selected expression they name
         void ResolveSortKeys(const SelectStatement &select, Table *table, Table *join_table,
                              PhysicalPlanNode *sort) const;
+
+        // Aggregation, HAVING, ORDER BY and the SELECT list of a query with
+        // GROUP BY or aggregate functions, over its (filtered) input rows
+        std::unique_ptr<PhysicalPlanNode> BuildAggregatePlan(const SelectStatement &select, Table *table,
+                                                             Table *join_table,
+                                                             std::unique_ptr<PhysicalPlanNode> input) const;
 
         std::unique_ptr<LogicalPlanNode> BuildSelectLogicalPlan(const SelectStatement *select) const;
         std::unique_ptr<PhysicalPlanNode> BuildSelectPhysicalPlan(const SelectStatement *select, Catalog *catalog) const;

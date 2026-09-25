@@ -290,6 +290,8 @@ namespace sql
              {"LIMIT", TokenType::LIMIT},
              {"OFFSET", TokenType::OFFSET},
              {"DISTINCT", TokenType::DISTINCT},
+             {"GROUP", TokenType::GROUP},
+             {"HAVING", TokenType::HAVING},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

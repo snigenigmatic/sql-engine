@@ -713,4 +713,83 @@ namespace sql
         }
     }
 
+    TEST(ParserTest, AggregatesGroupByHaving)
+    {
+        Lexer lexer("SELECT city, count(*), COUNT(DISTINCT age) AS n, Sum(age + 1) FROM p "
+                    "WHERE age > 1 GROUP BY city, age HAVING COUNT(*) > 1 ORDER BY n;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        ASSERT_EQ(select->items.size(), 4u);
+        EXPECT_EQ(ExpressionToSQL(select->items[1].expr.get()), "COUNT(*)");
+        EXPECT_EQ(ExpressionToSQL(select->items[2].expr.get()), "COUNT(DISTINCT age)");
+        EXPECT_EQ(select->items[2].alias, "n");
+        EXPECT_EQ(ExpressionToSQL(select->items[3].expr.get()), "SUM(age + 1)");
+        ASSERT_EQ(select->items[1].expr->GetType(), ExpressionType::AGGREGATE);
+        EXPECT_EQ(static_cast<AggregateExpression *>(select->items[1].expr.get())->argument, nullptr);
+        ASSERT_EQ(select->group_by.size(), 2u);
+        EXPECT_EQ(ExpressionToSQL(select->group_by[1].get()), "age");
+        ASSERT_NE(select->having, nullptr);
+        EXPECT_EQ(ExpressionToSQL(select->having.get()), "COUNT(*) > 1");
+        EXPECT_TRUE(ContainsAggregate(select->having.get()));
+        EXPECT_FALSE(ContainsAggregate(select->where.get()));
+        EXPECT_EQ(select->order_by.size(), 1u);
+    }
+
+    TEST(ParserTest, FunctionNamesAreNotReserved)
+    {
+        Lexer lexer("SELECT count, max FROM t GROUP BY count;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_EQ(select->columns, (std::vector<std::string>{"count", "max"}));
+    }
+
+    TEST(ParserTest, BadFunctionCalls)
+    {
+        for (const char *sql : {"SELECT SUM(*) FROM t;", "SELECT COUNT(DISTINCT *) FROM t;", "SELECT foo(a) FROM t;",
+                                "SELECT COUNT(a FROM t;", "SELECT a FROM t GROUP a;"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
+    }
+
+    TEST(ParserTest, ExpressionsEqualAndRewrite)
+    {
+        Lexer lexer("SELECT SUM(t.a + 1), SUM(a + 1), SUM(a + 1.5), a + 1 FROM t;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        auto strip = [](const std::string &n)
+        { return n.substr(n.find('.') == std::string::npos ? 0 : n.find('.') + 1); };
+        auto same = [&](const std::string &a, const std::string &b)
+        { return strip(a) == strip(b); };
+        const Expression *e0 = select->items[0].expr.get();
+        EXPECT_TRUE(ExpressionsEqual(e0, select->items[1].expr.get(), same));
+        EXPECT_FALSE(ExpressionsEqual(e0, select->items[2].expr.get(), same)); // 1 vs 1.5
+        EXPECT_FALSE(ExpressionsEqual(e0, select->items[3].expr.get(), same));
+
+        // Copy with every column reference renamed
+        auto copy = RewriteExpression(e0, [](const Expression *node) -> std::unique_ptr<Expression>
+                                      {
+            if (node->GetType() == ExpressionType::COLUMN_REF)
+                return std::make_unique<ColumnExpression>("x");
+            return nullptr; });
+        EXPECT_EQ(ExpressionToSQL(copy.get()), "SUM(x + 1)");
+        EXPECT_EQ(ExpressionToSQL(e0), "SUM(t.a + 1)"); // original untouched
+    }
+
+    TEST(ParserTest, LogicalPlanShowsAggregation)
+    {
+        Lexer lexer("SELECT city, COUNT(*) FROM p GROUP BY city HAVING COUNT(*) > 1;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        Optimizer optimizer;
+        auto explain = optimizer.ExplainLogicalPlan(optimizer.BuildLogicalPlan(stmt.get()).get());
+        EXPECT_NE(explain.find("Aggregate(group=[city])"), std::string::npos) << explain;
+        EXPECT_LT(explain.find("Filter"), explain.find("Aggregate")) << explain; // HAVING above
+    }
+
 } // namespace sql

@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <functional>
 #include <optional>
 
 namespace sql
@@ -21,7 +22,8 @@ namespace sql
         IS_NULL,  // IS NULL / IS NOT NULL
         LIKE,     // [NOT] LIKE
         IN_LIST,  // [NOT] IN (...)
-        BETWEEN   // [NOT] BETWEEN ... AND ...
+        BETWEEN,  // [NOT] BETWEEN ... AND ...
+        AGGREGATE // COUNT / SUM / AVG / MIN / MAX
     };
 
     struct Expression
@@ -102,6 +104,42 @@ namespace sql
         ExpressionType GetType() const override { return ExpressionType::BETWEEN; }
     };
 
+    enum class AggregateFunction
+    {
+        COUNT,
+        SUM,
+        AVG,
+        MIN,
+        MAX
+    };
+
+    const char *AggregateFunctionName(AggregateFunction function);
+
+    // COUNT(*), COUNT([DISTINCT] x), SUM(x), ... Only valid in the SELECT
+    // list, HAVING and ORDER BY of a query; the planner computes it per group
+    struct AggregateExpression : public Expression
+    {
+        AggregateFunction function;
+        std::unique_ptr<Expression> argument; // null for COUNT(*)
+        bool distinct;
+        AggregateExpression(AggregateFunction f, std::unique_ptr<Expression> a, bool d)
+            : function(f), argument(std::move(a)), distinct(d) {}
+        ExpressionType GetType() const override { return ExpressionType::AGGREGATE; }
+    };
+
+    // True if the expression contains an aggregate function call
+    bool ContainsAggregate(const Expression *expr);
+
+    // Structural equality. Column references are compared with same_column,
+    // which decides whether two names refer to the same column.
+    bool ExpressionsEqual(const Expression *a, const Expression *b,
+                          const std::function<bool(const std::string &, const std::string &)> &same_column);
+
+    // Deep copy of an expression. replace is called on every node first; a
+    // non-null result is used in place of that node's copy.
+    std::unique_ptr<Expression> RewriteExpression(
+        const Expression *expr, const std::function<std::unique_ptr<Expression>(const Expression *)> &replace);
+
     // --- Statements ---
 
     enum class StatementType
@@ -147,6 +185,8 @@ namespace sql
         std::vector<std::string> columns; // column names, when every item is a bare column
         bool select_star = false;
         bool distinct = false;
+        std::vector<std::unique_ptr<Expression>> group_by;
+        std::unique_ptr<Expression> having;
         std::vector<OrderItem> order_by;
         std::optional<int64_t> limit;
         int64_t offset = 0;

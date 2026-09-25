@@ -279,6 +279,17 @@ namespace sql
         return materialized_tables_.back().get();
     }
 
+    Table *Executor::RowContext(const PhysicalPlanNode *node, Table *table) const
+    {
+        if (node->over_aggregate)
+        {
+            if (!aggregate_context_table_)
+                throw std::logic_error("Aggregate output used before the aggregate was built");
+            return aggregate_context_table_.get();
+        }
+        return join_context_table_ ? join_context_table_.get() : table;
+    }
+
     std::unique_ptr<Operator> Executor::BuildOperatorTree(const PhysicalPlanNode *node, Table *table, Table *join_table)
     {
         if (node == nullptr)
@@ -418,8 +429,12 @@ namespace sql
                 throw std::runtime_error("Filter node missing child");
             auto child = BuildOperatorTree(node->children[0].get(), table, join_table);
             Table *filter_table = table;
-            if (join_context_table_ &&
-                node->table_name == "__join_context__")
+            if (node->over_aggregate)
+            {
+                filter_table = RowContext(node, table);
+            }
+            else if (join_context_table_ &&
+                     node->table_name == "__join_context__")
             {
                 filter_table = join_context_table_.get();
             }
@@ -428,9 +443,20 @@ namespace sql
         case PhysicalPlanType::SORT:
         {
             auto child = BuildOperatorTree(node->children.at(0).get(), table, join_table);
-            // Rows below the projection: the base table's, or joined rows
-            Table *context = join_context_table_ ? join_context_table_.get() : table;
-            return std::make_unique<Sort>(std::move(child), node->sort_keys, node->sort_descending, context);
+            // Rows below the projection: the base table's, joined rows, or
+            // an aggregate's output
+            return std::make_unique<Sort>(std::move(child), node->sort_keys, node->sort_descending,
+                                          RowContext(node, table));
+        }
+        case PhysicalPlanType::AGGREGATE:
+        {
+            auto child = BuildOperatorTree(node->children.at(0).get(), table, join_table);
+            Table *input = join_context_table_ ? join_context_table_.get() : table;
+            std::vector<Column> columns;
+            for (const auto &name : node->aggregate_columns)
+                columns.emplace_back(name, DataType::INTEGER, 0); // the type is not used
+            aggregate_context_table_ = std::make_unique<Table>("__aggregate__", Schema(std::move(columns)));
+            return std::make_unique<HashAggregate>(std::move(child), node->group_keys, node->aggregates, input);
         }
         case PhysicalPlanType::DISTINCT:
             return std::make_unique<Distinct>(BuildOperatorTree(node->children.at(0).get(), table, join_table));
@@ -452,8 +478,8 @@ namespace sql
             if (node->compute_projection)
             {
                 // Rows from a join are shaped like the qualified join schema
-                Table *context = join_context_table_ ? join_context_table_.get() : table;
-                return std::make_unique<ExpressionProjection>(std::move(child), node->projected_exprs, context);
+                return std::make_unique<ExpressionProjection>(std::move(child), node->projected_exprs,
+                                                              RowContext(node, table));
             }
             auto column_indices = ResolveProjectionIndices(node, table, projection_join_table);
             return std::make_unique<Projection>(std::move(child), std::move(column_indices), node->project_all);
@@ -471,6 +497,7 @@ namespace sql
 
         materialized_tables_.clear();
         join_context_table_.reset();
+        aggregate_context_table_.reset();
         Optimizer optimizer;
         // Operators may point into the plan (e.g. sort keys the planner
         // created), so it lives as long as the executor
@@ -825,6 +852,7 @@ namespace sql
         {
             materialized_tables_.clear();
             join_context_table_.reset();
+            aggregate_context_table_.reset();
             Optimizer optimizer;
             auto physical_plan = optimizer.BuildPhysicalPlan(explain->select.get(), catalog_);
             result.success = true;

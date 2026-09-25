@@ -129,6 +129,17 @@ namespace sql
             stmt->where = ParseExpression();
         }
 
+        if (Match(TokenType::GROUP))
+        {
+            Expect(TokenType::BY);
+            do
+            {
+                stmt->group_by.push_back(ParseExpression());
+            } while (Match(TokenType::COMMA));
+        }
+        if (Match(TokenType::HAVING))
+            stmt->having = ParseExpression();
+
         if (Match(TokenType::ORDER))
         {
             Expect(TokenType::BY);
@@ -526,6 +537,8 @@ namespace sql
         {
         case TokenType::IDENTIFIER:
         {
+            if (current_token_.type == TokenType::LPAREN)
+                return ParseFunctionCall(t.value);
             std::string name = t.value;
             if (current_token_.type == TokenType::DOT)
             {
@@ -567,6 +580,41 @@ namespace sql
         default:
             throw std::runtime_error("Unexpected token in expression: " + t.value);
         }
+    }
+
+    // name( [DISTINCT] expr ) or COUNT(*); the name is not case-sensitive and
+    // not reserved, so columns may still be called "count"
+    std::unique_ptr<Expression> Parser::ParseFunctionCall(const std::string &name)
+    {
+        std::string upper = name;
+        for (char &c : upper)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        AggregateFunction function;
+        if (upper == "COUNT")
+            function = AggregateFunction::COUNT;
+        else if (upper == "SUM")
+            function = AggregateFunction::SUM;
+        else if (upper == "AVG")
+            function = AggregateFunction::AVG;
+        else if (upper == "MIN")
+            function = AggregateFunction::MIN;
+        else if (upper == "MAX")
+            function = AggregateFunction::MAX;
+        else
+            throw std::runtime_error("Unknown function: " + name);
+
+        Expect(TokenType::LPAREN);
+        const bool distinct = Match(TokenType::DISTINCT);
+        if (Match(TokenType::STAR))
+        {
+            if (function != AggregateFunction::COUNT || distinct)
+                throw std::runtime_error(std::string("Only COUNT(*) accepts *, not ") + (distinct ? "DISTINCT *" : upper + "(*)"));
+            Expect(TokenType::RPAREN);
+            return std::make_unique<AggregateExpression>(function, nullptr, false);
+        }
+        auto argument = ParseExpression();
+        Expect(TokenType::RPAREN);
+        return std::make_unique<AggregateExpression>(function, std::move(argument), distinct);
     }
 
     std::string Parser::ParseQualifiedColumnName()

@@ -1,4 +1,5 @@
 #include "execution/distinct.h"
+#include "execution/evaluator.h"
 
 namespace sql
 {
@@ -13,9 +14,10 @@ namespace sql
     {
         while (child_->Next(tuple))
         {
-            // The binary encoding identifies a row (type, NULL-ness, value)
+            // Rows are duplicates when every value is, as for GROUP BY
             std::string key;
-            tuple->SerializeTo(&key);
+            for (size_t i = 0; i < tuple->GetValueCount(); ++i)
+                AppendGroupKey(tuple->GetValue(i), &key);
             if (seen_.insert(std::move(key)).second)
                 return true;
         }

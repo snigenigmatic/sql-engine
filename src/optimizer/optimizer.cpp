@@ -1,4 +1,6 @@
 #include "optimizer/optimizer.h"
+#include <algorithm>
+#include <functional>
 #include <stdexcept>
 #include <sstream>
 
@@ -204,6 +206,45 @@ namespace sql
             return labels;
         }
 
+        // The column a name refers to, spelled one way: without the table's
+        // own qualifier in a single-table query, and qualified in a join
+        std::string CanonicalColumn(const std::string &name, const SelectStatement &select, Table *table,
+                                    Table *join_table)
+        {
+            const size_t dot = name.find('.');
+            if (join_table == nullptr)
+                return dot != std::string::npos && name.substr(0, dot) == select.table ? name.substr(dot + 1) : name;
+            if (dot != std::string::npos)
+                return name;
+            switch (ResolveColumnSide(name, select.table, *select.join_table, table, join_table))
+            {
+            case PredicateTableSide::LEFT:
+                return select.table + "." + name;
+            case PredicateTableSide::RIGHT:
+                return *select.join_table + "." + name;
+            default:
+                return name; // unknown or ambiguous: evaluation reports it
+            }
+        }
+
+        // GROUP BY, HAVING or an aggregate function anywhere it may appear
+        bool IsAggregateQuery(const SelectStatement &select)
+        {
+            if (!select.group_by.empty() || select.having)
+                return true;
+            for (const auto &item : select.items)
+            {
+                if (ContainsAggregate(item.expr.get()))
+                    return true;
+            }
+            for (const auto &order : select.order_by)
+            {
+                if (ContainsAggregate(order.expr.get()))
+                    return true;
+            }
+            return false;
+        }
+
         // col BETWEEN low AND high with literal bounds of the column's kind
         bool IsIndexableRange(const Expression *expr, std::string *column_name, Value *low, Value *high)
         {
@@ -253,6 +294,22 @@ namespace sql
             current = std::move(filter);
         }
 
+        if (IsAggregateQuery(*select))
+        {
+            auto aggregate = std::make_unique<LogicalPlanNode>(LogicalPlanType::AGGREGATE);
+            for (const auto &key : select->group_by)
+                aggregate->group_labels.push_back(ExpressionToSQL(key.get()));
+            aggregate->children.push_back(std::move(current));
+            current = std::move(aggregate);
+            if (select->having)
+            {
+                auto having = std::make_unique<LogicalPlanNode>(LogicalPlanType::FILTER);
+                having->predicate = select->having.get();
+                having->children.push_back(std::move(current));
+                current = std::move(having);
+            }
+        }
+
         auto projection = std::make_unique<LogicalPlanNode>(LogicalPlanType::PROJECTION);
         projection->project_all = select->select_star;
         projection->projected_columns = ProjectionLabels(*select);
@@ -281,6 +338,12 @@ namespace sql
             {
                 out << "\n" << pad << "  predicate:\n" << DumpExpression(node->predicate, indent + 2);
             }
+            break;
+        case LogicalPlanType::AGGREGATE:
+            out << pad << "Aggregate(group=[";
+            for (size_t i = 0; i < node->group_labels.size(); ++i)
+                out << (i ? ", " : "") << node->group_labels[i];
+            out << "])";
             break;
         case LogicalPlanType::PROJECTION:
             out << pad << "Projection(columns=";
@@ -344,6 +407,8 @@ namespace sql
         {
             throw std::runtime_error("Table not found: " + select->table);
         }
+        if (ContainsAggregate(select->where.get()))
+            throw std::runtime_error("Aggregate functions are not allowed in WHERE");
 
         auto build_base_access_path = [&](const std::string &table_name, Table *target_table, const Expression *predicate) -> std::unique_ptr<PhysicalPlanNode>
         {
@@ -577,28 +642,35 @@ namespace sql
             }
         }
 
-        // ORDER BY sorts the rows before projection, so it can use columns
-        // that are not selected
-        if (!select->order_by.empty())
+        Table *join_table = select->join_table ? catalog->GetTable(*select->join_table) : nullptr;
+        if (IsAggregateQuery(*select))
         {
-            auto sort = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SORT);
-            ResolveSortKeys(*select, table, select->join_table ? catalog->GetTable(*select->join_table) : nullptr,
-                            sort.get());
-            sort->children.push_back(std::move(current));
-            current = std::move(sort);
+            current = BuildAggregatePlan(*select, table, join_table, std::move(current));
         }
+        else
+        {
+            // ORDER BY sorts the rows before projection, so it can use
+            // columns that are not selected
+            if (!select->order_by.empty())
+            {
+                auto sort = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SORT);
+                ResolveSortKeys(*select, table, join_table, sort.get());
+                sort->children.push_back(std::move(current));
+                current = std::move(sort);
+            }
 
-        auto projection = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::PROJECTION);
-        projection->project_all = select->select_star;
-        projection->projected_columns = ProjectionLabels(*select);
-        if (select->HasComputedItems())
-        {
-            projection->compute_projection = true;
-            for (const auto &item : select->items)
-                projection->projected_exprs.push_back(item.expr.get());
+            auto projection = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::PROJECTION);
+            projection->project_all = select->select_star;
+            projection->projected_columns = ProjectionLabels(*select);
+            if (select->HasComputedItems())
+            {
+                projection->compute_projection = true;
+                for (const auto &item : select->items)
+                    projection->projected_exprs.push_back(item.expr.get());
+            }
+            projection->children.push_back(std::move(current));
+            current = std::move(projection);
         }
-        projection->children.push_back(std::move(current));
-        current = std::move(projection);
 
         if (select->distinct)
         {
@@ -615,6 +687,169 @@ namespace sql
             current = std::move(limit);
         }
         return current;
+    }
+
+    std::unique_ptr<PhysicalPlanNode> Optimizer::BuildAggregatePlan(const SelectStatement &select, Table *table,
+                                                                    Table *join_table,
+                                                                    std::unique_ptr<PhysicalPlanNode> input) const
+    {
+        if (select.select_star)
+            throw std::runtime_error("SELECT * cannot be used with GROUP BY or aggregate functions");
+        auto same_column = [&](const std::string &a, const std::string &b)
+        {
+            return CanonicalColumn(a, select, table, join_table) == CanonicalColumn(b, select, table, join_table);
+        };
+
+        auto aggregate = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::AGGREGATE);
+        // Output columns are named by their SQL text (what EXPLAIN shows);
+        // equal texts for different expressions get a suffix
+        auto add_column = [&](const std::string &name)
+        {
+            std::string unique = name;
+            for (int n = 2; std::find(aggregate->aggregate_columns.begin(), aggregate->aggregate_columns.end(),
+                                      unique) != aggregate->aggregate_columns.end();
+                 ++n)
+                unique = name + " #" + std::to_string(n);
+            aggregate->aggregate_columns.push_back(unique);
+            return unique;
+        };
+
+        // Group keys first, each once. GROUP BY 2 names the second SELECT
+        // item, and a name that is not a column may be an item's alias.
+        for (const auto &group : select.group_by)
+        {
+            const Expression *key = group.get();
+            if (key->GetType() == ExpressionType::LITERAL)
+            {
+                const Value &v = static_cast<const LiteralExpression *>(key)->value;
+                if (!v.IsNull() && v.GetType() == DataType::INTEGER)
+                {
+                    const int64_t pos = v.GetAsInt();
+                    if (pos < 1 || pos > static_cast<int64_t>(select.items.size()))
+                        throw std::runtime_error("GROUP BY position " + std::to_string(pos) + " is out of range");
+                    key = select.items[static_cast<size_t>(pos - 1)].expr.get();
+                }
+            }
+            else if (key->GetType() == ExpressionType::COLUMN_REF)
+            {
+                const std::string &name = static_cast<const ColumnExpression *>(key)->name;
+                const bool is_column = join_table ? ResolveColumnSide(name, select.table, *select.join_table, table,
+                                                                      join_table) != PredicateTableSide::NONE
+                                                  : table->GetColumnIndex(CanonicalColumn(name, select, table, nullptr)) >= 0;
+                for (const auto &item : select.items)
+                {
+                    if (!is_column && !item.alias.empty() && item.alias == name)
+                        key = item.expr.get();
+                }
+            }
+            if (ContainsAggregate(key))
+                throw std::runtime_error("Aggregate functions are not allowed in GROUP BY");
+
+            bool repeated = false;
+            for (const Expression *existing : aggregate->group_keys)
+                repeated = repeated || ExpressionsEqual(existing, key, same_column);
+            if (!repeated)
+            {
+                aggregate->group_keys.push_back(key);
+                add_column(ExpressionToSQL(key));
+            }
+        }
+        const size_t key_count = aggregate->group_keys.size();
+
+        // Rewrite an expression over the aggregate's output rows: aggregates
+        // and group keys become references to their columns, and any other
+        // column is an error. HAVING and ORDER BY may also name a SELECT
+        // alias (not inside an alias's own expression).
+        std::function<std::unique_ptr<Expression>(const Expression *, bool)> rewrite;
+        rewrite = [&](const Expression *expr, bool allow_alias)
+        {
+            return RewriteExpression(expr, [&](const Expression *node) -> std::unique_ptr<Expression>
+                                     {
+                if (node->GetType() == ExpressionType::AGGREGATE)
+                {
+                    const auto *call = static_cast<const AggregateExpression *>(node);
+                    if (ContainsAggregate(call->argument.get()))
+                        throw std::runtime_error("Aggregate function calls cannot be nested");
+                    for (size_t i = 0; i < aggregate->aggregates.size(); ++i)
+                    {
+                        if (ExpressionsEqual(aggregate->aggregates[i], call, same_column))
+                            return std::make_unique<ColumnExpression>(aggregate->aggregate_columns[key_count + i]);
+                    }
+                    aggregate->aggregates.push_back(call);
+                    return std::make_unique<ColumnExpression>(add_column(ExpressionToSQL(call)));
+                }
+                for (size_t i = 0; i < key_count; ++i)
+                {
+                    if (ExpressionsEqual(aggregate->group_keys[i], node, same_column))
+                        return std::make_unique<ColumnExpression>(aggregate->aggregate_columns[i]);
+                }
+                if (node->GetType() == ExpressionType::COLUMN_REF)
+                {
+                    const std::string &name = static_cast<const ColumnExpression *>(node)->name;
+                    if (allow_alias)
+                    {
+                        for (const auto &item : select.items)
+                        {
+                            if (!item.alias.empty() && item.alias == name)
+                                return rewrite(item.expr.get(), false);
+                        }
+                    }
+                    throw std::runtime_error("Column '" + name +
+                                             "' must appear in the GROUP BY clause or be used in an aggregate function");
+                }
+                return nullptr; });
+        };
+
+        auto projection = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::PROJECTION);
+        projection->projected_columns = ProjectionLabels(select);
+        projection->compute_projection = true;
+        projection->over_aggregate = true;
+        for (const auto &item : select.items)
+        {
+            projection->owned_exprs.push_back(rewrite(item.expr.get(), false));
+            projection->projected_exprs.push_back(projection->owned_exprs.back().get());
+        }
+
+        std::unique_ptr<PhysicalPlanNode> having;
+        if (select.having)
+        {
+            having = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
+            having->table_name = "__aggregate__";
+            having->over_aggregate = true;
+            having->owned_exprs.push_back(rewrite(select.having.get(), true));
+            having->predicate = having->owned_exprs.back().get();
+        }
+
+        std::unique_ptr<PhysicalPlanNode> sort;
+        if (!select.order_by.empty())
+        {
+            // Positions and aliases name SELECT items; then rewrite
+            PhysicalPlanNode resolved(PhysicalPlanType::SORT);
+            ResolveSortKeys(select, table, join_table, &resolved);
+            sort = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SORT);
+            sort->over_aggregate = true;
+            sort->sort_descending = resolved.sort_descending;
+            for (const Expression *key : resolved.sort_keys)
+            {
+                sort->owned_exprs.push_back(rewrite(key, true));
+                sort->sort_keys.push_back(sort->owned_exprs.back().get());
+            }
+        }
+
+        aggregate->children.push_back(std::move(input));
+        std::unique_ptr<PhysicalPlanNode> current = std::move(aggregate);
+        if (having)
+        {
+            having->children.push_back(std::move(current));
+            current = std::move(having);
+        }
+        if (sort)
+        {
+            sort->children.push_back(std::move(current));
+            current = std::move(sort);
+        }
+        projection->children.push_back(std::move(current));
+        return projection;
     }
 
     void Optimizer::ResolveSortKeys(const SelectStatement &select, Table *table, Table *join_table,
@@ -672,15 +907,14 @@ namespace sql
             // With DISTINCT, rows are only defined by the selected values
             if (select.distinct)
             {
+                auto same_column = [&](const std::string &a, const std::string &b)
+                {
+                    return CanonicalColumn(a, select, table, join_table) ==
+                           CanonicalColumn(b, select, table, join_table);
+                };
                 bool selected = select.select_star && key->GetType() == ExpressionType::COLUMN_REF;
                 for (const auto &item : select.items)
-                {
-                    selected = selected || item.expr.get() == key ||
-                               (key->GetType() == ExpressionType::COLUMN_REF &&
-                                item.expr->GetType() == ExpressionType::COLUMN_REF &&
-                                static_cast<const ColumnExpression *>(item.expr.get())->name ==
-                                    static_cast<const ColumnExpression *>(key)->name);
-                }
+                    selected = selected || ExpressionsEqual(item.expr.get(), key, same_column);
                 if (!selected)
                     throw std::runtime_error("With SELECT DISTINCT, ORDER BY expressions must appear in the select list");
             }
@@ -769,6 +1003,15 @@ namespace sql
             break;
         case PhysicalPlanType::DISTINCT:
             out << pad << "Distinct";
+            break;
+        case PhysicalPlanType::AGGREGATE:
+            out << pad << "HashAggregate(group=[";
+            for (size_t i = 0; i < node->group_keys.size(); ++i)
+                out << (i ? ", " : "") << ExpressionToSQL(node->group_keys[i]);
+            out << "], aggregates=[";
+            for (size_t i = 0; i < node->aggregates.size(); ++i)
+                out << (i ? ", " : "") << ExpressionToSQL(node->aggregates[i]);
+            out << "])";
             break;
         case PhysicalPlanType::LIMIT:
             out << pad << "Limit(" << (node->limit ? "limit=" + std::to_string(*node->limit) : std::string("no limit"))

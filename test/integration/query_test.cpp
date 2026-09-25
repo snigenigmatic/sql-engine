@@ -1287,4 +1287,254 @@ namespace sql
                   (std::vector<int>{4, 3}));
     }
 
+    // ── Aggregates / GROUP BY / HAVING ────────────────────────────────────────────
+
+    // Each row's values rendered as text, e.g. "oslo|2|55"
+    static std::vector<std::string> Rows(const ExecutionResult &result)
+    {
+        std::vector<std::string> rows;
+        for (const auto &t : result.tuples)
+        {
+            std::string row;
+            for (size_t i = 0; i < t.GetValueCount(); ++i)
+                row += (i ? "|" : "") + t.GetValue(i).ToString();
+            rows.push_back(row);
+        }
+        return rows;
+    }
+
+    static std::string ErrorOf(Catalog &catalog, const std::string &sql)
+    {
+        auto result = RunSQL(catalog, sql);
+        EXPECT_FALSE(result.success) << sql;
+        return result.message;
+    }
+
+    TEST(IntegrationTest, AggregatesOverAnEmptyTable)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE e (a INTEGER, s VARCHAR(5));");
+        // Without GROUP BY there is always one row
+        auto all = RunSQL(catalog, "SELECT COUNT(*), COUNT(a), SUM(a), AVG(a), MIN(s), MAX(a) FROM e;");
+        ASSERT_TRUE(all.success) << all.message;
+        ASSERT_EQ(all.tuples.size(), 1u);
+        EXPECT_EQ(all.tuples[0].GetValue(0).GetAsInt(), 0);
+        EXPECT_EQ(all.tuples[0].GetValue(1).GetAsInt(), 0);
+        for (size_t i = 2; i < 6; ++i)
+            EXPECT_TRUE(all.tuples[0].GetValue(i).IsNull()) << i;
+        EXPECT_EQ(all.column_names,
+                  (std::vector<std::string>{"COUNT(*)", "COUNT(a)", "SUM(a)", "AVG(a)", "MIN(s)", "MAX(a)"}));
+        // ... but no groups means no rows
+        EXPECT_TRUE(RunSQL(catalog, "SELECT a, COUNT(*) FROM e GROUP BY a;").tuples.empty());
+        // HAVING without GROUP BY filters the single group
+        EXPECT_EQ(RunSQL(catalog, "SELECT COUNT(*) FROM e HAVING COUNT(*) > 0;").tuples.size(), 0u);
+        EXPECT_EQ(RunSQL(catalog, "SELECT COUNT(*) FROM e HAVING COUNT(*) = 0;").tuples.size(), 1u);
+    }
+
+    TEST(IntegrationTest, GroupByComputesEachAggregate)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        auto result = RunSQL(catalog, "SELECT city, COUNT(*), COUNT(age), SUM(age), MIN(name), MAX(age) "
+                                      "FROM p GROUP BY city ORDER BY city;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(Rows(result), (std::vector<std::string>{"lima|1|1|41|di|41", "oslo|2|2|55|ann|30",
+                                                          "rome|2|1|25|bo|25"}));
+        // Types: SUM of INTEGER is INTEGER, AVG is FLOAT
+        auto avg = RunSQL(catalog, "SELECT city, AVG(age), SUM(age) FROM p GROUP BY city ORDER BY city;");
+        ASSERT_EQ(avg.tuples.size(), 3u);
+        EXPECT_EQ(avg.tuples[1].GetValue(1).GetType(), DataType::FLOAT);
+        EXPECT_DOUBLE_EQ(avg.tuples[1].GetValue(1).GetAsFloat(), 27.5);
+        EXPECT_EQ(avg.tuples[1].GetValue(2).GetType(), DataType::INTEGER);
+        // SUM of FLOAT is FLOAT
+        RunSQL(catalog, "CREATE TABLE f (x FLOAT);");
+        RunSQL(catalog, "INSERT INTO f VALUES (1.5), (2), (NULL);");
+        auto fsum = RunSQL(catalog, "SELECT SUM(x), AVG(x), COUNT(x) FROM f;");
+        ASSERT_TRUE(fsum.success) << fsum.message;
+        EXPECT_EQ(fsum.tuples[0].GetValue(0).GetType(), DataType::FLOAT);
+        EXPECT_DOUBLE_EQ(fsum.tuples[0].GetValue(0).GetAsFloat(), 3.5);
+        EXPECT_DOUBLE_EQ(fsum.tuples[0].GetValue(1).GetAsFloat(), 1.75);
+        EXPECT_EQ(fsum.tuples[0].GetValue(2).GetAsInt(), 2);
+    }
+
+    TEST(IntegrationTest, AggregatesAndNulls)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        RunSQL(catalog, "INSERT INTO p VALUES (6, 'fi', NULL, NULL), (7, 'gu', NULL, 60);");
+        // NULL keys form one group; all-NULL inputs give NULL (COUNT gives 0)
+        auto result = RunSQL(catalog, "SELECT city, COUNT(*), SUM(age) FROM p WHERE age IS NULL GROUP BY city "
+                                      "ORDER BY city;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(Rows(result), (std::vector<std::string>{"NULL|1|NULL", "rome|1|NULL"}));
+        auto nulls = RunSQL(catalog, "SELECT COUNT(*), COUNT(city), COUNT(age) FROM p WHERE city IS NULL;");
+        EXPECT_EQ(Rows(nulls), (std::vector<std::string>{"2|0|1"}));
+    }
+
+    TEST(IntegrationTest, DistinctAggregates)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        auto result = RunSQL(catalog, "SELECT COUNT(DISTINCT age), SUM(DISTINCT age), COUNT(age), SUM(age), "
+                                      "COUNT(DISTINCT city) FROM p;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(Rows(result), (std::vector<std::string>{"3|96|4|121|3"}));
+    }
+
+    TEST(IntegrationTest, HavingFiltersGroups)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT city FROM p GROUP BY city HAVING COUNT(*) > 1 ORDER BY city;")),
+                  (std::vector<std::string>{"oslo", "rome"}));
+        // An aggregate only in HAVING, and an alias in HAVING
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT city FROM p GROUP BY city HAVING MAX(age) >= 30 ORDER BY city;")),
+                  (std::vector<std::string>{"lima", "oslo"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT city, SUM(age) AS total FROM p GROUP BY city HAVING total < 50 "
+                                       "ORDER BY city;")),
+                  (std::vector<std::string>{"lima|41", "rome|25"}));
+        // A group key in HAVING, and WHERE applied before grouping
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT city, COUNT(*) FROM p WHERE age < 40 GROUP BY city "
+                                       "HAVING city <> 'lima' ORDER BY city;")),
+                  (std::vector<std::string>{"oslo|2", "rome|1"}));
+    }
+
+    TEST(IntegrationTest, OrderByAggregatesAndLimit)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT city, SUM(age) FROM p GROUP BY city ORDER BY SUM(age) DESC;")),
+                  (std::vector<std::string>{"oslo|55", "lima|41", "rome|25"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT city, MIN(age) AS youngest FROM p GROUP BY city "
+                                       "ORDER BY youngest, city DESC LIMIT 2;")),
+                  (std::vector<std::string>{"rome|25", "oslo|25"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT city, COUNT(*) FROM p GROUP BY city ORDER BY 2 DESC, 1 LIMIT 1;")),
+                  (std::vector<std::string>{"oslo|2"}));
+        // An aggregate that is not selected can order the groups
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT city FROM p GROUP BY city ORDER BY MAX(age) DESC;")),
+                  (std::vector<std::string>{"lima", "oslo", "rome"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT DISTINCT COUNT(*) FROM p GROUP BY city ORDER BY COUNT(*);")),
+                  (std::vector<std::string>{"1", "2"}));
+    }
+
+    TEST(IntegrationTest, ExpressionsOverGroupsAndAggregates)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        auto result = RunSQL(catalog, "SELECT city, SUM(age) * 2, MAX(age) - MIN(age) AS spread, "
+                                      "SUM(age) / COUNT(*) FROM p WHERE age IS NOT NULL GROUP BY city ORDER BY city;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(result.column_names,
+                  (std::vector<std::string>{"city", "SUM(age) * 2", "spread", "SUM(age) / COUNT(*)"}));
+        EXPECT_EQ(Rows(result), (std::vector<std::string>{"lima|82|0|41", "oslo|110|5|27", "rome|50|0|25"}));
+        // Expressions of group keys
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT age + 1, COUNT(*) FROM p GROUP BY age ORDER BY age;")),
+                  (std::vector<std::string>{"NULL|1", "26|2", "31|1", "42|1"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT age / 10, COUNT(*) FROM p WHERE age > 0 GROUP BY age / 10 "
+                                       "ORDER BY 1;")),
+                  (std::vector<std::string>{"2|2", "3|1", "4|1"}));
+        // A qualified name is the same column
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT p.city, COUNT(*) FROM p GROUP BY city ORDER BY city LIMIT 1;")),
+                  (std::vector<std::string>{"lima|1"}));
+    }
+
+    TEST(IntegrationTest, GroupByPositionAndAlias)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT city, COUNT(*) FROM p GROUP BY 1 ORDER BY 1;")),
+                  (std::vector<std::string>{"lima|1", "oslo|2", "rome|2"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT age / 10 AS decade, COUNT(*) FROM p WHERE age > 0 GROUP BY decade "
+                                       "ORDER BY decade;")),
+                  (std::vector<std::string>{"2|2", "3|1", "4|1"}));
+        // A real column wins over an alias of the same name
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT COUNT(*) AS city FROM p GROUP BY city ORDER BY 1;")),
+                  (std::vector<std::string>{"1", "2", "2"}));
+        EXPECT_NE(ErrorOf(catalog, "SELECT city FROM p GROUP BY 2;").find("out of range"), std::string::npos);
+        EXPECT_EQ(ErrorOf(catalog, "SELECT COUNT(*) FROM p GROUP BY 1;"), "Aggregate functions are not allowed in GROUP BY");
+    }
+
+    TEST(IntegrationTest, AggregateOverAJoin)
+    {
+        Catalog catalog;
+        CreateOrdersAndCustomers(catalog);
+        auto result = RunSQL(catalog, "SELECT customers.name, COUNT(*), SUM(oid) FROM orders "
+                                      "JOIN customers ON orders.cid = customers.id GROUP BY customers.name "
+                                      "ORDER BY name;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(Rows(result), (std::vector<std::string>{"NULL|1|4", "Alice|2|4", "Bob|1|2"}));
+        auto explain = RunSQL(catalog, "EXPLAIN SELECT cid, COUNT(*) FROM orders GROUP BY cid "
+                                       "HAVING COUNT(*) > 1 ORDER BY cid;");
+        ASSERT_TRUE(explain.success) << explain.message;
+        const size_t aggregate = explain.message.find("HashAggregate(group=[cid], aggregates=[COUNT(*)])");
+        ASSERT_NE(aggregate, std::string::npos) << explain.message;
+        EXPECT_LT(explain.message.find("Filter"), aggregate) << explain.message; // HAVING above it
+        EXPECT_LT(explain.message.find("Sort(keys=[cid])"), explain.message.find("Filter")) << explain.message;
+    }
+
+    TEST(IntegrationTest, AggregateOverManyRows)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE big (id INTEGER, grp INTEGER, v INTEGER);");
+        std::string insert = "INSERT INTO big VALUES ";
+        for (int i = 0; i < 1000; ++i)
+            insert += (i ? ", (" : "(") + std::to_string(i) + ", " + std::to_string(i % 10) + ", " +
+                      std::to_string(i) + ")";
+        ASSERT_TRUE(RunSQL(catalog, insert + ";").success);
+        auto result = RunSQL(catalog, "SELECT grp, COUNT(*), SUM(v), MIN(v), MAX(v) FROM big GROUP BY grp "
+                                      "ORDER BY grp;");
+        ASSERT_TRUE(result.success) << result.message;
+        ASSERT_EQ(result.tuples.size(), 10u);
+        for (int g = 0; g < 10; ++g)
+        {
+            // v = g, g + 10, ..., g + 990
+            EXPECT_EQ(Rows(result)[static_cast<size_t>(g)],
+                      std::to_string(g) + "|100|" + std::to_string(100 * g + 49500) + "|" + std::to_string(g) + "|" +
+                          std::to_string(g + 990));
+        }
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT COUNT(*), SUM(v) FROM big;")), (std::vector<std::string>{"1000|499500"}));
+    }
+
+    TEST(IntegrationTest, AggregateErrors)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        EXPECT_NE(ErrorOf(catalog, "SELECT name, COUNT(*) FROM p;").find("must appear in the GROUP BY clause"),
+                  std::string::npos);
+        EXPECT_NE(ErrorOf(catalog, "SELECT name FROM p GROUP BY city;").find("'name'"), std::string::npos);
+        EXPECT_NE(ErrorOf(catalog, "SELECT city FROM p GROUP BY city HAVING age > 1;").find("'age'"),
+                  std::string::npos);
+        EXPECT_NE(ErrorOf(catalog, "SELECT city FROM p GROUP BY city ORDER BY age;").find("'age'"), std::string::npos);
+        EXPECT_NE(ErrorOf(catalog, "SELECT age + 1 FROM p GROUP BY age + 2;").find("'age'"), std::string::npos);
+        EXPECT_EQ(ErrorOf(catalog, "SELECT COUNT(*) FROM p WHERE COUNT(*) > 1;"),
+                  "Aggregate functions are not allowed in WHERE");
+        EXPECT_EQ(ErrorOf(catalog, "SELECT COUNT(*) FROM p GROUP BY COUNT(*);"),
+                  "Aggregate functions are not allowed in GROUP BY");
+        EXPECT_EQ(ErrorOf(catalog, "SELECT SUM(MAX(age)) FROM p;"), "Aggregate function calls cannot be nested");
+        EXPECT_NE(ErrorOf(catalog, "SELECT * FROM p GROUP BY city;").find("SELECT *"), std::string::npos);
+        EXPECT_NE(ErrorOf(catalog, "SELECT SUM(name) FROM p;").find("SUM requires numeric values"),
+                  std::string::npos);
+        EXPECT_EQ(ErrorOf(catalog, "UPDATE p SET age = COUNT(*);"), "Misuse of aggregate function COUNT()");
+        EXPECT_EQ(ErrorOf(catalog, "INSERT INTO p VALUES (9, 'x', 'y', MAX(1));"), "Misuse of aggregate function MAX()");
+        EXPECT_EQ(ErrorOf(catalog, "DELETE FROM p WHERE COUNT(*) > 0;"), "Misuse of aggregate function COUNT()");
+        EXPECT_EQ(RunSQL(catalog, "SELECT COUNT(*) FROM p;").tuples.at(0).GetValue(0).GetAsInt(), 5); // unchanged
+        // SUM must fit in INTEGER; the running total may go out of range and back
+        RunSQL(catalog, "CREATE TABLE n (v INTEGER);");
+        RunSQL(catalog, "INSERT INTO n VALUES (2147483647), (1);");
+        EXPECT_EQ(ErrorOf(catalog, "SELECT SUM(v) FROM n;"), "Integer overflow");
+        RunSQL(catalog, "INSERT INTO n VALUES (-10);");
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT SUM(v), MAX(v) FROM n;")),
+                  (std::vector<std::string>{"2147483638|2147483647"}));
+    }
+
+    TEST(IntegrationTest, DistinctComparesSelectedExpressions)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT DISTINCT age + 1 FROM p ORDER BY age + 1 DESC;")),
+                  (std::vector<std::string>{"42", "31", "26", "NULL"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT DISTINCT p.city FROM p ORDER BY city;")),
+                  (std::vector<std::string>{"lima", "oslo", "rome"}));
+    }
+
 } // namespace sql
