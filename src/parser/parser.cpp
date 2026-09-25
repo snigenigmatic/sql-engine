@@ -55,6 +55,10 @@ namespace sql
             return ParseDropTable();
         case TokenType::EXPLAIN:
             return ParseExplain();
+        case TokenType::BEGIN:
+        case TokenType::COMMIT:
+        case TokenType::ROLLBACK:
+            return ParseTransaction();
         default:
             throw std::runtime_error("Unexpected token at start of statement: " + current_token_.value);
         }
@@ -257,6 +261,23 @@ namespace sql
 
         Expect(TokenType::SEMICOLON);
         return stmt;
+    }
+
+    std::unique_ptr<TransactionStatement> Parser::ParseTransaction()
+    {
+        TransactionStatement::Kind kind;
+        if (Match(TokenType::BEGIN))
+            kind = TransactionStatement::Kind::BEGIN;
+        else if (Match(TokenType::COMMIT))
+            kind = TransactionStatement::Kind::COMMIT;
+        else
+        {
+            Expect(TokenType::ROLLBACK);
+            kind = TransactionStatement::Kind::ROLLBACK;
+        }
+        Match(TokenType::TRANSACTION); // optional
+        Expect(TokenType::SEMICOLON);
+        return std::make_unique<TransactionStatement>(kind);
     }
 
     std::unique_ptr<DropTableStatement> Parser::ParseDropTable()

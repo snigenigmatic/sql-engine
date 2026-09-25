@@ -518,4 +518,32 @@ namespace sql
         EXPECT_NE(explain.find("SeqScan(table=orders)"), std::string::npos);
     }
 
+    TEST(ParserTest, ParseTransactionStatements)
+    {
+        const std::vector<std::pair<std::string, TransactionStatement::Kind>> cases = {
+            {"BEGIN;", TransactionStatement::Kind::BEGIN},
+            {"begin transaction;", TransactionStatement::Kind::BEGIN},
+            {"COMMIT;", TransactionStatement::Kind::COMMIT},
+            {"COMMIT TRANSACTION;", TransactionStatement::Kind::COMMIT},
+            {"ROLLBACK;", TransactionStatement::Kind::ROLLBACK},
+            {"Rollback Transaction;", TransactionStatement::Kind::ROLLBACK},
+        };
+        for (const auto &[sql, kind] : cases)
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            ASSERT_NE(stmt, nullptr) << sql;
+            ASSERT_EQ(stmt->GetType(), StatementType::TRANSACTION_STMT) << sql;
+            EXPECT_EQ(static_cast<TransactionStatement *>(stmt.get())->kind, kind) << sql;
+        }
+    }
+
+    TEST(ParserTest, ParseTransactionRejectsTrailingTokens)
+    {
+        Lexer lexer("BEGIN WORK;");
+        Parser parser(lexer);
+        EXPECT_THROW(parser.ParseStatement(), std::runtime_error);
+    }
+
 } // namespace sql

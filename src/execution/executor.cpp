@@ -260,6 +260,8 @@ namespace sql
             return ExecuteDropTable(static_cast<DropTableStatement *>(stmt));
         case StatementType::EXPLAIN_STMT:
             return ExecuteExplain(static_cast<ExplainStatement *>(stmt));
+        case StatementType::TRANSACTION_STMT:
+            return {false, "BEGIN / COMMIT / ROLLBACK must be run through a Session", {}, {}};
         default:
             return {false, "Unsupported statement type", {}, {}};
         }

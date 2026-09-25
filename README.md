@@ -17,10 +17,10 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Crash safety: a write-ahead log makes every statement atomic and durable; committed work is recovered after a crash, anything uncommitted is discarded
 - Interactive REPL
 
+- Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, with statement-level rollback inside a transaction
+
 ### Planned
-- JOIN operations
-- Transaction support (ACID)
-- Query optimizer
+- SQL coverage: NULL semantics, constraints, expressions in SELECT, `ORDER BY` / `LIMIT`, aggregates and `GROUP BY`, outer and multi-way joins (see [docs/roadmap.md](docs/roadmap.md))
 
 ## Building
 
@@ -108,6 +108,12 @@ SELECT name, age FROM users;
 UPDATE users SET age = 99 WHERE id = 1;
 DELETE FROM users WHERE id = 2;
 
+-- Transactions
+BEGIN;
+UPDATE users SET age = 26 WHERE id = 1;
+DELETE FROM users WHERE id = 1;
+ROLLBACK;   -- or COMMIT;
+
 -- Indexes
 CREATE INDEX idx_id ON users (id);
 SELECT * FROM users WHERE id = 1;    -- uses index point lookup
@@ -152,7 +158,7 @@ ctest --test-dir build --output-on-failure --verbose
   - [x] Add correctness checks (ambiguous columns, swapped `ON` sides, type-mismatch safety)
   - [x] Add `EXPLAIN` command in REPL to print physical plan (`SeqScan`/`IndexScan`/`Join` path)
   - [x] Add join-condition index matching (`IndexNestedLoopJoin` when index exists on join column)
-- [ ] **Phase 6**: Transactions
+- [x] **Phase 6**: Transactions (see M5 and M6 below)
 
 The path to a fully working embedded database (page storage, WAL, transactions, SQL coverage) is tracked in [docs/roadmap.md](docs/roadmap.md).
 - [x] **M1**: Page layer, single-file `Pager`, LRU `BufferPoolManager` with RAII `PageGuard`
@@ -160,6 +166,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
 - [x] **M3**: Persistent catalog in the database file; REPL opens `sqlengine <file.db>` (replaces `.sqlengine/` text snapshots)
 - [x] **M4**: On-disk B+tree indexes keyed by (value, RID), maintained incrementally
 - [x] **M5**: Write-ahead log with crash recovery, checkpoints, and atomic per-statement commit/rollback
+- [x] **M6**: `BEGIN` / `COMMIT` / `ROLLBACK` with savepoint-based statement rollback (single connection, so serializable)
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture
