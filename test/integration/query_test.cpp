@@ -959,7 +959,7 @@ namespace sql
 
         auto bad = RunSQL(catalog, "INSERT INTO t VALUES (1.0, 2.5);");
         EXPECT_FALSE(bad.success);
-        EXPECT_NE(bad.message.find("INTEGER column 'i'"), std::string::npos) << bad.message;
+        EXPECT_NE(bad.message.find("INTEGER column t.i"), std::string::npos) << bad.message;
         EXPECT_FALSE(RunSQL(catalog, "UPDATE t SET i = 3.5;").success);
         ASSERT_TRUE(RunSQL(catalog, "UPDATE t SET f = 7;").success);
         EXPECT_EQ(RunSQL(catalog, "SELECT f FROM t;").tuples.at(0).GetValue(0).GetType(), DataType::FLOAT);
@@ -967,6 +967,145 @@ namespace sql
         // An index on the FLOAT column finds a row written with an integer
         RunSQL(catalog, "CREATE INDEX idx_f ON t (f);");
         EXPECT_EQ(RunSQL(catalog, "SELECT * FROM t WHERE f = 7.0;").tuples.size(), 1u);
+    }
+
+    // ── Constraints ───────────────────────────────────────────────────────────────
+
+    TEST(IntegrationTest, PrimaryKeyRejectsDuplicatesAndNulls)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(RunSQL(catalog, "CREATE TABLE t (id INTEGER PRIMARY KEY, name VARCHAR(10));").success);
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO t VALUES (1, 'a'), (2, 'b');").success);
+
+        auto dup = RunSQL(catalog, "INSERT INTO t VALUES (1, 'again');");
+        EXPECT_FALSE(dup.success);
+        EXPECT_EQ(dup.message, "UNIQUE constraint failed: t.id");
+        auto null_key = RunSQL(catalog, "INSERT INTO t VALUES (NULL, 'x');");
+        EXPECT_FALSE(null_key.success);
+        EXPECT_EQ(null_key.message, "NOT NULL constraint failed: t.id");
+
+        // Updating a key onto another row's key fails; keeping it is fine
+        EXPECT_FALSE(RunSQL(catalog, "UPDATE t SET id = 2 WHERE id = 1;").success);
+        EXPECT_TRUE(RunSQL(catalog, "UPDATE t SET name = 'z' WHERE id = 1;").success);
+        EXPECT_TRUE(RunSQL(catalog, "UPDATE t SET id = 3 WHERE id = 1;").success);
+        // A deleted key can be reused
+        RunSQL(catalog, "DELETE FROM t WHERE id = 2;");
+        EXPECT_TRUE(RunSQL(catalog, "INSERT INTO t VALUES (2, 'back');").success);
+
+        auto explain = RunSQL(catalog, "EXPLAIN SELECT * FROM t WHERE id = 3;");
+        EXPECT_NE(explain.message.find("IndexScan"), std::string::npos) << explain.message;
+    }
+
+    TEST(IntegrationTest, UniqueAllowsManyNulls)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, code VARCHAR(5) UNIQUE);");
+        EXPECT_TRUE(RunSQL(catalog, "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, 'x');").success);
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t VALUES (4, 'x');").success);
+        EXPECT_EQ(RunSQL(catalog, "SELECT * FROM t;").tuples.size(), 3u);
+    }
+
+    TEST(IntegrationTest, NotNullOnInsertAndUpdate)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, name VARCHAR(10) NOT NULL);");
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t VALUES (1, NULL);").success);
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t (id) VALUES (1);").success); // no default
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO t VALUES (1, 'a');").success);
+        EXPECT_FALSE(RunSQL(catalog, "UPDATE t SET name = NULL;").success);
+    }
+
+    TEST(IntegrationTest, DefaultsFillOmittedColumns)
+    {
+        Catalog catalog;
+        ASSERT_TRUE(RunSQL(catalog, "CREATE TABLE t (id INTEGER, qty INTEGER NOT NULL DEFAULT 1, "
+                                    "price FLOAT DEFAULT 2, note VARCHAR(10) DEFAULT NULL, flag BOOLEAN DEFAULT TRUE);")
+                        .success);
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO t (id) VALUES (7);").success);
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO t (note, id) VALUES ('hi', 8);").success);
+        auto rows = RunSQL(catalog, "SELECT * FROM t;");
+        ASSERT_EQ(rows.tuples.size(), 2u);
+        const Tuple &first = rows.tuples[0];
+        EXPECT_EQ(first.GetValue(1).GetAsInt(), 1);
+        EXPECT_EQ(first.GetValue(2).GetType(), DataType::FLOAT); // DEFAULT 2 stored as 2.0
+        EXPECT_DOUBLE_EQ(first.GetValue(2).GetAsFloat(), 2.0);
+        EXPECT_TRUE(first.GetValue(3).IsNull());
+        EXPECT_TRUE(first.GetValue(4).GetAsBool());
+        EXPECT_EQ(rows.tuples[1].GetValue(3).GetAsString(), "hi");
+    }
+
+    TEST(IntegrationTest, InvalidTableDefinitionsAreRejected)
+    {
+        Catalog catalog;
+        for (const char *sql : {"CREATE TABLE t (id INTEGER DEFAULT 'abc');",
+                                "CREATE TABLE t (id INTEGER NOT NULL DEFAULT NULL);",
+                                "CREATE TABLE t (s VARCHAR(2) DEFAULT 'abc');",
+                                "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY);",
+                                "CREATE TABLE t (a INTEGER, a VARCHAR(5));"})
+        {
+            EXPECT_FALSE(RunSQL(catalog, sql).success) << sql;
+            EXPECT_FALSE(catalog.TableExists("t")) << sql;
+        }
+    }
+
+    TEST(IntegrationTest, ValuesMustMatchColumnTypes)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (i INTEGER, b BOOLEAN, s VARCHAR(3));");
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t VALUES ('one', TRUE, 'a');").success);
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t VALUES (1, 1, 'a');").success);
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t VALUES (1, TRUE, 5);").success);
+        auto too_long = RunSQL(catalog, "INSERT INTO t VALUES (1, TRUE, 'abcd');");
+        EXPECT_FALSE(too_long.success);
+        EXPECT_EQ(too_long.message, "Value too long for VARCHAR(3) column t.s");
+        EXPECT_TRUE(RunSQL(catalog, "INSERT INTO t VALUES (1, TRUE, 'abc');").success);
+        EXPECT_FALSE(RunSQL(catalog, "UPDATE t SET b = 'yes';").success);
+    }
+
+    TEST(IntegrationTest, InsertColumnListErrors)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (a INTEGER, b INTEGER);");
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t (a, zzz) VALUES (1, 2);").success);
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t (a, a) VALUES (1, 2);").success);
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t (a, b) VALUES (1);").success);
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO t (b, a) VALUES (1, 2);").success);
+        auto row = RunSQL(catalog, "SELECT a, b FROM t;").tuples.at(0);
+        EXPECT_EQ(row.GetValue(0).GetAsInt(), 2);
+        EXPECT_EQ(row.GetValue(1).GetAsInt(), 1);
+    }
+
+    TEST(IntegrationTest, CreateUniqueIndex)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER, code VARCHAR(5));");
+        RunSQL(catalog, "INSERT INTO t VALUES (1, 'a'), (2, 'a');");
+        auto dup = RunSQL(catalog, "CREATE UNIQUE INDEX idx_code ON t (code);");
+        EXPECT_FALSE(dup.success);
+        EXPECT_NE(dup.message.find("duplicate value a"), std::string::npos) << dup.message;
+        EXPECT_EQ(catalog.GetIndex("t", "code"), nullptr);
+
+        RunSQL(catalog, "UPDATE t SET code = 'b' WHERE id = 2;");
+        ASSERT_TRUE(RunSQL(catalog, "CREATE UNIQUE INDEX idx_code ON t (code);").success);
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t VALUES (3, 'a');").success);
+        EXPECT_FALSE(RunSQL(catalog, "UPDATE t SET code = 'a' WHERE id = 2;").success);
+    }
+
+    TEST(IntegrationTest, ReservedIndexNamesAndConstraintIndexLifecycle)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE);");
+        EXPECT_FALSE(RunSQL(catalog, "CREATE INDEX __mine ON t (u);").success);
+        ASSERT_NE(catalog.GetIndex("t", "id"), nullptr);
+        ASSERT_NE(catalog.GetIndex("t", "u"), nullptr);
+
+        // Dropping the table drops its constraint indexes; the table can be
+        // recreated
+        ASSERT_TRUE(RunSQL(catalog, "DROP TABLE t;").success);
+        EXPECT_EQ(catalog.GetIndex("t", "id"), nullptr);
+        EXPECT_TRUE(RunSQL(catalog, "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE);").success);
+        EXPECT_TRUE(RunSQL(catalog, "INSERT INTO t VALUES (1, 1);").success);
+        EXPECT_FALSE(RunSQL(catalog, "INSERT INTO t VALUES (1, 2);").success);
     }
 
 } // namespace sql

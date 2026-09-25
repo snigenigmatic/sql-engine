@@ -11,7 +11,38 @@ namespace sql
         constexpr const char *TYPE_TABLE = "table";
         constexpr const char *TYPE_INDEX = "index";
 
-        // Schema definition text: "name:type:length,name:type:length,..."
+        // Schema definition text, one entry per column separated by ',':
+        //   name:type:length                         (written by older versions)
+        //   name:type:length:flags:default_hex
+        // flags: 1 = NOT NULL, 2 = PRIMARY KEY, 4 = UNIQUE. default_hex is
+        // the default value's binary encoding in hex (empty = no default),
+        // which keeps arbitrary strings clear of the separators.
+        constexpr int FLAG_NOT_NULL = 1;
+        constexpr int FLAG_PRIMARY_KEY = 2;
+        constexpr int FLAG_UNIQUE = 4;
+
+        std::string ToHex(const std::string &bytes)
+        {
+            static const char *digits = "0123456789abcdef";
+            std::string out;
+            for (unsigned char c : bytes)
+            {
+                out += digits[c >> 4];
+                out += digits[c & 15];
+            }
+            return out;
+        }
+
+        std::string FromHex(const std::string &hex)
+        {
+            if (hex.size() % 2 != 0)
+                throw std::runtime_error("Corrupt default value in schema");
+            std::string out;
+            for (size_t i = 0; i < hex.size(); i += 2)
+                out += static_cast<char>(std::stoi(hex.substr(i, 2), nullptr, 16));
+            return out;
+        }
+
         std::string EncodeSchema(const Schema &schema)
         {
             std::string out;
@@ -19,8 +50,13 @@ namespace sql
             {
                 if (!out.empty())
                     out += ",";
+                const int flags = (col.not_null ? FLAG_NOT_NULL : 0) | (col.primary_key ? FLAG_PRIMARY_KEY : 0) |
+                                  (col.unique ? FLAG_UNIQUE : 0);
+                std::string default_bytes;
+                if (col.default_value)
+                    col.default_value->SerializeTo(&default_bytes);
                 out += col.name + ":" + std::to_string(static_cast<int>(col.type)) + ":" +
-                       std::to_string(col.length);
+                       std::to_string(col.length) + ":" + std::to_string(flags) + ":" + ToHex(default_bytes);
             }
             return out;
         }
@@ -32,19 +68,54 @@ namespace sql
             std::string item;
             while (std::getline(ss, item, ','))
             {
-                const size_t a = item.find(':');
-                const size_t b = item.find(':', a == std::string::npos ? a : a + 1);
-                if (a == std::string::npos || b == std::string::npos || a == 0)
+                std::vector<std::string> fields;
+                std::stringstream fs(item);
+                std::string field;
+                while (std::getline(fs, field, ':'))
+                    fields.push_back(field);
+                if (item.back() == ':')
+                    fields.push_back(""); // empty default
+                if ((fields.size() != 3 && fields.size() != 5) || fields[0].empty())
                     throw std::runtime_error("Corrupt table schema: " + text);
-                const int type = std::stoi(item.substr(a + 1, b - a - 1));
+
+                const int type = std::stoi(fields[1]);
                 if (type < 0 || type > static_cast<int>(DataType::BOOLEAN))
                     throw std::runtime_error("Corrupt column type in schema: " + text);
-                columns.emplace_back(item.substr(0, a), static_cast<DataType>(type),
-                                     std::stoi(item.substr(b + 1)));
+                Column column(fields[0], static_cast<DataType>(type), std::stoi(fields[2]));
+                if (fields.size() == 5)
+                {
+                    const int flags = std::stoi(fields[3]);
+                    column.not_null = (flags & FLAG_NOT_NULL) != 0;
+                    column.primary_key = (flags & FLAG_PRIMARY_KEY) != 0;
+                    column.unique = (flags & FLAG_UNIQUE) != 0;
+                    if (!fields[4].empty())
+                    {
+                        const std::string bytes = FromHex(fields[4]);
+                        const char *cursor = bytes.data();
+                        Value value;
+                        if (!Value::DeserializeFrom(&cursor, bytes.data() + bytes.size(), &value))
+                            throw std::runtime_error("Corrupt default value in schema: " + text);
+                        column.default_value = value;
+                    }
+                }
+                columns.push_back(std::move(column));
             }
             if (columns.empty())
                 throw std::runtime_error("Corrupt table schema: " + text);
             return Schema(std::move(columns));
+        }
+
+        // Index definition text: the column, plus ":unique" for a unique index
+        std::string EncodeIndexDefinition(const std::string &column, bool unique)
+        {
+            return unique ? column + ":unique" : column;
+        }
+
+        void DecodeIndexDefinition(const std::string &text, std::string *column, bool *unique)
+        {
+            const size_t colon = text.find(':');
+            *column = text.substr(0, colon);
+            *unique = colon != std::string::npos && text.substr(colon + 1) == "unique";
         }
 
         std::string SchemaKey(const std::string &type, const std::string &name)
@@ -133,16 +204,20 @@ namespace sql
 
         for (const auto &def : index_defs)
         {
+            std::string column;
+            bool unique = false;
+            DecodeIndexDefinition(def.column, &column, &unique);
             Table *table = GetTable(def.table);
-            const int col_idx = table ? table->GetColumnIndex(def.column) : -1;
+            const int col_idx = table ? table->GetColumnIndex(column) : -1;
             if (col_idx < 0)
-                throw std::runtime_error("Index " + def.name + " refers to missing " + def.table + "." + def.column);
+                throw std::runtime_error("Index " + def.name + " refers to missing " + def.table + "." + column);
 
             auto index = std::make_unique<IndexInfo>();
             index->name = def.name;
             index->table = def.table;
-            index->column = def.column;
+            index->column = column;
             index->column_index = col_idx;
+            index->unique = unique;
             if (def.root_page != INVALID_PAGE_ID)
             {
                 index->tree = std::make_unique<BTree>(bpm_, def.root_page);
@@ -153,7 +228,8 @@ namespace sql
                 // and record its root
                 PopulateIndex(table, index.get());
                 DeleteSchemaRow(TYPE_INDEX, def.name);
-                InsertSchemaRow(TYPE_INDEX, def.name, def.table, index->tree->GetRootPageId(), def.column);
+                InsertSchemaRow(TYPE_INDEX, def.name, def.table, index->tree->GetRootPageId(),
+                                EncodeIndexDefinition(column, unique));
             }
             indexes_[def.name] = std::move(index);
         }
@@ -186,8 +262,13 @@ namespace sql
             for (auto it = table->begin(); it != table->end(); ++it)
             {
                 const Value &value = it->GetValue(static_cast<size_t>(index->column_index));
-                if (!value.IsNull()) // NULLs are not indexed
-                    index->tree->Insert(value, it.GetRID());
+                if (value.IsNull()) // NULLs are not indexed
+                    continue;
+                if (index->unique && !index->tree->Search(value).empty())
+                    throw std::invalid_argument("Cannot create unique index '" + index->name + "': " +
+                                                index->table + "." + index->column + " has duplicate value " +
+                                                value.ToString());
+                index->tree->Insert(value, it.GetRID());
             }
         }
         catch (...)
@@ -205,6 +286,23 @@ namespace sql
             const Value &value = tuple.GetValue(static_cast<size_t>(index->column_index));
             if (!value.IsNull())
                 BTree::CheckKey(value);
+        }
+    }
+
+    void Catalog::CheckUnique(const std::vector<IndexInfo *> &indexes, const Tuple &tuple, const RID *self) const
+    {
+        for (const IndexInfo *index : indexes)
+        {
+            if (!index->unique)
+                continue;
+            const Value &value = tuple.GetValue(static_cast<size_t>(index->column_index));
+            if (value.IsNull()) // any number of NULLs is allowed
+                continue;
+            for (const RID &existing : index->tree->Search(value))
+            {
+                if (self == nullptr || existing != *self)
+                    throw std::runtime_error("UNIQUE constraint failed: " + index->table + "." + index->column);
+            }
         }
     }
 
@@ -267,6 +365,7 @@ namespace sql
     {
         auto indexes = GetTableIndexes(table->GetName());
         CheckIndexKeys(indexes, tuple);
+        CheckUnique(indexes, tuple, nullptr);
         RID rid = table->Insert(tuple);
 
         std::vector<IndexEntry> inserted;
@@ -334,6 +433,7 @@ namespace sql
             return false;
         auto indexes = GetTableIndexes(table->GetName());
         CheckIndexKeys(indexes, tuple);
+        CheckUnique(indexes, tuple, &rid);
 
         // 1. Remove the old entries, then 2. rewrite the row (it may move)
         std::vector<IndexEntry> removed;
@@ -412,6 +512,15 @@ namespace sql
         const page_id_t root = heap->GetFirstPageId();
         tables_[name] = std::make_unique<Table>(name, schema, std::move(heap));
         InsertSchemaRow(TYPE_TABLE, name, name, root, EncodeSchema(schema));
+
+        // PRIMARY KEY and UNIQUE are enforced (and served) by unique indexes
+        for (const auto &col : schema.GetColumns())
+        {
+            if (col.primary_key)
+                CreateIndexInternal(std::string(RESERVED_PREFIX) + "pk_" + name, name, col.name, true);
+            else if (col.unique)
+                CreateIndexInternal(std::string(RESERVED_PREFIX) + "uq_" + name + "_" + col.name, name, col.name, true);
+        }
         return true;
     }
 
@@ -471,7 +580,18 @@ namespace sql
     }
 
     bool Catalog::CreateIndex(const std::string &index_name, const std::string &table_name,
-                              const std::string &column_name)
+                              const std::string &column_name, bool unique)
+    {
+        if (index_name.rfind(RESERVED_PREFIX, 0) == 0)
+        {
+            throw std::invalid_argument("Index name '" + index_name + "' is reserved (names may not start with '" +
+                                        RESERVED_PREFIX + "')");
+        }
+        return CreateIndexInternal(index_name, table_name, column_name, unique);
+    }
+
+    bool Catalog::CreateIndexInternal(const std::string &index_name, const std::string &table_name,
+                                      const std::string &column_name, bool unique)
     {
         if (indexes_.count(index_name))
             return false; // index name already taken
@@ -489,9 +609,11 @@ namespace sql
         index->table = table_name;
         index->column = column_name;
         index->column_index = col_idx;
+        index->unique = unique;
         PopulateIndex(table, index.get());
 
-        InsertSchemaRow(TYPE_INDEX, index_name, table_name, index->tree->GetRootPageId(), column_name);
+        InsertSchemaRow(TYPE_INDEX, index_name, table_name, index->tree->GetRootPageId(),
+                        EncodeIndexDefinition(column_name, unique));
         indexes_[index_name] = std::move(index);
         return true;
     }

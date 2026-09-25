@@ -18,16 +18,28 @@ namespace sql
         }
     } // namespace
 
-    Value Executor::CoerceToColumn(const Value &value, const Column &column)
+    Value Executor::CoerceToColumn(const Value &value, const Column &column, const std::string &table)
     {
-        // A bare NULL takes the column's type
+        const std::string where = table + "." + column.name;
         if (value.IsNull())
-            return Value(column.type);
+        {
+            if (column.not_null || column.primary_key)
+                throw std::runtime_error("NOT NULL constraint failed: " + where);
+            return Value(column.type); // a bare NULL takes the column's type
+        }
+
         // Numbers are stored as the column's numeric type, so a column (and
         // any index on it) holds one type
         std::optional<Value> converted = ConvertNumber(value, column.type);
         if (!converted)
-            throw std::runtime_error("Cannot store " + value.ToString() + " in INTEGER column '" + column.name + "'");
+            throw std::runtime_error("Cannot store " + value.ToString() + " in INTEGER column " + where);
+        if (converted->GetType() != column.type)
+            throw std::runtime_error("Type mismatch: cannot store " + value.ToString() + " in " +
+                                     DataTypeName(column.type) + " column " + where);
+        if (column.type == DataType::VARCHAR && column.length > 0 &&
+            converted->GetAsString().size() > static_cast<size_t>(column.length))
+            throw std::runtime_error("Value too long for VARCHAR(" + std::to_string(column.length) +
+                                     ") column " + where);
         return *converted;
     }
 
@@ -504,6 +516,7 @@ namespace sql
         try
         {
             std::vector<Column> columns;
+            size_t primary_keys = 0;
             for (const auto &cd : create->columns)
             {
                 DataType dt;
@@ -524,7 +537,30 @@ namespace sql
                 default:
                     throw std::runtime_error("Unknown column type");
                 }
-                columns.emplace_back(cd.name, dt, cd.length);
+                for (const auto &existing : columns)
+                {
+                    if (existing.name == cd.name)
+                        throw std::runtime_error("Duplicate column name: " + cd.name);
+                }
+                Column column(cd.name, dt, cd.length);
+                column.primary_key = cd.primary_key;
+                column.not_null = cd.not_null || cd.primary_key;
+                column.unique = cd.unique || cd.primary_key;
+                if (cd.primary_key && ++primary_keys > 1)
+                    throw std::runtime_error("Table '" + create->table + "' has more than one PRIMARY KEY");
+                if (cd.default_value)
+                {
+                    // Store the default as the column will store it
+                    try
+                    {
+                        column.default_value = CoerceToColumn(*cd.default_value, column, create->table);
+                    }
+                    catch (const std::exception &e)
+                    {
+                        throw std::runtime_error("Invalid DEFAULT for column " + cd.name + ": " + e.what());
+                    }
+                }
+                columns.push_back(std::move(column));
             }
 
             Schema schema(columns);
@@ -554,22 +590,51 @@ namespace sql
             Table *table = catalog_->GetTable(insert->table);
             if (!table)
                 throw std::runtime_error("Table not found: " + insert->table);
+            const Schema &schema = table->GetSchema();
+            const size_t col_count = schema.GetColumnCount();
 
-            size_t col_count = table->GetSchema().GetColumnCount();
+            // Which table column each VALUES position fills
+            std::vector<size_t> targets;
+            if (insert->columns.empty())
+            {
+                for (size_t c = 0; c < col_count; ++c)
+                    targets.push_back(c);
+            }
+            else
+            {
+                std::vector<bool> seen(col_count, false);
+                for (const auto &name : insert->columns)
+                {
+                    const int idx = table->GetColumnIndex(name);
+                    if (idx < 0)
+                        throw std::runtime_error("Unknown column: " + name);
+                    if (seen[static_cast<size_t>(idx)])
+                        throw std::runtime_error("Column listed twice: " + name);
+                    seen[static_cast<size_t>(idx)] = true;
+                    targets.push_back(static_cast<size_t>(idx));
+                }
+            }
+
             size_t rows_inserted = 0;
-
             for (auto &row : insert->rows)
             {
-                if (row.size() != col_count)
+                if (row.size() != targets.size())
                     throw std::runtime_error("Column count mismatch: expected " +
-                                             std::to_string(col_count) + ", got " +
+                                             std::to_string(targets.size()) + ", got " +
                                              std::to_string(row.size()));
 
+                // Columns the statement does not mention take their default
                 std::vector<Value> values;
-                for (size_t c = 0; c < row.size(); ++c)
+                values.reserve(col_count);
+                for (size_t c = 0; c < col_count; ++c)
                 {
-                    values.push_back(CoerceToColumn(EvaluateExpr(row[c].get()), table->GetSchema().GetColumn(c)));
+                    const Column &column = schema.GetColumn(c);
+                    values.push_back(column.default_value ? *column.default_value : Value(column.type));
                 }
+                for (size_t i = 0; i < targets.size(); ++i)
+                    values[targets[i]] = EvaluateExpr(row[i].get());
+                for (size_t c = 0; c < col_count; ++c)
+                    values[c] = CoerceToColumn(values[c], schema.GetColumn(c), table->GetName());
 
                 catalog_->InsertRow(table, Tuple(std::move(values)));
                 rows_inserted++;
@@ -661,7 +726,7 @@ namespace sql
                             throw std::runtime_error("Unknown column: " + assign.first);
                         new_values[static_cast<size_t>(col_idx)] = CoerceToColumn(
                             EvaluateExpr(assign.second.get(), &existing_tuple, table),
-                            table->GetSchema().GetColumn(static_cast<size_t>(col_idx)));
+                            table->GetSchema().GetColumn(static_cast<size_t>(col_idx)), table->GetName());
                     }
 
                     updates.push_back({it.GetRID(), Tuple(std::move(new_values))});
@@ -692,7 +757,7 @@ namespace sql
         bool created = false;
         try
         {
-            created = catalog_->CreateIndex(create->index_name, create->table, create->column);
+            created = catalog_->CreateIndex(create->index_name, create->table, create->column, create->unique);
         }
         catch (const std::exception &e)
         {

@@ -34,8 +34,9 @@ void PrintHelp()
     std::cout << "  save   - Checkpoint: copy the write-ahead log into the database file\n";
     std::cout << "  tables - List all tables\n";
     std::cout << "\nSQL commands (end with semicolon):\n";
-    std::cout << "  CREATE TABLE t (col1 INTEGER, col2 VARCHAR(50), col3 BOOLEAN);\n";
+    std::cout << "  CREATE TABLE t (col1 INTEGER PRIMARY KEY, col2 VARCHAR(50) NOT NULL, col3 BOOLEAN DEFAULT FALSE);\n";
     std::cout << "  INSERT INTO t VALUES (1, 'hello', TRUE);\n";
+    std::cout << "  INSERT INTO t (col1, col2) VALUES (2, 'world');   -- col3 takes its DEFAULT\n";
     std::cout << "  SELECT * FROM t;\n";
     std::cout << "  SELECT col1, col2 FROM t WHERE col1 > 5;\n";
     std::cout << "  UPDATE t SET col1 = 10 WHERE col2 = 'hello';\n";
@@ -104,6 +105,29 @@ void PrintResults(const sql::ExecutionResult &result)
               << (result.tuples.size() == 1 ? "" : "s") << ")\n\n";
 }
 
+// "name VARCHAR(20) NOT NULL DEFAULT 'x'"
+std::string DescribeColumn(const sql::Column &col)
+{
+    std::string text = col.name + " " + sql::DataTypeName(col.type);
+    if (col.type == sql::DataType::VARCHAR && col.length > 0)
+        text += "(" + std::to_string(col.length) + ")";
+    if (col.primary_key)
+        text += " PRIMARY KEY";
+    else
+    {
+        if (col.not_null)
+            text += " NOT NULL";
+        if (col.unique)
+            text += " UNIQUE";
+    }
+    if (col.default_value)
+    {
+        const bool quote = col.default_value->GetType() == sql::DataType::VARCHAR && !col.default_value->IsNull();
+        text += " DEFAULT " + (quote ? "'" + col.default_value->ToString() + "'" : col.default_value->ToString());
+    }
+    return text;
+}
+
 void ListTables()
 {
     auto names = g_db->GetCatalog().GetTableNames();
@@ -116,14 +140,9 @@ void ListTables()
     for (const auto &name : names)
     {
         sql::Table *t = g_db->GetCatalog().GetTable(name);
-        const auto &cols = t->GetSchema().GetColumns();
-        std::cout << "  " << name << " (" << t->GetTupleCount() << " rows) - columns: ";
-        for (size_t i = 0; i < cols.size(); ++i)
-        {
-            if (i > 0) std::cout << ", ";
-            std::cout << cols[i].name;
-        }
-        std::cout << "\n";
+        std::cout << "  " << name << " (" << t->GetTupleCount() << " rows)\n";
+        for (const auto &col : t->GetSchema().GetColumns())
+            std::cout << "    " << DescribeColumn(col) << "\n";
     }
 }
 

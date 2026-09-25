@@ -1,4 +1,5 @@
 #include "parser/parser.h"
+#include <cctype>
 #include <stdexcept>
 #include <vector>
 
@@ -124,7 +125,56 @@ namespace sql
             return ParseCreateTable();
         if (current_token_.type == TokenType::INDEX)
             return ParseCreateIndex();
-        throw std::runtime_error("Expected TABLE or INDEX after CREATE");
+        if (Match(TokenType::UNIQUE))
+        {
+            auto index = ParseCreateIndex();
+            index->unique = true;
+            return index;
+        }
+        throw std::runtime_error("Expected TABLE, INDEX or UNIQUE INDEX after CREATE");
+    }
+
+    // NOT NULL | NULL | PRIMARY KEY | UNIQUE | DEFAULT literal, in any order
+    void Parser::ParseColumnConstraints(ColumnDef *col)
+    {
+        while (true)
+        {
+            if (Match(TokenType::NOT))
+            {
+                Expect(TokenType::NULL_KW);
+                col->not_null = true;
+            }
+            else if (Match(TokenType::NULL_KW))
+            {
+                // explicitly nullable: the default
+            }
+            else if (Match(TokenType::PRIMARY))
+            {
+                // KEY is not reserved (columns may be called "key")
+                Token key = Expect(TokenType::IDENTIFIER);
+                std::string upper = key.value;
+                for (char &c : upper)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (upper != "KEY")
+                    throw std::runtime_error("Expected KEY after PRIMARY, got: " + key.value);
+                col->primary_key = true;
+            }
+            else if (Match(TokenType::UNIQUE))
+            {
+                col->unique = true;
+            }
+            else if (Match(TokenType::DEFAULT))
+            {
+                auto expr = ParsePrimary();
+                if (expr->GetType() != ExpressionType::LITERAL)
+                    throw std::runtime_error("DEFAULT must be a literal value");
+                col->default_value = static_cast<LiteralExpression *>(expr.get())->value;
+            }
+            else
+            {
+                return;
+            }
+        }
     }
 
     std::unique_ptr<CreateTableStatement> Parser::ParseCreateTable()
@@ -165,6 +215,7 @@ namespace sql
                 Expect(TokenType::RPAREN);
             }
 
+            ParseColumnConstraints(&col);
             stmt->columns.push_back(std::move(col));
         } while (Match(TokenType::COMMA));
 
@@ -198,6 +249,16 @@ namespace sql
 
         Token table = Expect(TokenType::IDENTIFIER);
         stmt->table = table.value;
+
+        // Optional column list: INSERT INTO t (a, b) VALUES ...
+        if (Match(TokenType::LPAREN))
+        {
+            do
+            {
+                stmt->columns.push_back(Expect(TokenType::IDENTIFIER).value);
+            } while (Match(TokenType::COMMA));
+            Expect(TokenType::RPAREN);
+        }
 
         Expect(TokenType::VALUES);
 
