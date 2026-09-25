@@ -10,10 +10,12 @@
 #include "execution/executor.h"
 #include "catalog/database.h"
 #include "catalog/legacy_import.h"
+#include "session/session.h"
 #include <memory>
 #include <sys/stat.h>
 
 std::unique_ptr<sql::Database> g_db;
+std::unique_ptr<sql::Session> g_session;
 
 void PrintBanner()
 {
@@ -29,7 +31,7 @@ void PrintHelp()
     std::cout << "Available commands:\n";
     std::cout << "  help   - Show this help message\n";
     std::cout << "  quit   - Exit the program\n";
-    std::cout << "  save   - Flush all pages to the database file\n";
+    std::cout << "  save   - Checkpoint: copy the write-ahead log into the database file\n";
     std::cout << "  tables - List all tables\n";
     std::cout << "\nSQL commands (end with semicolon):\n";
     std::cout << "  CREATE TABLE t (col1 INTEGER, col2 VARCHAR(50), col3 BOOLEAN);\n";
@@ -38,8 +40,14 @@ void PrintHelp()
     std::cout << "  SELECT col1, col2 FROM t WHERE col1 > 5;\n";
     std::cout << "  UPDATE t SET col1 = 10 WHERE col2 = 'hello';\n";
     std::cout << "  DELETE FROM t WHERE col1 = 1;\n";
-    std::cout << "\nData is stored in: " << g_db->GetPath()
-              << " (written after every statement)\n";
+    std::cout << "\nTransactions:\n";
+    std::cout << "  BEGIN;     - start a transaction (prompt changes to sql*>)\n";
+    std::cout << "  COMMIT;    - make its changes permanent\n";
+    std::cout << "  ROLLBACK;  - discard its changes\n";
+    std::cout << "\nData is stored in: " << g_db->GetPath() << " (write-ahead log: "
+              << g_db->GetPath() << "-wal)\n";
+    std::cout << "Outside a transaction each statement commits when it succeeds and is rolled\n"
+              << "back when it fails. Inside one, a failed statement is undone on its own.\n";
 }
 
 void PrintResults(const sql::ExecutionResult &result)
@@ -123,26 +131,8 @@ void ExecuteSQL(const std::string &sql_input)
 {
     try
     {
-        sql::Lexer lexer(sql_input);
-        sql::Parser parser(lexer);
-        auto stmt = parser.ParseStatement();
-
-        if (!stmt)
-        {
-            std::cout << "Error: Failed to parse SQL statement.\n";
-            return;
-        }
-
-        sql::Executor executor(&g_db->GetCatalog());
-        auto result = executor.Execute(stmt.get());
-        PrintResults(result);
-
-        const auto type = stmt->GetType();
-        if (type != sql::StatementType::SELECT && type != sql::StatementType::EXPLAIN_STMT &&
-            !g_db->Flush())
-        {
-            std::cout << "Warning: failed to write changes to " << g_db->GetPath() << "\n";
-        }
+        for (const auto &result : g_session->ExecuteScript(sql_input))
+            PrintResults(result);
     }
     catch (const std::exception &e)
     {
@@ -207,6 +197,7 @@ int main(int argc, char **argv)
             std::cout << "Loaded " << tables.size() << " table(s) from " << path << ".\n";
     }
 
+    g_session = std::make_unique<sql::Session>(g_db.get());
     PrintBanner();
 
     std::string input;
@@ -215,7 +206,7 @@ int main(int argc, char **argv)
     while (true)
     {
         if (sql_buffer.empty())
-            std::cout << "sql> ";
+            std::cout << (g_session->InTransaction() ? "sql*> " : "sql> ");
         else
             std::cout << "  -> ";
 
@@ -246,10 +237,11 @@ int main(int argc, char **argv)
             }
             else if (command == "save")
             {
-                if (g_db->Flush())
-                    std::cout << "All changes written to " << g_db->GetPath() << ".\n";
+                std::string error;
+                if (g_session->Checkpoint(&error))
+                    std::cout << "Checkpoint complete: all changes are in " << g_db->GetPath() << ".\n";
                 else
-                    std::cout << "Error writing to " << g_db->GetPath() << ".\n";
+                    std::cout << "Error: " << error << "\n";
                 continue;
             }
             else if (command == "help" || command == "h")
@@ -273,8 +265,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!g_db->Flush())
-        std::cerr << "Warning: failed to write changes to " << g_db->GetPath() << "\n";
-    g_db.reset();
+    if (g_session->InTransaction())
+        std::cout << "Rolling back the open transaction.\n";
+    g_session.reset(); // rolls back an open transaction
+    g_db.reset();      // checkpoints and removes the write-ahead log
     return 0;
 }

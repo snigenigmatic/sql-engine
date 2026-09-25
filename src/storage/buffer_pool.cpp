@@ -198,14 +198,57 @@ namespace sql
         return it != page_table_.end() && frames_[it->second].pin_count_ > 0;
     }
 
-    bool BufferPoolManager::FlushAll()
+    bool BufferPoolManager::HasDirtyPages()
+    {
+        std::lock_guard<std::recursive_mutex> lock(latch_);
+        for (const auto &entry : page_table_)
+        {
+            if (frames_[entry.second].is_dirty_)
+                return true;
+        }
+        return false;
+    }
+
+    bool BufferPoolManager::WriteDirtyPages()
     {
         std::lock_guard<std::recursive_mutex> lock(latch_);
 
         bool ok = true;
         for (const auto &entry : page_table_)
             ok = FlushFrame(entry.second) && ok;
+        return ok;
+    }
+
+    bool BufferPoolManager::FlushAll()
+    {
+        std::lock_guard<std::recursive_mutex> lock(latch_);
+        const bool ok = WriteDirtyPages();
         return pager_->Sync() && ok;
+    }
+
+    bool BufferPoolManager::DiscardAll()
+    {
+        std::lock_guard<std::recursive_mutex> lock(latch_);
+
+        for (const auto &entry : page_table_)
+        {
+            if (frames_[entry.second].pin_count_ > 0)
+                return false;
+        }
+        page_table_.clear();
+        lru_.clear();
+        lru_pos_.clear();
+        free_frames_.clear();
+        for (size_t i = 0; i < frames_.size(); ++i)
+        {
+            Page &page = frames_[i];
+            page.ResetMemory();
+            page.page_id_ = INVALID_PAGE_ID;
+            page.pin_count_ = 0;
+            page.is_dirty_ = false;
+            free_frames_.push_back(static_cast<frame_id_t>(i));
+        }
+        return true;
     }
 
     bool BufferPoolManager::DeletePage(page_id_t page_id)

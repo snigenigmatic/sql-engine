@@ -36,6 +36,8 @@ CTestTestfile.cmake
 # Logs and databases
 *.log
 *.db
+*.db-wal
+*.importing
 
 # Compilation database
 compile_commands.json

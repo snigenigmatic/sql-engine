@@ -16,7 +16,9 @@ namespace sql
     {
         LITERAL,
         COLUMN_REF,
-        BINARY_OP
+        BINARY_OP,
+        UNARY_OP, // NOT
+        IS_NULL   // IS NULL / IS NOT NULL
     };
 
     struct Expression
@@ -49,6 +51,22 @@ namespace sql
         ExpressionType GetType() const override { return ExpressionType::BINARY_OP; }
     };
 
+    struct UnaryExpression : public Expression
+    {
+        TokenType op;
+        std::unique_ptr<Expression> operand;
+        UnaryExpression(TokenType o, std::unique_ptr<Expression> e) : op(o), operand(std::move(e)) {}
+        ExpressionType GetType() const override { return ExpressionType::UNARY_OP; }
+    };
+
+    struct IsNullExpression : public Expression
+    {
+        std::unique_ptr<Expression> operand;
+        bool negated; // IS NOT NULL
+        IsNullExpression(std::unique_ptr<Expression> e, bool n) : operand(std::move(e)), negated(n) {}
+        ExpressionType GetType() const override { return ExpressionType::IS_NULL; }
+    };
+
     // --- Statements ---
 
     enum class StatementType
@@ -60,7 +78,8 @@ namespace sql
         CREATE_INDEX,
         DELETE_STMT,
         UPDATE_STMT,
-        EXPLAIN_STMT
+        EXPLAIN_STMT,
+        TRANSACTION_STMT
     };
 
     struct Statement
@@ -129,6 +148,20 @@ namespace sql
         std::vector<std::pair<std::string, std::unique_ptr<Expression>>> assignments; // SET col = expr
         std::unique_ptr<Expression> where;
         StatementType GetType() const override { return StatementType::UPDATE_STMT; }
+    };
+
+    // BEGIN / COMMIT / ROLLBACK [TRANSACTION]
+    struct TransactionStatement : public Statement
+    {
+        enum class Kind
+        {
+            BEGIN,
+            COMMIT,
+            ROLLBACK
+        };
+        Kind kind;
+        explicit TransactionStatement(Kind k) : kind(k) {}
+        StatementType GetType() const override { return StatementType::TRANSACTION_STMT; }
     };
 
     struct ExplainStatement : public Statement

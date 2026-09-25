@@ -1,4 +1,5 @@
 #include "execution/index_nested_loop_join.h"
+#include "execution/evaluator.h"
 #include <stdexcept>
 
 namespace sql
@@ -23,6 +24,10 @@ namespace sql
         outer_col_idx_ = outer_table_->GetColumnIndex(StripQualifier(outer_col_));
         if (outer_col_idx_ < 0)
             throw std::runtime_error("IndexNestedLoopJoin: unknown outer column: " + outer_col_);
+        const int inner_col_idx = inner_table_->GetColumnIndex(StripQualifier(inner_col_));
+        if (inner_col_idx < 0)
+            throw std::runtime_error("IndexNestedLoopJoin: unknown inner column: " + inner_col_);
+        inner_key_type_ = inner_table_->GetSchema().GetColumn(static_cast<size_t>(inner_col_idx)).type;
 
         outer_started_ = false;
         inner_matches_.clear();
@@ -67,8 +72,17 @@ namespace sql
                 return false;
 
             current_outer_ = *outer_it_;
-            Value probe_key = current_outer_.GetValue(static_cast<size_t>(outer_col_idx_));
-            inner_matches_ = inner_index_->Search(probe_key);
+            const Value &probe_key = current_outer_.GetValue(static_cast<size_t>(outer_col_idx_));
+            // NULL never matches (and is not indexed). A number is looked up
+            // as the indexed column's type, so 5 finds 5.0; 5.5 cannot equal
+            // any INTEGER.
+            std::optional<Value> key;
+            if (!probe_key.IsNull())
+                key = ConvertNumber(probe_key, inner_key_type_);
+            if (key)
+                inner_matches_ = inner_index_->Search(*key);
+            else
+                inner_matches_.clear();
             inner_cursor_ = 0;
         }
     }

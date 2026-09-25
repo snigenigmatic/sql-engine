@@ -9,17 +9,20 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Lexer and full SQL parser
 - Volcano/iterator query execution model
 - Full DML/DDL: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`
-- `WHERE` clause with comparison and logical operators
+- `WHERE` clause with comparison and logical operators (`AND`, `OR`, `NOT`)
+- SQL `NULL`: `NULL` literals, `IS [NOT] NULL`, three-valued logic (a comparison with `NULL` is unknown, and `WHERE` keeps only true rows), and joins never match `NULL` keys
+- `INTEGER` and `FLOAT` values compare and combine numerically
 - Column projection (`SELECT col1, col2 ...`)
 - Disk-resident B+tree indexes: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`), maintained row by row on INSERT/UPDATE/DELETE
 - Query planner: automatically uses index scan when an index exists on the filtered column
 - Single-file database: tables and index definitions are stored in 4 KB pages (slotted heaps + a `sqlite_master`-style schema table) behind an LRU buffer pool
+- Crash safety: a write-ahead log makes every statement atomic and durable; committed work is recovered after a crash, anything uncommitted is discarded
 - Interactive REPL
 
+- Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, with statement-level rollback inside a transaction
+
 ### Planned
-- JOIN operations
-- Transaction support (ACID)
-- Query optimizer
+- SQL coverage: constraints, expressions in SELECT, `ORDER BY` / `LIMIT`, aggregates and `GROUP BY`, outer and multi-way joins (see [docs/roadmap.md](docs/roadmap.md))
 
 ## Building
 
@@ -93,7 +96,7 @@ sql-engine/
 ./build/src/sqlengine [database-file]   # default: sqlengine.db
 ```
 
-Changes are written to the database file after every statement. A text snapshot left in `.sqlengine/` by older versions is imported automatically the first time a new database file is created.
+Each statement is atomic and durable: it is committed to the write-ahead log (`<file>-wal`) when it succeeds and rolled back when it fails. The log is copied into the database file by checkpoints (automatically, on `save`, and on exit), and replayed on the next start if the process crashes. Only one process can have a database open at a time. A text snapshot left in `.sqlengine/` by older versions is imported automatically the first time a new database file is created.
 
 ```sql
 -- DDL
@@ -107,6 +110,12 @@ SELECT name, age FROM users;
 UPDATE users SET age = 99 WHERE id = 1;
 DELETE FROM users WHERE id = 2;
 
+-- Transactions
+BEGIN;
+UPDATE users SET age = 26 WHERE id = 1;
+DELETE FROM users WHERE id = 1;
+ROLLBACK;   -- or COMMIT;
+
 -- Indexes
 CREATE INDEX idx_id ON users (id);
 SELECT * FROM users WHERE id = 1;    -- uses index point lookup
@@ -118,7 +127,7 @@ SELECT * FROM users WHERE id > 1;   -- uses index range scan
 | Command | Description |
 |---|---|
 | `tables` | List all tables and their columns |
-| `save` | Flush all pages to the database file (also done after every statement) |
+| `save` | Checkpoint: copy the write-ahead log into the database file |
 | `help` | Show SQL syntax reference |
 | `quit` / `exit` | Save and exit |
 
@@ -151,13 +160,17 @@ ctest --test-dir build --output-on-failure --verbose
   - [x] Add correctness checks (ambiguous columns, swapped `ON` sides, type-mismatch safety)
   - [x] Add `EXPLAIN` command in REPL to print physical plan (`SeqScan`/`IndexScan`/`Join` path)
   - [x] Add join-condition index matching (`IndexNestedLoopJoin` when index exists on join column)
-- [ ] **Phase 6**: Transactions
+- [x] **Phase 6**: Transactions (see M5 and M6 below)
 
 The path to a fully working embedded database (page storage, WAL, transactions, SQL coverage) is tracked in [docs/roadmap.md](docs/roadmap.md).
 - [x] **M1**: Page layer, single-file `Pager`, LRU `BufferPoolManager` with RAII `PageGuard`
 - [x] **M2**: Slotted-page `TableHeap` with RIDs; tables, scans, joins and indexes run on pages
 - [x] **M3**: Persistent catalog in the database file; REPL opens `sqlengine <file.db>` (replaces `.sqlengine/` text snapshots)
 - [x] **M4**: On-disk B+tree indexes keyed by (value, RID), maintained incrementally
+- [x] **M5**: Write-ahead log with crash recovery, checkpoints, and atomic per-statement commit/rollback
+- [x] **M6**: `BEGIN` / `COMMIT` / `ROLLBACK` with savepoint-based statement rollback (single connection, so serializable)
+- [ ] **M7**: SQL coverage
+  - [x] NULL semantics and a single shared expression evaluator
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

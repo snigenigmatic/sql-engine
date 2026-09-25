@@ -11,6 +11,7 @@ macro(add_sqlengine_test test_name)
             execution
             storage
             catalog
+            session
     )
     add_test(NAME ${test_name} COMMAND ${test_name})
 endmacro()
@@ -35,3 +36,11 @@ add_sqlengine_test(table_heap_test storage/table_heap_test.cpp)
 # Catalog tests
 add_sqlengine_test(catalog_persistence_test catalog/catalog_persistence_test.cpp)
 add_sqlengine_test(btree_test storage/btree_test.cpp)
+
+# Recovery tests
+add_sqlengine_test(wal_test recovery/wal_test.cpp)
+add_sqlengine_test(crash_recovery_test recovery/crash_recovery_test.cpp)
+
+# Session tests
+add_sqlengine_test(session_test session/session_test.cpp)
+add_sqlengine_test(evaluator_test execution/evaluator_test.cpp)

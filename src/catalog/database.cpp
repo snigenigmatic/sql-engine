@@ -1,4 +1,5 @@
 #include "catalog/database.h"
+#include <functional>
 #include <stdexcept>
 
 namespace sql
@@ -12,7 +13,7 @@ namespace sql
         if (!db->pager_->Open(path))
         {
             if (error)
-                *error = "Unable to open '" + path + "': not a database file or not accessible";
+                *error = "Unable to open database: " + db->pager_->GetLastError();
             return nullptr;
         }
         db->was_created_ = db->pager_->GetCatalogRoot() == INVALID_PAGE_ID;
@@ -25,8 +26,16 @@ namespace sql
         {
             if (error)
                 *error = "Unable to load schema from '" + path + "': " + e.what();
+            return nullptr; // destructor discards anything loading wrote
+        }
+        // Loading may have written (a new schema table, rebuilt indexes)
+        if (!db->Commit())
+        {
+            if (error)
+                *error = "Unable to write to '" + path + "'";
             return nullptr;
         }
+        db->opened_ = true;
         return db;
     }
 
@@ -39,19 +48,94 @@ namespace sql
         db->pager_->OpenInMemory();
         db->bpm_ = std::make_unique<BufferPoolManager>(pool_size, db->pager_.get());
         db->catalog_ = std::make_unique<Catalog>(db->bpm_.get(), db->pager_.get());
+        db->opened_ = true;
         return db;
     }
 
     Database::~Database()
     {
         catalog_.reset();
-        if (bpm_)
-            bpm_->FlushAll();
+        if (!bpm_)
+            return;
+        if (opened_ && !broken_)
+        {
+            Commit();
+        }
+        else
+        {
+            // Failed open, or state we cannot vouch for: leave the database
+            // file and its log as they are; the next open recovers the last
+            // commit
+            bpm_->DiscardAll();
+            pager_->Abandon();
+        }
     }
 
-    bool Database::Flush()
+    bool Database::HasUncommittedChanges()
     {
-        return bpm_->FlushAll();
+        return bpm_->HasDirtyPages() || pager_->HasUncommittedChanges();
+    }
+
+    bool Database::Commit()
+    {
+        return !broken_ && bpm_->WriteDirtyPages() && pager_->Commit();
+    }
+
+    bool Database::Rollback(std::string *error)
+    {
+        return Restore([this] { return pager_->Rollback(); }, error);
+    }
+
+    bool Database::CreateSavepoint(Pager::Savepoint *savepoint)
+    {
+        if (!bpm_->WriteDirtyPages())
+            return false;
+        *savepoint = pager_->CreateSavepoint();
+        return true;
+    }
+
+    bool Database::RollbackTo(const Pager::Savepoint &savepoint, std::string *error)
+    {
+        return Restore([this, &savepoint] { return pager_->RollbackTo(savepoint); }, error);
+    }
+
+    bool Database::Restore(const std::function<bool()> &rollback_pager, std::string *error)
+    {
+        auto fail = [&](const std::string &message)
+        {
+            if (error)
+                *error = message;
+            return false;
+        };
+
+        if (pager_->IsInMemory())
+            return fail("rollback is not supported for in-memory databases");
+        if (!bpm_->DiscardAll())
+            return fail("cannot roll back while pages are in use"); // nothing changed
+        if (!rollback_pager())
+        {
+            broken_ = true;
+            return fail("rollback failed: " + pager_->GetLastError());
+        }
+
+        // Tables, indexes and cached counts are rebuilt from the rolled-back
+        // pages
+        catalog_.reset();
+        try
+        {
+            catalog_ = std::make_unique<Catalog>(bpm_.get(), pager_.get());
+        }
+        catch (const std::exception &e)
+        {
+            broken_ = true;
+            return fail(std::string("cannot reload schema after rollback: ") + e.what());
+        }
+        return true;
+    }
+
+    bool Database::Checkpoint()
+    {
+        return Commit() && pager_->Checkpoint();
     }
 
 } // namespace sql

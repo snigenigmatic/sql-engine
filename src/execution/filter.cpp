@@ -1,4 +1,5 @@
 #include "execution/filter.h"
+#include "execution/evaluator.h"
 #include <stdexcept>
 
 namespace sql
@@ -60,148 +61,57 @@ namespace sql
         }
     }
 
-    Value Filter::Evaluate(const Expression *expr, const Tuple &tuple) const
+    Value Filter::ResolveColumn(const ColumnExpression &col, const Tuple &tuple) const
     {
-        if (!expr)
+        int idx = table_->GetColumnIndex(col.name);
+        if (idx < 0)
         {
-            throw std::runtime_error("Null expression");
-        }
-
-        switch (expr->GetType())
-        {
-        case ExpressionType::LITERAL:
-        {
-            const auto *lit = static_cast<const LiteralExpression *>(expr);
-            return lit->value;
-        }
-        case ExpressionType::COLUMN_REF:
-        {
-            const auto *col = static_cast<const ColumnExpression *>(expr);
-            int idx = table_->GetColumnIndex(col->name);
-            if (idx < 0)
+            const std::string stripped = StripQualifier(col.name);
+            const std::string qualifier = ExtractQualifier(col.name);
+            int matched_idx = -1;
+            const auto &columns = table_->GetSchema().GetColumns();
+            for (size_t i = 0; i < columns.size(); ++i)
             {
-                const std::string stripped = StripQualifier(col->name);
-                const std::string qualifier = ExtractQualifier(col->name);
-                int matched_idx = -1;
-                const auto &columns = table_->GetSchema().GetColumns();
-                for (size_t i = 0; i < columns.size(); ++i)
+                const auto &schema_col = columns[i].name;
+                const std::string schema_stripped = StripQualifier(schema_col);
+                if (schema_stripped != stripped)
                 {
-                    const auto &schema_col = columns[i].name;
-                    const std::string schema_stripped = StripQualifier(schema_col);
-                    if (schema_stripped != stripped)
+                    continue;
+                }
+                if (!qualifier.empty() && ExtractQualifier(schema_col) != qualifier)
+                {
+                    const std::string schema_qualifier = ExtractQualifier(schema_col);
+                    if (!schema_qualifier.empty())
                     {
-                        continue;
-                    }
-                    if (!qualifier.empty() && ExtractQualifier(schema_col) != qualifier)
-                    {
-                        const std::string schema_qualifier = ExtractQualifier(schema_col);
-                        if (!schema_qualifier.empty())
-                        {
-                            if (schema_qualifier != qualifier)
-                            {
-                                continue;
-                            }
-                        }
-                        else if (qualifier != table_->GetName())
+                        if (schema_qualifier != qualifier)
                         {
                             continue;
                         }
                     }
-                    if (matched_idx >= 0)
+                    else if (qualifier != table_->GetName())
                     {
-                        throw std::runtime_error("Ambiguous column: " + col->name);
+                        continue;
                     }
-                    matched_idx = static_cast<int>(i);
                 }
-                idx = matched_idx;
+                if (matched_idx >= 0)
+                {
+                    throw std::runtime_error("Ambiguous column: " + col.name);
+                }
+                matched_idx = static_cast<int>(i);
             }
-            if (idx < 0)
-            {
-                throw std::runtime_error("Unknown column: " + col->name);
-            }
-            return tuple.GetValue(static_cast<size_t>(idx));
+            idx = matched_idx;
         }
-        case ExpressionType::BINARY_OP:
+        if (idx < 0)
         {
-            const auto *bin = static_cast<const BinaryExpression *>(expr);
-            Value left = Evaluate(bin->left.get(), tuple);
-            Value right = Evaluate(bin->right.get(), tuple);
-
-            switch (bin->op)
-            {
-            // Comparison operators
-            case TokenType::EQ:
-                return Value(left == right);
-            case TokenType::NEQ:
-                return Value(left != right);
-            case TokenType::LT:
-                return Value(left < right);
-            case TokenType::GT:
-                return Value(left > right);
-            case TokenType::LEQ:
-                return Value(left <= right);
-            case TokenType::GEQ:
-                return Value(left >= right);
-
-            // Logical operators
-            case TokenType::AND:
-                return Value(left.GetAsBool() && right.GetAsBool());
-            case TokenType::OR:
-                return Value(left.GetAsBool() || right.GetAsBool());
-
-            // Arithmetic operators
-            case TokenType::PLUS:
-                if (left.GetType() == DataType::INTEGER && right.GetType() == DataType::INTEGER)
-                {
-                    return Value(left.GetAsInt() + right.GetAsInt());
-                }
-                else
-                {
-                    return Value(left.GetAsFloat() + right.GetAsFloat());
-                }
-            case TokenType::MINUS:
-                if (left.GetType() == DataType::INTEGER && right.GetType() == DataType::INTEGER)
-                {
-                    return Value(left.GetAsInt() - right.GetAsInt());
-                }
-                else
-                {
-                    return Value(left.GetAsFloat() - right.GetAsFloat());
-                }
-            case TokenType::STAR:
-                if (left.GetType() == DataType::INTEGER && right.GetType() == DataType::INTEGER)
-                {
-                    return Value(left.GetAsInt() * right.GetAsInt());
-                }
-                else
-                {
-                    return Value(left.GetAsFloat() * right.GetAsFloat());
-                }
-            case TokenType::SLASH:
-                if (left.GetType() == DataType::INTEGER && right.GetType() == DataType::INTEGER)
-                {
-                    if (right.GetAsInt() == 0)
-                    {
-                        throw std::runtime_error("Division by zero");
-                    }
-                    return Value(left.GetAsInt() / right.GetAsInt());
-                }
-                else
-                {
-                    if (right.GetAsFloat() == 0.0)
-                    {
-                        throw std::runtime_error("Division by zero");
-                    }
-                    return Value(left.GetAsFloat() / right.GetAsFloat());
-                }
-
-            default:
-                throw std::runtime_error("Unknown binary operator");
-            }
+            throw std::runtime_error("Unknown column: " + col.name);
         }
-        default:
-            throw std::runtime_error("Unknown expression type");
-        }
+        return tuple.GetValue(static_cast<size_t>(idx));
+    }
+
+    Value Filter::Evaluate(const Expression *expr, const Tuple &tuple) const
+    {
+        return EvaluateExpression(expr, [&](const ColumnExpression &col)
+                                  { return ResolveColumn(col, tuple); });
     }
 
     bool Filter::EvaluatePredicate(const Tuple &tuple) const
@@ -210,8 +120,7 @@ namespace sql
         {
             return true; // No predicate means all tuples pass
         }
-        Value result = Evaluate(predicate_, tuple);
-        return result.GetAsBool();
+        return IsTrue(Evaluate(predicate_, tuple));
     }
 
 } // namespace sql
