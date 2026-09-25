@@ -50,6 +50,8 @@ namespace sql
         // Evaluate an expression (reused for INSERT values, UPDATE SET, etc.)
         Value EvaluateExpr(const Expression *expr, const Tuple *tuple = nullptr, Table *table = nullptr) const;
         Value ResolveColumnValue(const ColumnExpression &col, const Tuple *tuple, Table *table) const;
+        // The value as it is stored in the column (NULL typed, numbers converted)
+        static Value CoerceToColumn(const Value &value, const Column &column);
         int ResolveColumnIndexForSelect(const std::string &name, Table *base_table, Table *join_table, bool *from_join_table = nullptr) const;
         void EnsureJoinContextTable(Table *left, Table *right);
         std::pair<std::string, std::string> ResolveJoinColumns(const PhysicalPlanNode *node, Table *left, Table *right) const;

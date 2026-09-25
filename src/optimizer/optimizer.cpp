@@ -364,36 +364,6 @@ namespace sql
                 throw std::runtime_error("JOIN requires ON left_col = right_col");
             }
 
-            std::unique_ptr<PhysicalPlanNode> left_input = build_base_access_path(select->table, table, nullptr);
-            std::unique_ptr<PhysicalPlanNode> right_input = build_base_access_path(*select->join_table, right_table, nullptr);
-            const Expression *remaining_predicate = select->where.get();
-            if (remaining_predicate != nullptr)
-            {
-                const PredicateTableSide side = ResolvePredicateSingleTable(
-                    remaining_predicate, select->table, *select->join_table, table, right_table);
-                if (side == PredicateTableSide::LEFT || side == PredicateTableSide::RIGHT)
-                {
-                    const std::string target_table_name = (side == PredicateTableSide::LEFT) ? select->table : *select->join_table;
-                    Table *target_table = (side == PredicateTableSide::LEFT) ? table : right_table;
-                    std::unique_ptr<PhysicalPlanNode> side_input = build_base_access_path(target_table_name, target_table, remaining_predicate);
-                    auto side_filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
-                    side_filter->table_name = target_table_name;
-                    side_filter->predicate = remaining_predicate;
-                    side_filter->children.push_back(std::move(side_input));
-                    side_input = std::move(side_filter);
-
-                    if (side == PredicateTableSide::LEFT)
-                    {
-                        left_input = std::move(side_input);
-                    }
-                    else
-                    {
-                        right_input = std::move(side_input);
-                    }
-                    remaining_predicate = nullptr;
-                }
-            }
-
             const size_t left_count = table->GetTupleCount();
             const size_t right_count = right_table->GetTupleCount();
 
@@ -454,6 +424,41 @@ namespace sql
                 join->join_right_as_outer = right_count < left_count;
                 // Build hash table on smaller side for hash join.
                 join->join_build_right = right_count <= left_count;
+            }
+
+            std::unique_ptr<PhysicalPlanNode> left_input = build_base_access_path(select->table, table, nullptr);
+            std::unique_ptr<PhysicalPlanNode> right_input = build_base_access_path(*select->join_table, right_table, nullptr);
+            const Expression *remaining_predicate = select->where.get();
+            if (remaining_predicate != nullptr)
+            {
+                const PredicateTableSide side = ResolvePredicateSingleTable(
+                    remaining_predicate, select->table, *select->join_table, table, right_table);
+                // An index nested loop join reaches its inner table through
+                // the index, so a filter on that side stays after the join
+                const bool inner_side_of_index_join =
+                    join->type == PhysicalPlanType::INDEX_NESTED_LOOP_JOIN &&
+                    side == (join->join_right_as_outer ? PredicateTableSide::LEFT : PredicateTableSide::RIGHT);
+                if ((side == PredicateTableSide::LEFT || side == PredicateTableSide::RIGHT) && !inner_side_of_index_join)
+                {
+                    const std::string target_table_name = (side == PredicateTableSide::LEFT) ? select->table : *select->join_table;
+                    Table *target_table = (side == PredicateTableSide::LEFT) ? table : right_table;
+                    std::unique_ptr<PhysicalPlanNode> side_input = build_base_access_path(target_table_name, target_table, remaining_predicate);
+                    auto side_filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
+                    side_filter->table_name = target_table_name;
+                    side_filter->predicate = remaining_predicate;
+                    side_filter->children.push_back(std::move(side_input));
+                    side_input = std::move(side_filter);
+
+                    if (side == PredicateTableSide::LEFT)
+                    {
+                        left_input = std::move(side_input);
+                    }
+                    else
+                    {
+                        right_input = std::move(side_input);
+                    }
+                    remaining_predicate = nullptr;
+                }
             }
 
             join->table_name = select->table;

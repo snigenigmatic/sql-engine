@@ -1,4 +1,7 @@
 #include "execution/evaluator.h"
+#include <climits>
+#include <cmath>
+#include <cstdint>
 #include <stdexcept>
 
 namespace sql
@@ -197,6 +200,19 @@ namespace sql
         }
         }
         throw std::runtime_error("Unknown expression type");
+    }
+
+    std::optional<Value> ConvertNumber(const Value &value, DataType target)
+    {
+        if (value.IsNull() || value.GetType() == target || !IsNumeric(value) ||
+            (target != DataType::INTEGER && target != DataType::FLOAT))
+            return value;
+        if (target == DataType::FLOAT)
+            return Value(static_cast<double>(value.GetAsInt()));
+        const double d = value.GetAsFloat();
+        if (!(d >= INT32_MIN && d <= INT32_MAX) || std::floor(d) != d)
+            return std::nullopt;
+        return Value(static_cast<int32_t>(d));
     }
 
     bool IsTrue(const Value &value)

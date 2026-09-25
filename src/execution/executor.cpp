@@ -18,6 +18,19 @@ namespace sql
         }
     } // namespace
 
+    Value Executor::CoerceToColumn(const Value &value, const Column &column)
+    {
+        // A bare NULL takes the column's type
+        if (value.IsNull())
+            return Value(column.type);
+        // Numbers are stored as the column's numeric type, so a column (and
+        // any index on it) holds one type
+        std::optional<Value> converted = ConvertNumber(value, column.type);
+        if (!converted)
+            throw std::runtime_error("Cannot store " + value.ToString() + " in INTEGER column '" + column.name + "'");
+        return *converted;
+    }
+
     int Executor::ResolveColumnIndexForSelect(const std::string &name, Table *base_table, Table *join_table, bool *from_join_table) const
     {
         if (base_table == nullptr)
@@ -359,12 +372,33 @@ namespace sql
             if (inner_index == nullptr)
                 throw std::runtime_error("Expected index not found on " + inner_table_name + "." + inner_col);
 
+            // Inputs may carry pushed-down filters. The outer input is read
+            // row by row, so filter it up front; the inner table is reached
+            // through its index, so its filter (the optimizer does not push
+            // one there) is applied to the joined rows instead.
+            const PhysicalPlanNode *inner_filter = nullptr;
+            if (node->children.size() == 2)
+            {
+                const PhysicalPlanNode *outer_input = node->children[right_is_outer ? 1 : 0].get();
+                const PhysicalPlanNode *inner_input = node->children[right_is_outer ? 0 : 1].get();
+                if (outer_input->type != PhysicalPlanType::SEQ_SCAN)
+                    outer_table = MaterializeOperatorToTable(BuildOperatorTree(outer_input, outer_table, nullptr),
+                                                             outer_table, "__outer_input__");
+                if (inner_input->type == PhysicalPlanType::FILTER)
+                    inner_filter = inner_input;
+                else if (inner_input->type != PhysicalPlanType::SEQ_SCAN)
+                    throw std::logic_error("Unsupported inner input for index nested loop join");
+            }
+
             EnsureJoinContextTable(left, right);
             // outer_is_left: left table is outer when right_is_outer=false
             const bool outer_is_left = !right_is_outer;
-            return std::make_unique<IndexNestedLoopJoin>(
+            std::unique_ptr<Operator> join = std::make_unique<IndexNestedLoopJoin>(
                 outer_table, inner_table, inner_index,
                 outer_col, inner_col, outer_is_left);
+            if (inner_filter != nullptr)
+                join = std::make_unique<Filter>(std::move(join), inner_filter->predicate, join_context_table_.get());
+            return join;
         }
         case PhysicalPlanType::FILTER:
         {
@@ -534,11 +568,7 @@ namespace sql
                 std::vector<Value> values;
                 for (size_t c = 0; c < row.size(); ++c)
                 {
-                    Value v = EvaluateExpr(row[c].get());
-                    // A bare NULL takes the column's type
-                    if (v.IsNull())
-                        v = Value(table->GetSchema().GetColumn(c).type);
-                    values.push_back(std::move(v));
+                    values.push_back(CoerceToColumn(EvaluateExpr(row[c].get()), table->GetSchema().GetColumn(c)));
                 }
 
                 catalog_->InsertRow(table, Tuple(std::move(values)));
@@ -629,10 +659,9 @@ namespace sql
                         int col_idx = table->GetColumnIndex(assign.first);
                         if (col_idx < 0)
                             throw std::runtime_error("Unknown column: " + assign.first);
-                        Value v = EvaluateExpr(assign.second.get(), &existing_tuple, table);
-                        if (v.IsNull())
-                            v = Value(table->GetSchema().GetColumn(static_cast<size_t>(col_idx)).type);
-                        new_values[static_cast<size_t>(col_idx)] = std::move(v);
+                        new_values[static_cast<size_t>(col_idx)] = CoerceToColumn(
+                            EvaluateExpr(assign.second.get(), &existing_tuple, table),
+                            table->GetSchema().GetColumn(static_cast<size_t>(col_idx)));
                     }
 
                     updates.push_back({it.GetRID(), Tuple(std::move(new_values))});

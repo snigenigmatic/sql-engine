@@ -1,4 +1,5 @@
 #include "execution/hash_join.h"
+#include "execution/evaluator.h"
 #include <functional>
 #include <stdexcept>
 #include <utility>
@@ -61,8 +62,10 @@ namespace sql
 
         switch (key.type)
         {
+        // Numbers are keyed by value so that 5 and 5.0 meet in one bucket
         case DataType::INTEGER:
-            key.int_value = value.GetAsInt();
+            key.type = DataType::FLOAT;
+            key.float_value = static_cast<double>(value.GetAsInt());
             break;
         case DataType::FLOAT:
             key.float_value = value.GetAsFloat();
@@ -181,7 +184,7 @@ namespace sql
 
                 const Value &probe_key = probe_tuple.GetValue(static_cast<size_t>(probe_key_index));
                 const Value &build_key = build_tuple.GetValue(static_cast<size_t>(build_key_index));
-                if (probe_key.GetType() != build_key.GetType() || probe_key != build_key)
+                if (!IsTrue(EvaluateBinaryOp(TokenType::EQ, probe_key, build_key)))
                 {
                     continue;
                 }

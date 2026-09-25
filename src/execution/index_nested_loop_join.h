@@ -43,6 +43,7 @@ namespace sql
         bool outer_is_left_;
 
         int outer_col_idx_ = -1;
+        DataType inner_key_type_ = DataType::INTEGER;
         TableIterator outer_it_;
         bool outer_started_ = false;
         Tuple current_outer_;

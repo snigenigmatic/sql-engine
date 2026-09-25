@@ -1,4 +1,5 @@
 #include "execution/nested_loop_join.h"
+#include "execution/evaluator.h"
 #include <stdexcept>
 
 namespace sql
@@ -77,13 +78,9 @@ namespace sql
                 ++inner_it_;
                 const Value &inner_key = inner_row.GetValue(inner_index);
 
-                // NULL never equals anything, including NULL
-                if (outer_key.IsNull() || inner_key.IsNull() || outer_key.GetType() != inner_key.GetType())
-                {
-                    continue;
-                }
-
-                if (outer_key == inner_key)
+                // Same equality as WHERE: NULL never matches, and INTEGER and
+                // FLOAT compare numerically
+                if (IsTrue(EvaluateBinaryOp(TokenType::EQ, outer_key, inner_key)))
                 {
                     std::vector<Value> joined_values;
                     const auto &left_row = right_as_outer_ ? inner_row : current_outer_;

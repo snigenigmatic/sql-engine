@@ -4,6 +4,7 @@
 #include "lexer/token.h"
 #include "parser/ast.h"
 #include <functional>
+#include <optional>
 
 namespace sql
 {
@@ -25,6 +26,12 @@ namespace sql
     // Evaluate an expression tree. AND / OR skip their right operand when
     // the left one already decides the result.
     Value EvaluateExpression(const Expression *expr, const ColumnResolver &resolve_column);
+
+    // Convert a number to the other numeric type without changing its value.
+    // Returns nullopt when no value of the target type equals it (2.5 as an
+    // INTEGER). NULLs, non-numeric values and values already of the target
+    // type are returned unchanged.
+    std::optional<Value> ConvertNumber(const Value &value, DataType target);
 
     // WHERE semantics: only TRUE qualifies; FALSE and NULL do not.
     // Throws if the value is not a boolean.

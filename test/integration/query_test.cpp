@@ -877,4 +877,96 @@ namespace sql
         EXPECT_EQ(Ids(RunSQL(catalog, "SELECT id FROM prices WHERE price = 5;")), (std::vector<int>{2}));
     }
 
+    // ── Joins: pushed-down filters and numeric keys ──────────────────────────────
+
+    static void CreateOrdersAndCustomers(Catalog &catalog)
+    {
+        RunSQL(catalog, "CREATE TABLE orders (oid INTEGER, cid INTEGER);");
+        RunSQL(catalog, "CREATE TABLE customers (id INTEGER, name VARCHAR(20));");
+        RunSQL(catalog, "INSERT INTO orders VALUES (1, 10), (2, 20), (3, 10), (4, 30);");
+        RunSQL(catalog, "INSERT INTO customers VALUES (10, 'Alice'), (20, 'Bob'), (30, NULL);");
+    }
+
+    TEST(IntegrationTest, IndexJoinAppliesFiltersOnTheIndexedSide)
+    {
+        Catalog catalog;
+        CreateOrdersAndCustomers(catalog);
+        RunSQL(catalog, "CREATE INDEX idx_cid ON customers (id);"); // customers is probed
+        const std::string join = "SELECT oid FROM orders JOIN customers ON orders.cid = customers.id ";
+        auto explain = RunSQL(catalog, "EXPLAIN " + join + "WHERE customers.name = 'Alice';");
+        ASSERT_NE(explain.message.find("IndexNestedLoopJoin"), std::string::npos) << explain.message;
+
+        EXPECT_EQ(Ids(RunSQL(catalog, join + "WHERE customers.name = 'Alice';")), (std::vector<int>{1, 3}));
+        EXPECT_EQ(Ids(RunSQL(catalog, join + "WHERE customers.name IS NULL;")), (std::vector<int>{4}));
+        EXPECT_EQ(Ids(RunSQL(catalog, join + "WHERE NOT customers.name = 'Alice';")), (std::vector<int>{2}));
+        EXPECT_EQ(Ids(RunSQL(catalog, join + "WHERE orders.oid >= 3;")), (std::vector<int>{3, 4}));
+    }
+
+    TEST(IntegrationTest, IndexJoinAppliesFiltersWhenTheLeftTableIsIndexed)
+    {
+        Catalog catalog;
+        CreateOrdersAndCustomers(catalog);
+        RunSQL(catalog, "CREATE INDEX idx_orders_cid ON orders (cid);"); // orders is probed
+        const std::string join = "SELECT oid FROM orders JOIN customers ON orders.cid = customers.id ";
+        auto explain = RunSQL(catalog, "EXPLAIN " + join + "WHERE orders.oid = 3;");
+        ASSERT_NE(explain.message.find("IndexNestedLoopJoin"), std::string::npos) << explain.message;
+
+        EXPECT_EQ(Ids(RunSQL(catalog, join + "WHERE orders.oid = 3;")), (std::vector<int>{3}));
+        EXPECT_EQ(Ids(RunSQL(catalog, join + "WHERE customers.name = 'Bob';")), (std::vector<int>{2}));
+    }
+
+    TEST(IntegrationTest, NumericJoinKeysMatchAcrossIntegerAndFloat)
+    {
+        // Every join algorithm: nested loop, hash join, index join probing a
+        // FLOAT index, index join probing an INTEGER index
+        for (const std::string setup : {"", "HASH", "INDEX_ON_FLOAT", "INDEX_ON_INTEGER"})
+        {
+            Catalog catalog;
+            RunSQL(catalog, "CREATE TABLE a (k INTEGER, tag VARCHAR(5));");
+            RunSQL(catalog, "CREATE TABLE b (k FLOAT, tag VARCHAR(5));");
+            RunSQL(catalog, "INSERT INTO a VALUES (5, 'a5'), (6, 'a6');");
+            RunSQL(catalog, "INSERT INTO b VALUES (5.0, 'b5'), (6.5, 'b65');");
+            if (setup == "HASH")
+            {
+                std::string sql = "INSERT INTO b VALUES ";
+                for (int i = 100; i < 120; ++i)
+                    sql += std::string(i > 100 ? ", " : "") + "(" + std::to_string(i) + ".5, 'x')";
+                RunSQL(catalog, sql + ";");
+            }
+            if (setup == "INDEX_ON_FLOAT")
+                RunSQL(catalog, "CREATE INDEX idx_b ON b (k);");
+            if (setup == "INDEX_ON_INTEGER")
+                RunSQL(catalog, "CREATE INDEX idx_a ON a (k);");
+
+            auto joined = RunSQL(catalog, "SELECT a.tag, b.tag FROM a JOIN b ON a.k = b.k;");
+            ASSERT_TRUE(joined.success) << setup << ": " << joined.message;
+            ASSERT_EQ(joined.tuples.size(), 1u) << setup;
+            EXPECT_EQ(joined.tuples[0].GetValue(0).GetAsString(), "a5") << setup;
+            EXPECT_EQ(joined.tuples[0].GetValue(1).GetAsString(), "b5") << setup;
+        }
+    }
+
+    TEST(IntegrationTest, NumbersAreStoredAsTheColumnType)
+    {
+        Catalog catalog;
+        RunSQL(catalog, "CREATE TABLE t (f FLOAT, i INTEGER);");
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO t VALUES (5, 2.0);").success);
+        auto row = RunSQL(catalog, "SELECT * FROM t;").tuples.at(0);
+        EXPECT_EQ(row.GetValue(0).GetType(), DataType::FLOAT);
+        EXPECT_DOUBLE_EQ(row.GetValue(0).GetAsFloat(), 5.0);
+        EXPECT_EQ(row.GetValue(1).GetType(), DataType::INTEGER);
+        EXPECT_EQ(row.GetValue(1).GetAsInt(), 2);
+
+        auto bad = RunSQL(catalog, "INSERT INTO t VALUES (1.0, 2.5);");
+        EXPECT_FALSE(bad.success);
+        EXPECT_NE(bad.message.find("INTEGER column 'i'"), std::string::npos) << bad.message;
+        EXPECT_FALSE(RunSQL(catalog, "UPDATE t SET i = 3.5;").success);
+        ASSERT_TRUE(RunSQL(catalog, "UPDATE t SET f = 7;").success);
+        EXPECT_EQ(RunSQL(catalog, "SELECT f FROM t;").tuples.at(0).GetValue(0).GetType(), DataType::FLOAT);
+
+        // An index on the FLOAT column finds a row written with an integer
+        RunSQL(catalog, "CREATE INDEX idx_f ON t (f);");
+        EXPECT_EQ(RunSQL(catalog, "SELECT * FROM t WHERE f = 7.0;").tuples.size(), 1u);
+    }
+
 } // namespace sql
