@@ -37,6 +37,8 @@ namespace sql
         case TokenType::COMMIT: return "COMMIT";
         case TokenType::ROLLBACK: return "ROLLBACK";
         case TokenType::TRANSACTION: return "TRANSACTION";
+        case TokenType::NULL_KW: return "NULL";
+        case TokenType::IS: return "IS";
         case TokenType::IDENTIFIER: return "IDENTIFIER";
         case TokenType::STRING_LITERAL: return "STRING_LITERAL";
         case TokenType::INTEGER_LITERAL: return "INTEGER_LITERAL";
