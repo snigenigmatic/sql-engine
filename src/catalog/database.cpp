@@ -62,9 +62,10 @@ namespace sql
         }
         else
         {
-            // Failed open: leave the file exactly as it was
+            // Failed open: leave the database file and its log exactly as
+            // they were
             bpm_->DiscardAll();
-            pager_->Rollback();
+            pager_->Abandon();
         }
     }
 

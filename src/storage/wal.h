@@ -16,8 +16,9 @@ namespace sql
     // frames, then the database file.
     //
     // File layout:
-    //   header (32 bytes): magic "SQLWAL01", version, page size, salt1,
-    //                      salt2, checksum of the preceding 24 bytes
+    //   header (40 bytes): magic "SQLWAL01", version, page size, salt1,
+    //                      salt2, database id, checksum of the preceding
+    //                      32 bytes
     //   frames: { page_id, commit_page_count, salt1, salt2, checksum } +
     //           page image
     // commit_page_count is non-zero only on a commit frame and records the
@@ -25,11 +26,12 @@ namespace sql
     // earlier frame too), so recovery stops at the first torn or stale frame
     // and anything after the last intact commit frame is discarded. The salts
     // change every time the log is reset, so frames left over from an older
-    // log generation never validate.
+    // log generation never validate. The database id ties the log to one
+    // database file: a log found next to a different database is discarded.
     class WriteAheadLog
     {
     public:
-        static constexpr size_t HEADER_SIZE = 32;
+        static constexpr size_t HEADER_SIZE = 40;
         static constexpr size_t FRAME_HEADER_SIZE = 24;
         static constexpr size_t FRAME_SIZE = FRAME_HEADER_SIZE + PAGE_SIZE;
 
@@ -39,9 +41,12 @@ namespace sql
         WriteAheadLog(const WriteAheadLog &) = delete;
         WriteAheadLog &operator=(const WriteAheadLog &) = delete;
 
-        // Open (or create) the log and recover every committed frame. An
-        // incomplete or corrupt tail is truncated away.
-        bool Open(const std::string &path);
+        // Open (or create) the log for the database with the given id and
+        // recover every committed frame. An incomplete or corrupt tail is
+        // truncated away; a log belonging to another database is discarded.
+        // Fails (leaving the file untouched) if the log holds frames behind an
+        // unreadable header, or on an I/O error.
+        bool Open(const std::string &path, uint64_t db_id, std::string *error = nullptr);
         void Close(bool remove_file);
         bool IsOpen() const { return fd_ >= 0; }
 
@@ -77,8 +82,10 @@ namespace sql
     private:
         enum class RecoverResult
         {
-            NO_LOG,    // missing or invalid header: start a new log
+            NO_LOG,    // empty, or just a torn header: start a new log
+            FOREIGN,   // written for a different database: start a new log
             RECOVERED, // committed frames (possibly none) are available
+            CORRUPT,   // frames behind an unreadable header
             IO_ERROR,
         };
         RecoverResult Recover();
@@ -86,6 +93,7 @@ namespace sql
 
         std::string path_;
         int fd_ = -1;
+        uint64_t db_id_ = 0;
         uint32_t salt1_ = 0;
         uint32_t salt2_ = 0;
 

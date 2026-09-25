@@ -3,11 +3,14 @@
 #include "execution/executor.h"
 #include "lexer/lexer.h"
 #include "parser/parser.h"
+#include "storage/buffer_pool.h"
+#include "storage/table_heap.h"
 #include "storage/wal.h"
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <string>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -105,6 +108,17 @@ namespace sql
             auto stmt = parser.ParseStatement();
             Executor executor(&db.GetCatalog());
             return executor.Execute(stmt.get()).tuples.size();
+        }
+
+        static std::string ReadFile(const std::string &path)
+        {
+            std::ifstream in(path, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+
+        static void WriteFile(const std::string &path, const std::string &bytes)
+        {
+            std::ofstream(path, std::ios::binary | std::ios::trunc) << bytes;
         }
 
         static uint64_t FileSize(const std::string &path)
@@ -273,6 +287,125 @@ namespace sql
         auto db = Open();
         ASSERT_NE(db, nullptr);
         EXPECT_TRUE(ExecCommit(*db, "CREATE TABLE t (id INTEGER, name VARCHAR(20));"));
+    }
+
+    TEST_F(CrashRecoveryTest, RecoveryDefersCheckpointUntilClose)
+    {
+        CommitTwoTransactionsAndCrash();
+        const uint64_t db_size = FileSize(path_);
+        {
+            auto db = Open();
+            ASSERT_NE(db, nullptr);
+            EXPECT_EQ(Count(*db, "SELECT * FROM t;"), 20u); // read through the log
+            EXPECT_EQ(FileSize(path_), db_size);             // database file untouched
+        }
+        EXPECT_GT(FileSize(path_), db_size); // checkpointed on close
+        EXPECT_FALSE(std::filesystem::exists(wal_path_));
+    }
+
+    TEST_F(CrashRecoveryTest, FailedOpenChangesNeitherFile)
+    {
+        // Commit a corrupt schema row, then crash with it only in the log
+        ASSERT_TRUE(RunAndCrash([&]
+                                {
+            std::string error;
+            auto db = Database::Open(path_, &error);
+            if (!db || !ExecCommit(*db, "CREATE TABLE t (id INTEGER, name VARCHAR(20));"))
+                return false;
+            BufferPoolManager bpm(8, &db->GetPager());
+            TableHeap schema(&bpm, db->GetPager().GetCatalogRoot());
+            schema.InsertTuple(Tuple({Value("table"), Value("bogus"), Value("bogus"), Value(999), Value("id:0:0")}));
+            bool ok = bpm.WriteDirtyPages() && db->GetPager().Commit();
+            return CrashWithOpen(db, ok); }));
+
+        const std::string db_bytes = ReadFile(path_);
+        const std::string wal_bytes = ReadFile(wal_path_);
+        std::string error;
+        EXPECT_EQ(Database::Open(path_, &error), nullptr);
+        EXPECT_NE(error.find("invalid root page"), std::string::npos) << error;
+        EXPECT_EQ(ReadFile(path_), db_bytes);
+        EXPECT_EQ(ReadFile(wal_path_), wal_bytes);
+    }
+
+    TEST_F(CrashRecoveryTest, LogOfAnotherDatabaseIsDiscarded)
+    {
+        // Database A crashes with commits in its log...
+        CommitTwoTransactionsAndCrash();
+        const std::string foreign_log = ReadFile(wal_path_);
+        std::remove(path_.c_str());
+        std::remove(wal_path_.c_str());
+
+        // ...and database B is created at the same path and closed cleanly
+        {
+            auto db = Open();
+            ASSERT_TRUE(ExecCommit(*db, "CREATE TABLE b (x INTEGER);"));
+        }
+
+        // A's log reappears next to B: it must not be replayed into B
+        WriteFile(wal_path_, foreign_log);
+        auto db = Open();
+        ASSERT_NE(db, nullptr);
+        EXPECT_EQ(db->GetCatalog().GetTableNames(), std::vector<std::string>{"b"});
+    }
+
+    TEST_F(CrashRecoveryTest, CorruptLogHeaderWithFramesIsRefusedAndKept)
+    {
+        CommitTwoTransactionsAndCrash();
+        std::string wal = ReadFile(wal_path_);
+        wal[3] = static_cast<char>(wal[3] ^ 0x20); // damage the magic
+        WriteFile(wal_path_, wal);
+        const std::string db_bytes = ReadFile(path_);
+
+        std::string error;
+        EXPECT_EQ(Database::Open(path_, &error), nullptr);
+        EXPECT_NE(error.find("corrupt"), std::string::npos) << error;
+        EXPECT_EQ(ReadFile(wal_path_), wal); // committed frames preserved
+        EXPECT_EQ(ReadFile(path_), db_bytes);
+    }
+
+    TEST_F(CrashRecoveryTest, TornHeaderOnlyLogIsReset)
+    {
+        {
+            auto db = Open();
+            ASSERT_TRUE(ExecCommit(*db, "CREATE TABLE t (id INTEGER, name VARCHAR(20));"));
+        }
+        // A reset that tore while rewriting the header leaves at most a
+        // header's worth of junk and no frames
+        WriteFile(wal_path_, std::string(WriteAheadLog::HEADER_SIZE - 3, 'j'));
+        auto db = Open();
+        ASSERT_NE(db, nullptr);
+        EXPECT_TRUE(db->GetCatalog().TableExists("t"));
+    }
+
+    TEST_F(CrashRecoveryTest, OlderFilesGetADatabaseId)
+    {
+        {
+            auto db = Open();
+            ASSERT_TRUE(ExecCommit(*db, "CREATE TABLE t (id INTEGER, name VARCHAR(20));"));
+            ASSERT_TRUE(ExecCommit(*db, InsertRows("t", 0, 5)));
+        }
+        // Files written before database ids existed have zeros there
+        std::string bytes = ReadFile(path_);
+        for (size_t i = 24; i < 32; ++i)
+            bytes[i] = 0;
+        WriteFile(path_, bytes);
+
+        {
+            auto db = Open();
+            ASSERT_NE(db, nullptr);
+            EXPECT_EQ(Count(*db, "SELECT * FROM t;"), 5u);
+        }
+        bytes = ReadFile(path_);
+        EXPECT_NE(bytes.substr(24, 8), std::string(8, '\0'));
+
+        // And its log is tied to it from then on
+        ASSERT_TRUE(RunAndCrash([&]
+                                {
+            std::string error;
+            auto db = Database::Open(path_, &error);
+            return CrashWithOpen(db, db && ExecCommit(*db, InsertRows("t", 5, 10))); }));
+        auto db = Open();
+        EXPECT_EQ(Count(*db, "SELECT * FROM t;"), 10u);
     }
 
 } // namespace sql

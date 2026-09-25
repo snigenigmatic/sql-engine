@@ -1,5 +1,6 @@
 #include "storage/wal.h"
 #include <array>
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <random>
@@ -42,17 +43,37 @@ namespace sql
             return value;
         }
 
-        bool PreadFull(int fd, char *buf, size_t len, uint64_t offset)
+        enum class ReadStatus
+        {
+            OK,
+            END, // end of file before len bytes
+            ERROR,
+        };
+
+        // Distinguishes a short file (a torn tail, which recovery expects)
+        // from a read error (which must never be mistaken for the end)
+        ReadStatus ReadAt(int fd, char *buf, size_t len, uint64_t offset)
         {
             size_t done = 0;
             while (done < len)
             {
                 ssize_t n = pread(fd, buf + done, len - done, static_cast<off_t>(offset + done));
-                if (n <= 0)
-                    return false;
+                if (n == 0)
+                    return ReadStatus::END;
+                if (n < 0)
+                {
+                    if (errno == EINTR)
+                        continue;
+                    return ReadStatus::ERROR;
+                }
                 done += static_cast<size_t>(n);
             }
-            return true;
+            return ReadStatus::OK;
+        }
+
+        bool PreadFull(int fd, char *buf, size_t len, uint64_t offset)
+        {
+            return ReadAt(fd, buf, len, offset) == ReadStatus::OK;
         }
 
         bool PwriteFull(int fd, const char *buf, size_t len, uint64_t offset)
@@ -69,20 +90,41 @@ namespace sql
         }
     } // namespace
 
-    bool WriteAheadLog::Open(const std::string &path)
+    bool WriteAheadLog::Open(const std::string &path, uint64_t db_id, std::string *error)
     {
         Close(false);
         path_ = path;
+        db_id_ = db_id;
         fd_ = open(path.c_str(), O_RDWR | O_CREAT, 0644);
         if (fd_ < 0)
-            return false;
-        const RecoverResult result = Recover();
-        if (result == RecoverResult::IO_ERROR || (result == RecoverResult::NO_LOG && !Reset()))
         {
-            Close(false);
+            if (error)
+                *error = "cannot open write-ahead log '" + path + "'";
             return false;
         }
-        return true;
+
+        switch (Recover())
+        {
+        case RecoverResult::RECOVERED:
+            return true;
+        case RecoverResult::NO_LOG:
+        case RecoverResult::FOREIGN:
+            if (Reset())
+                return true;
+            if (error)
+                *error = "cannot initialize write-ahead log '" + path + "'";
+            break;
+        case RecoverResult::CORRUPT:
+            if (error)
+                *error = "write-ahead log '" + path + "' is corrupt; it was left untouched";
+            break;
+        case RecoverResult::IO_ERROR:
+            if (error)
+                *error = "cannot read write-ahead log '" + path + "'";
+            break;
+        }
+        Close(false);
+        return false;
     }
 
     void WriteAheadLog::Close(bool remove_file)
@@ -102,27 +144,50 @@ namespace sql
 
     WriteAheadLog::RecoverResult WriteAheadLog::Recover()
     {
-        std::array<char, HEADER_SIZE> header{};
-        if (!PreadFull(fd_, header.data(), HEADER_SIZE, 0) ||
-            std::memcmp(header.data(), MAGIC, sizeof(MAGIC)) != 0 ||
-            Get<uint32_t>(header.data(), 8) != VERSION ||
-            Get<uint32_t>(header.data(), 12) != PAGE_SIZE ||
-            Get<uint64_t>(header.data(), 24) != Checksum(FNV_OFFSET, header.data(), 24))
-        {
+        struct stat st;
+        if (fstat(fd_, &st) != 0)
+            return RecoverResult::IO_ERROR;
+        if (st.st_size == 0)
             return RecoverResult::NO_LOG;
+
+        std::array<char, HEADER_SIZE> header{};
+        const ReadStatus status = ReadAt(fd_, header.data(), HEADER_SIZE, 0);
+        if (status == ReadStatus::ERROR)
+            return RecoverResult::IO_ERROR;
+        const bool valid = status == ReadStatus::OK &&
+                           std::memcmp(header.data(), MAGIC, sizeof(MAGIC)) == 0 &&
+                           Get<uint32_t>(header.data(), 8) == VERSION &&
+                           Get<uint32_t>(header.data(), 12) == PAGE_SIZE &&
+                           Get<uint64_t>(header.data(), 32) == Checksum(FNV_OFFSET, header.data(), 32);
+        if (!valid)
+        {
+            // The header is only ever rewritten by Reset(), after a
+            // checkpoint has made the database file hold every commit. So a
+            // bad header with nothing behind it is a torn Reset and safe to
+            // redo; frames behind a bad header are data we cannot vouch for.
+            return static_cast<uint64_t>(st.st_size) <= HEADER_SIZE ? RecoverResult::NO_LOG
+                                                                    : RecoverResult::CORRUPT;
         }
+        if (Get<uint64_t>(header.data(), 24) != db_id_)
+            return RecoverResult::FOREIGN;
+
         salt1_ = Get<uint32_t>(header.data(), 16);
         salt2_ = Get<uint32_t>(header.data(), 20);
 
         committed_.clear();
         pending_.clear();
-        running_checksum_ = committed_checksum_ = Get<uint64_t>(header.data(), 24);
+        running_checksum_ = committed_checksum_ = Get<uint64_t>(header.data(), 32);
         frame_count_ = committed_frames_ = 0;
         committed_page_count_ = 0;
 
         std::array<char, FRAME_SIZE> frame{};
-        while (PreadFull(fd_, frame.data(), FRAME_SIZE, FrameOffset(frame_count_)))
+        while (true)
         {
+            const ReadStatus read = ReadAt(fd_, frame.data(), FRAME_SIZE, FrameOffset(frame_count_));
+            if (read == ReadStatus::ERROR)
+                return RecoverResult::IO_ERROR;
+            if (read == ReadStatus::END)
+                break; // torn or absent tail
             if (Get<uint32_t>(frame.data(), 8) != salt1_ || Get<uint32_t>(frame.data(), 12) != salt2_)
                 break; // left over from an older log generation
             uint64_t sum = Checksum(running_checksum_, frame.data(), 16);
@@ -168,8 +233,9 @@ namespace sql
         Put<uint32_t>(header.data(), 12, static_cast<uint32_t>(PAGE_SIZE));
         Put<uint32_t>(header.data(), 16, salt1_);
         Put<uint32_t>(header.data(), 20, salt2_);
-        const uint64_t sum = Checksum(FNV_OFFSET, header.data(), 24);
-        Put<uint64_t>(header.data(), 24, sum);
+        Put<uint64_t>(header.data(), 24, db_id_);
+        const uint64_t sum = Checksum(FNV_OFFSET, header.data(), 32);
+        Put<uint64_t>(header.data(), 32, sum);
 
         if (ftruncate(fd_, 0) != 0 || !PwriteFull(fd_, header.data(), HEADER_SIZE, 0) || fsync(fd_) != 0)
             return false;

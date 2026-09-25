@@ -20,6 +20,8 @@ namespace sql
     //   [12..16) page count (including the header page)
     //   [16..20) free-list head page id (INVALID_PAGE_ID if empty)
     //   [20..24) catalog root page id   (INVALID_PAGE_ID until set)
+    //   [24..32) database id: random, fixed at creation; ties the write-ahead
+    //            log to this file
     //
     // Freed pages form a singly linked list: the first 4 bytes of a free page
     // hold the id of the next free page.
@@ -28,9 +30,9 @@ namespace sql
     // header page as a commit frame and fsyncs, making every change since
     // the previous commit durable at once; Rollback() discards them. The
     // database file is only written by checkpoints (when the log grows past a
-    // threshold, and on close), and after a crash Open() replays the
-    // committed part of the log, so the file always reflects a whole number
-    // of committed transactions.
+    // threshold, and on close). After a crash, Open() recovers the committed
+    // part of the log and reads through it; nothing is written until the
+    // database is used, so a failed open changes nothing.
     class Pager
     {
     public:
@@ -55,6 +57,10 @@ namespace sql
 
         // Commits outstanding changes, checkpoints, and removes the log.
         void Close();
+
+        // Close without committing or checkpointing: uncommitted changes are
+        // lost and the log is left for the next Open() to recover
+        void Abandon();
         bool IsOpen() const { return fd_ >= 0 || in_memory_; }
         bool IsInMemory() const { return in_memory_; }
         const std::string &GetLastError() const { return last_error_; }
@@ -101,6 +107,8 @@ namespace sql
         bool Fail(const std::string &message);
         void BuildHeader(char *buf) const;
         bool WriteHeader();
+        // Parse the newest committed header: the log's copy of page 0 if it
+        // has one, else the database file's
         bool ReadHeader();
         bool IsValidHeaderPageId(page_id_t page_id) const;
         HeaderState CurrentHeader() const { return {page_count_, free_list_head_, catalog_root_}; }
@@ -123,6 +131,7 @@ namespace sql
         uint32_t page_count_ = 0;
         page_id_t free_list_head_ = INVALID_PAGE_ID;
         page_id_t catalog_root_ = INVALID_PAGE_ID;
+        uint64_t db_id_ = 0;
 
         // State as of the last commit, restored by Rollback
         HeaderState committed_header_;

@@ -4,7 +4,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <array>
+#include <cerrno>
 #include <cstring>
+#include <random>
 
 namespace sql
 {
@@ -16,6 +18,16 @@ namespace sql
         constexpr size_t OFF_PAGE_COUNT = 12;
         constexpr size_t OFF_FREE_HEAD = 16;
         constexpr size_t OFF_CATALOG_ROOT = 20;
+        constexpr size_t OFF_DB_ID = 24;
+
+        uint64_t NewDatabaseId()
+        {
+            std::random_device rd;
+            uint64_t id = 0;
+            while (id == 0)
+                id = (static_cast<uint64_t>(rd()) << 32) | rd();
+            return id;
+        }
 
         bool PreadFull(int fd, char *buf, size_t len, off_t offset)
         {
@@ -93,11 +105,13 @@ namespace sql
         if (st.st_size == 0)
         {
             // New database. A log left behind by an earlier database with
-            // the same name must not be replayed into it.
-            unlink(wal_path.c_str());
+            // the same name must not be used with it.
+            if (unlink(wal_path.c_str()) != 0 && errno != ENOENT)
+                return Fail("cannot remove stale write-ahead log '" + wal_path + "'");
             page_count_ = 1;
             free_list_head_ = INVALID_PAGE_ID;
             catalog_root_ = INVALID_PAGE_ID;
+            db_id_ = NewDatabaseId();
             std::array<char, PAGE_SIZE> buf{};
             BuildHeader(buf.data());
             if (!RawWrite(0, buf.data()) || fsync(fd_) != 0)
@@ -106,32 +120,51 @@ namespace sql
         else
         {
             // Reject foreign files before touching any log
-            std::array<char, sizeof(MAGIC)> magic{};
-            if (!PreadFull(fd_, magic.data(), magic.size(), 0) ||
-                std::memcmp(magic.data(), MAGIC, sizeof(MAGIC)) != 0)
+            std::array<char, PAGE_SIZE> page0{};
+            if (!PreadFull(fd_, page0.data(), sizeof(MAGIC), 0) ||
+                std::memcmp(page0.data(), MAGIC, sizeof(MAGIC)) != 0)
                 return Fail("'" + path + "' is not a database file");
 
-            // Replay transactions committed before a crash
+            // The id is fixed at creation, so the file's copy is authoritative
+            if (!RawRead(0, page0.data()))
+                return Fail("'" + path + "' has a corrupt header");
+            std::memcpy(&db_id_, page0.data() + OFF_DB_ID, sizeof(db_id_));
+
+            // Recover transactions committed before a crash. They stay in the
+            // log (reads go through it) until the next checkpoint.
             if (FileExists(wal_path))
             {
-                if (!wal_.Open(wal_path))
-                    return Fail("cannot read write-ahead log '" + wal_path + "'");
-                if (wal_.GetCommittedFrameCount() > 0 && !CheckpointLog())
-                    return Fail("recovery from '" + wal_path + "' failed");
+                std::string error;
+                if (!wal_.Open(wal_path, db_id_, &error))
+                    return Fail(error);
             }
 
-            if (fstat(fd_, &st) != 0)
-                return Fail("cannot stat '" + path + "'");
-            // Every declared page must exist and header page ids must be in
-            // range
-            if (!ReadHeader() ||
-                static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(page_count_) * PAGE_SIZE ||
-                !IsValidHeaderPageId(free_list_head_) || !IsValidHeaderPageId(catalog_root_))
+            if (!ReadHeader() || !IsValidHeaderPageId(free_list_head_) || !IsValidHeaderPageId(catalog_root_))
                 return Fail("'" + path + "' has a corrupt header");
+            // Every declared page must exist (pages newer than the last
+            // checkpoint live in the log)
+            if (wal_.GetCommittedFrameCount() == 0 &&
+                static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(page_count_) * PAGE_SIZE)
+                return Fail("'" + path + "' has a corrupt header");
+
+            if (db_id_ == 0)
+            {
+                // Written before database ids existed (and so before logs):
+                // give it one now, directly in the file
+                db_id_ = NewDatabaseId();
+                std::array<char, PAGE_SIZE> buf{};
+                BuildHeader(buf.data());
+                if (!RawWrite(0, buf.data()) || fsync(fd_) != 0)
+                    return Fail("cannot update '" + path + "'");
+            }
         }
 
-        if (!wal_.IsOpen() && !wal_.Open(wal_path))
-            return Fail("cannot create write-ahead log '" + wal_path + "'");
+        if (!wal_.IsOpen())
+        {
+            std::string error;
+            if (!wal_.Open(wal_path, db_id_, &error))
+                return Fail(error);
+        }
 
         committed_header_ = CurrentHeader();
         header_dirty_ = false;
@@ -172,6 +205,18 @@ namespace sql
         header_dirty_ = false;
     }
 
+    void Pager::Abandon()
+    {
+        wal_.Close(false);
+        if (fd_ >= 0)
+        {
+            close(fd_); // also releases the lock
+            fd_ = -1;
+        }
+        fresh_pages_.clear();
+        header_dirty_ = false;
+    }
+
     bool Pager::RawRead(page_id_t page_id, char *out)
     {
         if (in_memory_)
@@ -197,7 +242,7 @@ namespace sql
     bool Pager::ReadHeader()
     {
         std::array<char, PAGE_SIZE> buf{};
-        if (!RawRead(0, buf.data()))
+        if (!wal_.ReadPage(0, buf.data()) && !RawRead(0, buf.data()))
             return false;
         if (std::memcmp(buf.data(), MAGIC, sizeof(MAGIC)) != 0)
             return false;
@@ -227,6 +272,7 @@ namespace sql
         std::memcpy(buf + OFF_PAGE_COUNT, &page_count_, sizeof(page_count_));
         std::memcpy(buf + OFF_FREE_HEAD, &free_list_head_, sizeof(free_list_head_));
         std::memcpy(buf + OFF_CATALOG_ROOT, &catalog_root_, sizeof(catalog_root_));
+        std::memcpy(buf + OFF_DB_ID, &db_id_, sizeof(db_id_));
     }
 
     bool Pager::WriteHeader()
