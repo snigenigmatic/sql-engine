@@ -191,6 +191,13 @@ namespace sql
         return FlushFrame(it->second);
     }
 
+    bool BufferPoolManager::IsPinned(page_id_t page_id)
+    {
+        std::lock_guard<std::recursive_mutex> lock(latch_);
+        auto it = page_table_.find(page_id);
+        return it != page_table_.end() && frames_[it->second].pin_count_ > 0;
+    }
+
     bool BufferPoolManager::FlushAll()
     {
         std::lock_guard<std::recursive_mutex> lock(latch_);

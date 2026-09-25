@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <string>
 #include <unistd.h>
+#include <unordered_set>
 #include <vector>
 
 namespace sql
@@ -282,6 +283,39 @@ namespace sql
             ids.push_back(row.GetValue(0).GetAsInt());
         EXPECT_EQ(ids, (std::vector<int>{2, 3}));
         EXPECT_EQ(temp.GetTupleCount(), 2u);
+    }
+
+    TEST_F(TableHeapTest, DropRefusesWhileAPageIsPinned)
+    {
+        Pager pager;
+        pager.OpenInMemory();
+        BufferPoolManager bpm(4, &pager);
+        auto heap = TableHeap::Create(&bpm);
+        for (int i = 0; i < 500; ++i)
+            heap->InsertTuple(Row(i, "row"));
+
+        {
+            PageGuard pinned = bpm.FetchPageGuarded(heap->GetFirstPageId());
+            EXPECT_THROW(heap->Drop(), std::runtime_error);
+            EXPECT_EQ(pager.GetFreeListHead(), INVALID_PAGE_ID); // nothing freed
+        }
+        RID rid;
+        Tuple tuple;
+        EXPECT_TRUE(heap->FirstTuple(&rid, &tuple)); // heap still intact
+        heap->Drop();
+        EXPECT_NE(pager.GetFreeListHead(), INVALID_PAGE_ID);
+    }
+
+    TEST(RIDTest, HashesTemporaryRids)
+    {
+        std::unordered_set<RID, RIDHasher> rids;
+        for (uint32_t i = 0; i < 100; ++i)
+        {
+            rids.insert(RID(INVALID_PAGE_ID, i));
+            rids.insert(RID(static_cast<page_id_t>(i + 1), i));
+        }
+        EXPECT_EQ(rids.size(), 200u);
+        EXPECT_EQ(rids.count(RID(INVALID_PAGE_ID, 7)), 1u);
     }
 
 } // namespace sql

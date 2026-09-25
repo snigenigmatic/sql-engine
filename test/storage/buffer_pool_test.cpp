@@ -229,4 +229,48 @@ namespace sql
         EXPECT_NE(bpm.NewPage(&other), nullptr);
     }
 
+    TEST_F(BufferPoolTest, PagerRejectsHeaderClaimingMissingPages)
+    {
+        {
+            Pager pager;
+            ASSERT_TRUE(pager.Open(path_));
+            pager.AllocatePage();
+            pager.AllocatePage();
+        }
+        // Truncate the file so the header's page count exceeds its size
+        ASSERT_EQ(truncate(path_.c_str(), static_cast<off_t>(PAGE_SIZE * 2)), 0);
+        Pager pager;
+        EXPECT_FALSE(pager.Open(path_));
+    }
+
+    TEST_F(BufferPoolTest, PagerRejectsOutOfRangeHeaderPageIds)
+    {
+        {
+            Pager pager;
+            ASSERT_TRUE(pager.Open(path_));
+            pager.AllocatePage();
+            ASSERT_TRUE(pager.SetCatalogRoot(1));
+        }
+        {
+            Pager pager;
+            ASSERT_TRUE(pager.Open(path_));
+            ASSERT_TRUE(pager.SetCatalogRoot(99)); // beyond page count
+        }
+        Pager pager;
+        EXPECT_FALSE(pager.Open(path_));
+    }
+
+    TEST_F(BufferPoolTest, IsPinnedTracksPins)
+    {
+        Pager pager;
+        ASSERT_TRUE(pager.Open(path_));
+        BufferPoolManager bpm(2, &pager);
+        page_id_t pid;
+        bpm.NewPage(&pid);
+        EXPECT_TRUE(bpm.IsPinned(pid));
+        bpm.UnpinPage(pid, false);
+        EXPECT_FALSE(bpm.IsPinned(pid));
+        EXPECT_FALSE(bpm.IsPinned(12345));
+    }
+
 } // namespace sql

@@ -216,6 +216,21 @@ namespace sql
         EXPECT_EQ(pager_.GetPageCount(), pages);
     }
 
+    TEST_F(BTreeTest, DropRefusesWhileAPageIsPinned)
+    {
+        auto tree = BTree::Create(bpm_.get());
+        for (int k = 0; k < 1000; ++k)
+            tree->Insert(Value(k), R(k));
+        {
+            PageGuard pinned = bpm_->FetchPageGuarded(tree->GetRootPageId());
+            EXPECT_THROW(tree->Drop(), std::runtime_error);
+            EXPECT_EQ(pager_.GetFreeListHead(), INVALID_PAGE_ID); // nothing freed
+        }
+        EXPECT_EQ(tree->Search(Value(500)).size(), 1u); // tree still intact
+        tree->Drop();
+        EXPECT_NE(pager_.GetFreeListHead(), INVALID_PAGE_ID);
+    }
+
     TEST(BTreeFileTest, TreeSurvivesReopen)
     {
         const std::string path = ::testing::TempDir() + "btree_reopen_" + std::to_string(getpid()) + ".db";

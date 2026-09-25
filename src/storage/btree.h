@@ -78,6 +78,8 @@ namespace sql
         int GetHeight() const;
 
         // Return every page to the free list. The tree is unusable afterwards.
+        // Throws std::runtime_error (before freeing anything) if a page is
+        // still pinned, or if the pager fails to free a page.
         void Drop();
 
         // Total order used by the tree: by type first, then by value

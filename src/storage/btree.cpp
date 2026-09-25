@@ -459,8 +459,16 @@ namespace sql
                 stack.insert(stack.end(), node.children.begin(), node.children.end());
         }
         for (page_id_t page_id : pages)
-            bpm_->DeletePage(page_id);
+        {
+            if (bpm_->IsPinned(page_id))
+                throw std::runtime_error("Cannot drop index: page " + std::to_string(page_id) + " is in use");
+        }
         root_page_id_ = INVALID_PAGE_ID;
+        for (page_id_t page_id : pages)
+        {
+            if (!bpm_->DeletePage(page_id))
+                throw std::runtime_error("Failed to free index page " + std::to_string(page_id));
+        }
     }
 
 } // namespace sql

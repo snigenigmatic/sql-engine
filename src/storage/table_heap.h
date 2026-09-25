@@ -39,6 +39,8 @@ namespace sql
         bool NextTuple(const RID &rid, RID *next_rid, Tuple *tuple) const;
 
         // Return every page to the free list. The heap is unusable afterwards.
+        // Throws std::runtime_error (before freeing anything) if a page is
+        // still pinned, or if the pager fails to free a page.
         void Drop();
 
     private:

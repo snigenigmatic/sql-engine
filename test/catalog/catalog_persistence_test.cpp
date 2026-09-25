@@ -1,10 +1,14 @@
 #include <gtest/gtest.h>
 #include "catalog/database.h"
+#include "catalog/legacy_import.h"
 #include "execution/executor.h"
 #include "lexer/lexer.h"
 #include "parser/parser.h"
 #include "storage/table_heap.h"
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sys/stat.h>
 #include <string>
 #include <unistd.h>
 
@@ -253,6 +257,172 @@ namespace sql
         // Name is not taken by the failed attempt
         Run(*db, "DELETE FROM t WHERE s = '" + std::string(2000, 'x') + "';");
         EXPECT_TRUE(Run(*db, "CREATE INDEX idx_s ON t (s);").success);
+    }
+
+    // ── Corrupt files ─────────────────────────────────────────────────────────────
+
+    TEST_F(CatalogPersistenceTest, FileWithPagesButNoSchemaIsRejected)
+    {
+        {
+            Pager pager;
+            ASSERT_TRUE(pager.Open(path_));
+            pager.AllocatePage();
+            pager.AllocatePage();
+        }
+        std::string error;
+        EXPECT_EQ(Database::Open(path_, &error), nullptr);
+        EXPECT_NE(error.find("no schema table"), std::string::npos) << error;
+
+        // The file was not modified into a "new" database
+        Pager pager;
+        ASSERT_TRUE(pager.Open(path_));
+        EXPECT_EQ(pager.GetCatalogRoot(), INVALID_PAGE_ID);
+        EXPECT_EQ(pager.GetPageCount(), 3u);
+    }
+
+    TEST_F(CatalogPersistenceTest, TableWithInvalidRootPageIsRejected)
+    {
+        for (int32_t bad_root : {INVALID_PAGE_ID, 0, 999})
+        {
+            std::remove(path_.c_str());
+            {
+                auto db = OpenDb();
+                Run(*db, "CREATE TABLE ok (id INTEGER);");
+            }
+            {
+                Pager pager;
+                ASSERT_TRUE(pager.Open(path_));
+                BufferPoolManager bpm(8, &pager);
+                TableHeap schema(&bpm, pager.GetCatalogRoot());
+                schema.InsertTuple(Tuple({Value("table"), Value("bogus"), Value("bogus"),
+                                          Value(bad_root), Value("id:0:0")}));
+            }
+            std::string error;
+            EXPECT_EQ(Database::Open(path_, &error), nullptr) << bad_root;
+            EXPECT_NE(error.find("invalid root page"), std::string::npos) << error;
+        }
+    }
+
+    TEST_F(CatalogPersistenceTest, IndexWithInvalidRootPageIsRejected)
+    {
+        for (int32_t bad_root : {0, 999})
+        {
+            std::remove(path_.c_str());
+            {
+                auto db = OpenDb();
+                Run(*db, "CREATE TABLE t (id INTEGER);");
+            }
+            {
+                Pager pager;
+                ASSERT_TRUE(pager.Open(path_));
+                BufferPoolManager bpm(8, &pager);
+                TableHeap schema(&bpm, pager.GetCatalogRoot());
+                schema.InsertTuple(Tuple({Value("index"), Value("bad_idx"), Value("t"),
+                                          Value(bad_root), Value("id")}));
+            }
+            std::string error;
+            EXPECT_EQ(Database::Open(path_, &error), nullptr) << bad_root;
+            EXPECT_NE(error.find("invalid root page"), std::string::npos) << error;
+        }
+    }
+
+    // ── Legacy snapshot migration ─────────────────────────────────────────────────
+
+    class LegacyMigrationTest : public CatalogPersistenceTest
+    {
+    protected:
+        void SetUp() override
+        {
+            CatalogPersistenceTest::SetUp();
+            dir_ = path_ + ".snapshot";
+            std::filesystem::remove_all(dir_);
+            std::filesystem::create_directories(dir_);
+            std::remove((path_ + ".importing").c_str());
+        }
+        void TearDown() override
+        {
+            std::filesystem::remove_all(dir_);
+            std::remove((path_ + ".importing").c_str());
+            CatalogPersistenceTest::TearDown();
+        }
+
+        void Write(const std::string &name, const std::string &content)
+        {
+            std::ofstream(dir_ + "/" + name) << content;
+        }
+
+        static bool Exists(const std::string &path)
+        {
+            struct stat st;
+            return stat(path.c_str(), &st) == 0;
+        }
+
+        std::string dir_;
+    };
+
+    TEST_F(LegacyMigrationTest, ImportsEveryTable)
+    {
+        Write("catalog.meta", "2\npeople\nflags\n");
+        Write("people.tbl", "2\nid 0 0\nname 2 50\n3\n0 1\n2 11:Alice Smith\n0 2\n2 NULL\n0 3\n2 3:Bob\n");
+        Write("flags.tbl", "1\non 3 0\n2\n3 true\n3 false\n");
+
+        size_t count = 0;
+        std::string error;
+        ASSERT_TRUE(MigrateLegacySnapshot(dir_, path_, &count, &error)) << error;
+        EXPECT_EQ(count, 2u);
+        EXPECT_FALSE(Exists(path_ + ".importing"));
+
+        auto db = OpenDb();
+        EXPECT_EQ(db->GetCatalog().GetTableNames(), (std::vector<std::string>{"flags", "people"}));
+        auto people = Run(*db, "SELECT name FROM people WHERE id = 1;");
+        ASSERT_EQ(people.tuples.size(), 1u);
+        EXPECT_EQ(people.tuples[0].GetValue(0).GetAsString(), "Alice Smith");
+        EXPECT_TRUE(Run(*db, "SELECT name FROM people WHERE id = 2;").tuples[0].GetValue(0).IsNull());
+        EXPECT_EQ(Run(*db, "SELECT * FROM flags;").tuples.size(), 2u);
+    }
+
+    TEST_F(LegacyMigrationTest, MissingTableFileCreatesNothing)
+    {
+        Write("catalog.meta", "2\npeople\nmissing\n");
+        Write("people.tbl", "1\nid 0 0\n1\n0 1\n");
+
+        std::string error;
+        EXPECT_FALSE(MigrateLegacySnapshot(dir_, path_, nullptr, &error));
+        EXPECT_NE(error.find("missing.tbl"), std::string::npos) << error;
+        EXPECT_FALSE(Exists(path_));
+        EXPECT_FALSE(Exists(path_ + ".importing"));
+    }
+
+    TEST_F(LegacyMigrationTest, MalformedDataCreatesNothing)
+    {
+        const std::vector<std::string> bad_tables = {
+            "1\nflag 3 0\n1\n3 maybe\n",   // bad boolean
+            "1\nid 0 0\n3\n0 1\n0 2\n",   // fewer rows than declared
+            "1\nid 0 0\n1\n0 notanumber\n", // bad integer
+            "1\nname 2 50\n1\n2 20:too short\n", // string ends early
+        };
+        for (const auto &table : bad_tables)
+        {
+            Write("catalog.meta", "1\nt\n");
+            Write("t.tbl", table);
+            std::string error;
+            EXPECT_FALSE(MigrateLegacySnapshot(dir_, path_, nullptr, &error)) << table;
+            EXPECT_FALSE(error.empty());
+            EXPECT_FALSE(Exists(path_)) << table;
+            EXPECT_FALSE(Exists(path_ + ".importing")) << table;
+        }
+    }
+
+    TEST_F(LegacyMigrationTest, ReplacesLeftoverFromInterruptedImport)
+    {
+        std::ofstream(path_ + ".importing") << "half-written garbage";
+        Write("catalog.meta", "1\nt\n");
+        Write("t.tbl", "1\nid 0 0\n1\n0 42\n");
+
+        std::string error;
+        ASSERT_TRUE(MigrateLegacySnapshot(dir_, path_, nullptr, &error)) << error;
+        auto db = OpenDb();
+        EXPECT_EQ(Run(*db, "SELECT * FROM t;").tuples.size(), 1u);
     }
 
 } // namespace sql

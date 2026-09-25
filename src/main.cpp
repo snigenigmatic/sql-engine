@@ -11,6 +11,7 @@
 #include "catalog/database.h"
 #include "catalog/legacy_import.h"
 #include <memory>
+#include <sys/stat.h>
 
 std::unique_ptr<sql::Database> g_db;
 
@@ -149,6 +150,13 @@ void ExecuteSQL(const std::string &sql_input)
     }
 }
 
+// True if the path names an existing, non-empty file
+bool DatabaseFileHasContent(const std::string &path)
+{
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && st.st_size > 0;
+}
+
 int main(int argc, char **argv)
 {
     std::string path = "sqlengine.db";
@@ -163,7 +171,28 @@ int main(int argc, char **argv)
         path = arg;
     }
 
+    // One-time migration of text snapshots written by earlier versions. It
+    // only runs when the database file does not exist yet, and is all or
+    // nothing: a failed import leaves no database behind and is retried on
+    // the next launch.
     std::string error;
+    sql::LegacyImporter legacy;
+    bool imported = false;
+    if (!DatabaseFileHasContent(path) && legacy.HasSnapshot())
+    {
+        size_t table_count = 0;
+        if (!sql::MigrateLegacySnapshot(legacy.GetDirectory(), path, &table_count, &error))
+        {
+            std::cerr << "Error: could not import legacy snapshot from " << legacy.GetDirectory()
+                      << "/: " << error << "\n"
+                      << "No database was created. Fix or move the snapshot aside, then retry.\n";
+            return 1;
+        }
+        std::cout << "Imported " << table_count << " table(s) from legacy snapshot "
+                  << legacy.GetDirectory() << "/\n";
+        imported = true;
+    }
+
     g_db = sql::Database::Open(path, &error);
     if (!g_db)
     {
@@ -171,23 +200,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // One-time migration of text snapshots written by earlier versions
-    sql::LegacyImporter legacy;
-    if (g_db->WasCreated() && legacy.HasSnapshot())
-    {
-        try
-        {
-            legacy.LoadCatalog(g_db->GetCatalog());
-            g_db->Flush();
-            std::cout << "Imported " << g_db->GetCatalog().GetTableNames().size()
-                      << " table(s) from legacy snapshot " << legacy.GetDirectory() << "/\n";
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Warning: legacy import failed: " << e.what() << "\n";
-        }
-    }
-    else
+    if (!imported)
     {
         auto tables = g_db->GetCatalog().GetTableNames();
         if (!tables.empty())

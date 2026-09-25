@@ -80,7 +80,11 @@ namespace sql
             return true;
         }
 
-        if (!ReadHeader())
+        // Reject corrupt headers: every declared page must exist in the file
+        // and the page ids stored in the header must be in range.
+        if (!ReadHeader() ||
+            static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(page_count_) * PAGE_SIZE ||
+            !IsValidHeaderPageId(free_list_head_) || !IsValidHeaderPageId(catalog_root_))
         {
             Close();
             return false;
@@ -154,6 +158,11 @@ namespace sql
         std::memcpy(&free_list_head_, buf.data() + OFF_FREE_HEAD, sizeof(free_list_head_));
         std::memcpy(&catalog_root_, buf.data() + OFF_CATALOG_ROOT, sizeof(catalog_root_));
         return page_count_ >= 1;
+    }
+
+    bool Pager::IsValidHeaderPageId(page_id_t page_id) const
+    {
+        return page_id == INVALID_PAGE_ID || (page_id >= 1 && static_cast<uint32_t>(page_id) < page_count_);
     }
 
     bool Pager::WriteHeader()
