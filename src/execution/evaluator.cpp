@@ -13,6 +13,8 @@ namespace sql
     {
         const Value NULL_BOOL = Value(DataType::BOOLEAN);
 
+        thread_local const SubqueryRunner *current_subquery_runner = nullptr;
+
         bool IsNumeric(const Value &v)
         {
             return v.GetType() == DataType::INTEGER || v.GetType() == DataType::FLOAT;
@@ -230,6 +232,31 @@ namespace sql
         return Value(pi == p.size());
     }
 
+    SubqueryScope::SubqueryScope(SubqueryRunner runner)
+        : runner_(std::move(runner)), previous_(current_subquery_runner)
+    {
+        current_subquery_runner = &runner_;
+    }
+
+    SubqueryScope::~SubqueryScope()
+    {
+        current_subquery_runner = previous_;
+    }
+
+    Value InValues(const Value &operand, const std::vector<Value> &values)
+    {
+        Value result(false);
+        for (const Value &value : values)
+        {
+            const Value equal = EvaluateBinaryOp(TokenType::EQ, operand, value);
+            if (IsTrue(equal))
+                return Value(true);
+            if (equal.IsNull())
+                result = NULL_BOOL;
+        }
+        return result;
+    }
+
     Value EvaluateExpression(const Expression *expr, const ColumnResolver &resolve_column)
     {
         if (!expr)
@@ -268,15 +295,15 @@ namespace sql
             Value result(false);
             for (const auto &item : in->list)
             {
-                const Value equal = EvaluateBinaryOp(TokenType::EQ, operand,
-                                                     EvaluateExpression(item.get(), resolve_column));
-                if (IsTrue(equal))
+                // Stop at the first match, before evaluating later items
+                const Value found = InValues(operand, {EvaluateExpression(item.get(), resolve_column)});
+                if (IsTrue(found))
                 {
-                    result = Value(true);
+                    result = found;
                     break;
                 }
-                if (equal.IsNull())
-                    result = NULL_BOOL;
+                if (found.IsNull())
+                    result = found;
             }
             return in->negated ? EvaluateUnaryOp(TokenType::NOT, result) : result;
         }
@@ -296,6 +323,10 @@ namespace sql
             throw std::runtime_error(std::string("Misuse of aggregate function ") +
                                      AggregateFunctionName(static_cast<const AggregateExpression *>(expr)->function) +
                                      "()");
+        case ExpressionType::SUBQUERY:
+            if (current_subquery_runner == nullptr)
+                throw std::runtime_error("Subqueries are not supported here");
+            return (*current_subquery_runner)(*static_cast<const SubqueryExpression *>(expr), resolve_column);
         case ExpressionType::BINARY_OP:
         {
             const auto *bin = static_cast<const BinaryExpression *>(expr);

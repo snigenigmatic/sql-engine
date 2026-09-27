@@ -218,4 +218,32 @@ namespace sql
         EXPECT_NE(key(Value("a")) + key(Value("bc")), key(Value("ab")) + key(Value("c")));
     }
 
+    TEST(EvaluatorTest, SubqueriesNeedARunner)
+    {
+        SubqueryExpression exists(SubqueryExpression::Kind::EXISTS, false, nullptr, std::make_unique<SelectStatement>());
+        auto no_columns = [](const ColumnExpression &) -> Value { return Value(); };
+        EXPECT_THROW(EvaluateExpression(&exists, no_columns), std::runtime_error);
+        {
+            SubqueryScope scope([](const SubqueryExpression &, const ColumnResolver &) { return Value(true); });
+            EXPECT_TRUE(EvaluateExpression(&exists, no_columns).GetAsBool());
+            {
+                // Runners nest
+                SubqueryScope inner([](const SubqueryExpression &, const ColumnResolver &) { return Value(false); });
+                EXPECT_FALSE(EvaluateExpression(&exists, no_columns).GetAsBool());
+            }
+            EXPECT_TRUE(EvaluateExpression(&exists, no_columns).GetAsBool());
+        }
+        EXPECT_THROW(EvaluateExpression(&exists, no_columns), std::runtime_error);
+    }
+
+    TEST(EvaluatorTest, InValuesIsThreeValued)
+    {
+        EXPECT_EQ(Tri(InValues(Value(1), {Value(2), Value(1.0)})), "T");
+        EXPECT_EQ(Tri(InValues(Value(1), {Value(2)})), "F");
+        EXPECT_EQ(Tri(InValues(Value(1), {Value(2), Value()})), "N"); // the NULL might have been 1
+        EXPECT_EQ(Tri(InValues(Value(1), {Value(1), Value()})), "T");
+        EXPECT_EQ(Tri(InValues(Value(), {Value(1)})), "N");
+        EXPECT_EQ(Tri(InValues(Value(), {})), "F"); // nothing to match
+    }
+
 } // namespace sql

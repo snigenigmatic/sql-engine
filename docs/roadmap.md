@@ -63,7 +63,9 @@ Add these in small PRs, each with parser tests plus `query_test` cases:
 6. **Joins** (done): `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, multi-way joins (more than two tables), arbitrary `ON` conditions and table aliases. `join_table` became a join list.
    - Tables join left to right, in the order written; each step picks an index, hash or nested-loop join. Cost-based join ordering waits for `ANALYZE` in M8.
    - Single-table `WHERE` conditions are pushed below the joins, except onto the NULL-padded side of a LEFT JOIN or a table probed through its index.
-7. **Subqueries** (stretch goal): `IN (SELECT …)`, `EXISTS` and scalar subqueries.
+7. **Subqueries** (done): `IN (SELECT …)`, `EXISTS` and scalar subqueries, correlated or not.
+   - A subquery is planned and run when evaluated: its references to the enclosing row become literals, and results are cached per statement by those outer values.
+   - Not yet supported: correlated subqueries in the SELECT list, HAVING or ORDER BY of a grouped query, and decorrelation into joins.
 
 ## M8 — Usability & hardening
 - CLI: `sqlengine <file.db>`, multi-line input, `.tables` / `.schema` meta-commands and running a `.sql` script from a file or stdin.

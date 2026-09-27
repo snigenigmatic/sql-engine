@@ -148,6 +148,110 @@ namespace sql
                 ForEachColumn(child, visit);
         }
 
+        // ForEachColumn, plus the enclosing-query names used by subqueries
+        void ForEachColumnUsed(const Expression *expr, Catalog *catalog,
+                               const std::function<void(const std::string &)> &visit)
+        {
+            if (expr == nullptr)
+                return;
+            if (expr->GetType() == ExpressionType::COLUMN_REF)
+                visit(static_cast<const ColumnExpression *>(expr)->name);
+            if (expr->GetType() == ExpressionType::SUBQUERY && catalog != nullptr)
+            {
+                for (const std::string &name :
+                     OuterReferences(*static_cast<const SubqueryExpression *>(expr)->select, catalog))
+                    visit(name);
+            }
+            for (const Expression *child : ExpressionChildren(expr))
+                ForEachColumnUsed(child, catalog, visit);
+        }
+
+        bool IsSelectAlias(const SelectStatement &select, const std::string &name)
+        {
+            for (const auto &item : select.items)
+            {
+                if (!item.alias.empty() && item.alias == name)
+                    return true;
+            }
+            return false;
+        }
+
+        bool ResolvedInChain(const std::vector<const Scope *> &chain, const SelectStatement &select,
+                             const std::string &name)
+        {
+            if (IsSelectAlias(select, name))
+                return true;
+            for (const Scope *scope : chain)
+            {
+                if (scope->CanResolve(name))
+                    return true;
+            }
+            return false;
+        }
+
+        // Calls on_outer for each name in `select` (and the subqueries in
+        // it) that no query in the chain resolves
+        void WalkOuterReferences(const SelectStatement &select, Catalog *catalog, std::vector<const Scope *> *chain,
+                                 const std::function<void(const std::string &)> &on_outer)
+        {
+            const Scope scope = Scope::ForSelect(select, catalog);
+            chain->push_back(&scope);
+            std::function<void(const Expression *)> walk = [&](const Expression *expr)
+            {
+                if (expr == nullptr)
+                    return;
+                if (expr->GetType() == ExpressionType::COLUMN_REF)
+                {
+                    const std::string &name = static_cast<const ColumnExpression *>(expr)->name;
+                    if (!ResolvedInChain(*chain, select, name))
+                        on_outer(name);
+                }
+                if (expr->GetType() == ExpressionType::SUBQUERY)
+                    WalkOuterReferences(*static_cast<const SubqueryExpression *>(expr)->select, catalog, chain,
+                                        on_outer);
+                for (const Expression *child : ExpressionChildren(expr))
+                    walk(child);
+            };
+            for (const Expression *expr : SelectExpressions(select))
+                walk(expr);
+            chain->pop_back();
+        }
+
+        std::unique_ptr<SelectStatement> BindInChain(const SelectStatement &select, Catalog *catalog,
+                                                     std::vector<const Scope *> *chain,
+                                                     const std::vector<std::pair<std::string, Value>> &values)
+        {
+            const Scope scope = Scope::ForSelect(select, catalog);
+            chain->push_back(&scope);
+            std::function<std::unique_ptr<Expression>(const Expression *)> replace =
+                [&](const Expression *node) -> std::unique_ptr<Expression>
+            {
+                if (node->GetType() == ExpressionType::COLUMN_REF)
+                {
+                    const std::string &name = static_cast<const ColumnExpression *>(node)->name;
+                    if (ResolvedInChain(*chain, select, name))
+                        return nullptr;
+                    for (const auto &[outer_name, value] : values)
+                    {
+                        if (outer_name == name)
+                            return std::make_unique<LiteralExpression>(value);
+                    }
+                    return nullptr;
+                }
+                if (node->GetType() == ExpressionType::SUBQUERY)
+                {
+                    const auto *subquery = static_cast<const SubqueryExpression *>(node);
+                    return std::make_unique<SubqueryExpression>(
+                        subquery->kind, subquery->negated, RewriteExpression(subquery->operand.get(), replace),
+                        BindInChain(*subquery->select, catalog, chain, values));
+                }
+                return nullptr;
+            };
+            auto bound = CloneSelect(select, replace);
+            chain->pop_back();
+            return bound;
+        }
+
         // Qualified names must name a table in FROM, and ON conditions may
         // only use the tables joined so far. (Unqualified names elsewhere
         // may be SELECT aliases, so evaluation reports those.)
@@ -235,9 +339,28 @@ namespace sql
         }
     } // namespace
 
+    std::vector<std::string> OuterReferences(const SelectStatement &subquery, Catalog *catalog)
+    {
+        std::vector<std::string> names;
+        std::vector<const Scope *> chain;
+        WalkOuterReferences(subquery, catalog, &chain, [&](const std::string &name)
+                            {
+            if (std::find(names.begin(), names.end(), name) == names.end())
+                names.push_back(name); });
+        return names;
+    }
+
+    std::unique_ptr<SelectStatement> BindOuterReferences(const SelectStatement &subquery, Catalog *catalog,
+                                                         const std::vector<std::pair<std::string, Value>> &values)
+    {
+        std::vector<const Scope *> chain;
+        return BindInChain(subquery, catalog, &chain, values);
+    }
+
     Scope Scope::ForSelect(const SelectStatement &select, Catalog *catalog)
     {
         Scope scope;
+        scope.catalog_ = catalog;
         auto add = [&](const std::string &table, const std::string &alias)
         {
             Table *schema = catalog->GetTable(table);
@@ -326,8 +449,8 @@ namespace sql
     {
         uint64_t relations = 0;
         bool resolved = true;
-        ForEachColumn(expr, [&](const std::string &name)
-                      {
+        ForEachColumnUsed(expr, catalog_, [&](const std::string &name)
+                          {
             if (CanResolve(name, count))
                 relations |= uint64_t{1} << Resolve(name, count).relation;
             else
@@ -779,6 +902,20 @@ namespace sql
         {
             return RewriteExpression(expr, [&](const Expression *node) -> std::unique_ptr<Expression>
                                      {
+                if (node->GetType() == ExpressionType::SUBQUERY)
+                {
+                    // Its body is a query of its own; only an IN operand
+                    // belongs to the grouped rows
+                    const auto *subquery = static_cast<const SubqueryExpression *>(node);
+                    if (!OuterReferences(*subquery->select, scope.GetCatalog()).empty())
+                        throw std::runtime_error(
+                            "Correlated subqueries are not supported in the SELECT list, HAVING or ORDER BY of "
+                            "a query with GROUP BY or aggregates");
+                    return std::make_unique<SubqueryExpression>(
+                        subquery->kind, subquery->negated,
+                        subquery->operand ? rewrite(subquery->operand.get(), allow_alias) : nullptr,
+                        CloneSelect(*subquery->select, [](const Expression *) { return std::unique_ptr<Expression>(); }));
+                }
                 if (node->GetType() == ExpressionType::AGGREGATE)
                 {
                     const auto *call = static_cast<const AggregateExpression *>(node);

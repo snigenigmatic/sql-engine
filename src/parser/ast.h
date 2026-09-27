@@ -22,9 +22,12 @@ namespace sql
         IS_NULL,  // IS NULL / IS NOT NULL
         LIKE,     // [NOT] LIKE
         IN_LIST,  // [NOT] IN (...)
-        BETWEEN,  // [NOT] BETWEEN ... AND ...
-        AGGREGATE // COUNT / SUM / AVG / MIN / MAX
+        BETWEEN,   // [NOT] BETWEEN ... AND ...
+        AGGREGATE, // COUNT / SUM / AVG / MIN / MAX
+        SUBQUERY   // (SELECT ...), [NOT] EXISTS (SELECT ...), x [NOT] IN (SELECT ...)
     };
+
+    struct SelectStatement;
 
     struct Expression
     {
@@ -127,7 +130,27 @@ namespace sql
         ExpressionType GetType() const override { return ExpressionType::AGGREGATE; }
     };
 
-    // The direct subexpressions of an expression, in order
+    // A SELECT used as a value. Its body is a query of its own: names it
+    // cannot resolve refer to the enclosing query's current row.
+    struct SubqueryExpression : public Expression
+    {
+        enum class Kind
+        {
+            SCALAR, // (SELECT x ...): the single value, or NULL for no rows
+            EXISTS, // [NOT] EXISTS (SELECT ...)
+            IN      // operand [NOT] IN (SELECT x ...)
+        };
+        Kind kind;
+        bool negated;
+        std::unique_ptr<Expression> operand; // IN only
+        std::unique_ptr<SelectStatement> select;
+        SubqueryExpression(Kind k, bool n, std::unique_ptr<Expression> o, std::unique_ptr<SelectStatement> s);
+        ~SubqueryExpression() override;
+        ExpressionType GetType() const override { return ExpressionType::SUBQUERY; }
+    };
+
+    // The direct subexpressions of an expression, in order. A subquery's
+    // body is a separate query, so only an IN subquery's operand counts.
     std::vector<const Expression *> ExpressionChildren(const Expression *expr);
 
     // True if the expression contains an aggregate function call
@@ -316,5 +339,17 @@ namespace sql
     // SQL text for an expression (used to name computed result columns)
     std::string ExpressionToSQL(const Expression *expr);
     std::string DumpStatement(const Statement *stmt);
+
+    // SQL text of a SELECT, without the final ";"
+    std::string SelectToSQL(const SelectStatement &select);
+
+    // Deep copy of a SELECT; replace is applied to every expression in it,
+    // as in RewriteExpression (including the bodies of nested subqueries)
+    std::unique_ptr<SelectStatement> CloneSelect(
+        const SelectStatement &select, const std::function<std::unique_ptr<Expression>(const Expression *)> &replace);
+
+    // Every expression that belongs to this SELECT itself (not to its
+    // subqueries): items, ON, WHERE, GROUP BY, HAVING, ORDER BY
+    std::vector<const Expression *> SelectExpressions(const SelectStatement &select);
 
 } // namespace sql

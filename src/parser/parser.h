@@ -25,6 +25,8 @@ namespace sql
 
         std::unique_ptr<Statement> ParseCreate();
         std::unique_ptr<SelectStatement> ParseSelect();
+        std::unique_ptr<SelectStatement> ParseSelectBody();
+        std::unique_ptr<SelectStatement> ParseSubqueryBody();
         std::unique_ptr<ExplainStatement> ParseExplain();
         std::unique_ptr<CreateTableStatement> ParseCreateTable();
         void ParseColumnConstraints(ColumnDef *col);

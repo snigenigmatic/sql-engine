@@ -113,6 +113,61 @@ namespace sql
 
     ExecutionResult Executor::Execute(Statement *stmt)
     {
+        // Subquery results last for one statement: the data may change after
+        subquery_cache_.clear();
+        SubqueryScope subqueries([this](const SubqueryExpression &subquery, const ColumnResolver &resolve_outer)
+                                 { return RunSubquery(subquery, resolve_outer); });
+        return ExecuteStatement(stmt);
+    }
+
+    Value Executor::RunSubquery(const SubqueryExpression &subquery, const ColumnResolver &resolve_outer)
+    {
+        // The enclosing row's values for the names the subquery borrows
+        std::vector<std::pair<std::string, Value>> outer;
+        std::string key;
+        for (const std::string &name : OuterReferences(*subquery.select, catalog_))
+        {
+            outer.emplace_back(name, resolve_outer(ColumnExpression(name)));
+            AppendGroupKey(outer.back().second, &key);
+        }
+
+        auto cached = subquery_cache_.find({&subquery, key});
+        if (cached == subquery_cache_.end())
+        {
+            std::unique_ptr<SelectStatement> bound = BindOuterReferences(*subquery.select, catalog_, outer);
+            Executor inner(catalog_);
+            ExecutionResult result = inner.Execute(bound.get());
+            if (!result.success)
+                throw std::runtime_error(result.message);
+            ++subquery_runs_;
+            subquery_runs_ += inner.SubqueryRuns();
+            cached = subquery_cache_
+                         .emplace(std::make_pair(&subquery, key),
+                                  SubqueryResult{result.column_names.size(), std::move(result.tuples)})
+                         .first;
+        }
+        const SubqueryResult &rows = cached->second;
+
+        if (subquery.kind == SubqueryExpression::Kind::EXISTS)
+            return Value(rows.rows.empty() == subquery.negated);
+        if (rows.columns != 1)
+            throw std::runtime_error("Subquery must return exactly one column, not " + std::to_string(rows.columns));
+        if (subquery.kind == SubqueryExpression::Kind::SCALAR)
+        {
+            if (rows.rows.size() > 1)
+                throw std::runtime_error("Scalar subquery returned more than one row");
+            return rows.rows.empty() ? Value() : rows.rows[0].GetValue(0);
+        }
+        std::vector<Value> values;
+        values.reserve(rows.rows.size());
+        for (const Tuple &row : rows.rows)
+            values.push_back(row.GetValue(0));
+        const Value found = InValues(EvaluateExpression(subquery.operand.get(), resolve_outer), values);
+        return subquery.negated ? EvaluateUnaryOp(TokenType::NOT, found) : found;
+    }
+
+    ExecutionResult Executor::ExecuteStatement(Statement *stmt)
+    {
         if (!stmt)
             return {false, "Null statement", {}, {}};
 

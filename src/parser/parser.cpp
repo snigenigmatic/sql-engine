@@ -66,7 +66,7 @@ namespace sql
         }
     }
 
-    std::unique_ptr<SelectStatement> Parser::ParseSelect()
+    std::unique_ptr<SelectStatement> Parser::ParseSelectBody()
     {
         auto stmt = std::make_unique<SelectStatement>();
         Expect(TokenType::SELECT);
@@ -189,9 +189,22 @@ namespace sql
             if (Match(TokenType::OFFSET))
                 stmt->offset = std::stoll(Expect(TokenType::INTEGER_LITERAL).value);
         }
+        return stmt;
+    }
 
+    std::unique_ptr<SelectStatement> Parser::ParseSelect()
+    {
+        auto stmt = ParseSelectBody();
         Expect(TokenType::SEMICOLON);
         return stmt;
+    }
+
+    // "(SELECT ...)", after the "(" has been read
+    std::unique_ptr<SelectStatement> Parser::ParseSubqueryBody()
+    {
+        auto select = ParseSelectBody();
+        Expect(TokenType::RPAREN);
+        return select;
     }
 
     std::unique_ptr<Statement> Parser::ParseCreate()
@@ -479,6 +492,9 @@ namespace sql
         if (Match(TokenType::IN))
         {
             Expect(TokenType::LPAREN);
+            if (current_token_.type == TokenType::SELECT)
+                return std::make_unique<SubqueryExpression>(SubqueryExpression::Kind::IN, negated, std::move(left),
+                                                            ParseSubqueryBody());
             std::vector<std::unique_ptr<Expression>> list;
             do
             {
@@ -588,8 +604,15 @@ namespace sql
             return std::make_unique<LiteralExpression>(Value()); // untyped NULL
         case TokenType::FLOAT_LITERAL:
             return std::make_unique<LiteralExpression>(Value(std::stod(t.value)));
+        case TokenType::EXISTS:
+            Expect(TokenType::LPAREN);
+            return std::make_unique<SubqueryExpression>(SubqueryExpression::Kind::EXISTS, false, nullptr,
+                                                        ParseSubqueryBody());
         case TokenType::LPAREN:
         {
+            if (current_token_.type == TokenType::SELECT)
+                return std::make_unique<SubqueryExpression>(SubqueryExpression::Kind::SCALAR, false, nullptr,
+                                                            ParseSubqueryBody());
             auto expr = ParseExpression();
             Expect(TokenType::RPAREN);
             return expr;

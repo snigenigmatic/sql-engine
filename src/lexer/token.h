@@ -60,6 +60,7 @@ namespace sql
         LEFT,
         OUTER,
         CROSS,
+        EXISTS,
 
         // Identifiers and Literals
         IDENTIFIER,

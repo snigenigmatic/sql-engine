@@ -146,6 +146,7 @@ namespace sql
         static Scope ForSelect(const SelectStatement &select, Catalog *catalog);
 
         const std::vector<Relation> &Relations() const { return relations_; }
+        Catalog *GetCatalog() const { return catalog_; }
         size_t Size() const { return relations_.size(); }
         // Position of a relation's first column in joined rows
         size_t Offset(size_t relation) const;
@@ -156,13 +157,25 @@ namespace sql
         bool CanResolve(const std::string &name, size_t count = SIZE_MAX) const;
         // "relation.column" when the name resolves, else the name itself
         std::string Canonical(const std::string &name) const;
-        // Bit i set when the expression reads relation i; nullopt if some
-        // column does not resolve
+        // Bit i set when the expression reads relation i (subqueries count
+        // the columns of this query they refer to); nullopt if some column
+        // does not resolve
         std::optional<uint64_t> RelationsOf(const Expression *expr, size_t count = SIZE_MAX) const;
 
     private:
         std::vector<Relation> relations_;
+        Catalog *catalog_ = nullptr;
     };
+
+    // Names a subquery uses that none of its own tables (or those of the
+    // subqueries it is nested in) resolve: references to the enclosing
+    // query's row. SELECT aliases are not counted.
+    std::vector<std::string> OuterReferences(const SelectStatement &subquery, Catalog *catalog);
+
+    // A copy of the subquery with each outer reference replaced by its
+    // value (names not in `values` are left alone)
+    std::unique_ptr<SelectStatement> BindOuterReferences(const SelectStatement &subquery, Catalog *catalog,
+                                                         const std::vector<std::pair<std::string, Value>> &values);
 
     class Optimizer
     {

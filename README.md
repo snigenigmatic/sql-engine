@@ -18,6 +18,7 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - `ORDER BY` (by expression, output alias or position; `ASC`/`DESC`; NULLs first), `LIMIT` / `OFFSET`, `SELECT DISTINCT`
 - Aggregates: `COUNT(*)`, `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` (optionally `DISTINCT`), `GROUP BY` (expressions, positions or aliases), `HAVING` (hash aggregation). Aggregates skip NULLs. Every selected column must be grouped or aggregated. `SUM` of integers raises an error if the total overflows `INTEGER`.
 - Joins: `[INNER] JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` and comma joins, any number of tables, any `ON` condition, and table aliases (self-joins included). Tables join in the order written, by nested loop, hash or index join. `WHERE` conditions on one table filter it before the joins where that is safe.
+- Subqueries: scalar `(SELECT ...)`, `[NOT] EXISTS (SELECT ...)` and `x [NOT] IN (SELECT ...)`, anywhere an expression goes (including UPDATE and DELETE). They may be correlated, using columns of the enclosing query (`WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cid = c.id)`). Each subquery runs once per statement, or once per distinct set of outer values when correlated.
 - Expressions: `+ - * /` (with integer overflow checks), unary minus, `LIKE` / `NOT LIKE` (`%`, `_`), `IN (...)`, `BETWEEN ... AND ...`
 - Disk-resident B+tree indexes: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`), maintained row by row on INSERT/UPDATE/DELETE
 - Query planner: automatically uses index scan when an index exists on the filtered column
@@ -28,7 +29,7 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, with statement-level rollback inside a transaction
 
 ### Planned
-- SQL coverage: subqueries (see [docs/roadmap.md](docs/roadmap.md))
+- Usability and hardening: CLI meta-commands, `ANALYZE` and cost-based planning, golden SQL tests (see [docs/roadmap.md](docs/roadmap.md))
 
 ## Building
 
@@ -177,13 +178,14 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
 - [x] **M4**: On-disk B+tree indexes keyed by (value, RID), maintained incrementally
 - [x] **M5**: Write-ahead log with crash recovery, checkpoints, and atomic per-statement commit/rollback
 - [x] **M6**: `BEGIN` / `COMMIT` / `ROLLBACK` with savepoint-based statement rollback (single connection, so serializable)
-- [ ] **M7**: SQL coverage
+- [x] **M7**: SQL coverage
   - [x] NULL semantics and a single shared expression evaluator
   - [x] Constraints (`PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT`), type checking, `INSERT` column lists
   - [x] Expressions: arithmetic, computed and aliased SELECT columns, `LIKE`, `IN`, `BETWEEN` (index range scans)
   - [x] `ORDER BY`, `LIMIT` / `OFFSET`, `SELECT DISTINCT`
   - [x] Aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `GROUP BY`, `HAVING`
   - [x] `LEFT` / `CROSS` joins, joins of any number of tables, table aliases
+  - [x] Subqueries: scalar, `EXISTS`, `IN (SELECT ...)`, correlated
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

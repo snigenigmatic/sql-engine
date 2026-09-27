@@ -17,6 +17,8 @@
 #include "optimizer/optimizer.h"
 #include "catalog/catalog.h"
 #include "storage/table.h"
+#include "execution/evaluator.h"
+#include <map>
 #include <memory>
 #include <vector>
 #include <string>
@@ -39,7 +41,14 @@ namespace sql
 
         ExecutionResult Execute(Statement *stmt);
 
+        // Subqueries run by this executor so far (each distinct set of
+        // outer values runs once per statement)
+        size_t SubqueryRuns() const { return subquery_runs_; }
+
     private:
+        ExecutionResult ExecuteStatement(Statement *stmt);
+        // Result of a subquery for the enclosing row that resolve_outer reads
+        Value RunSubquery(const SubqueryExpression &subquery, const ColumnResolver &resolve_outer);
         std::unique_ptr<Operator> BuildPlan(SelectStatement *select);
         std::unique_ptr<Operator> BuildOperatorTree(const PhysicalPlanNode *node);
         // The right input of a join: the table itself, or its filtered rows
@@ -79,6 +88,16 @@ namespace sql
         std::unique_ptr<Table> aggregate_context_table_;
         std::unique_ptr<PhysicalPlanNode> physical_plan_;
         std::vector<std::unique_ptr<Table>> materialized_tables_;
+
+        // Subquery results for the statement being run, by subquery and the
+        // outer values it was run with
+        struct SubqueryResult
+        {
+            size_t columns = 0;
+            std::vector<Tuple> rows;
+        };
+        std::map<std::pair<const SubqueryExpression *, std::string>, SubqueryResult> subquery_cache_;
+        size_t subquery_runs_ = 0;
     };
 
 } // namespace sql

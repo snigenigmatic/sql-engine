@@ -35,6 +35,8 @@ namespace sql
             return "BETWEEN";
         case ExpressionType::AGGREGATE:
             return "AGGREGATE";
+        case ExpressionType::SUBQUERY:
+            return "SUBQUERY";
         default:
             return "UNKNOWN_EXPRESSION";
         }
@@ -146,6 +148,14 @@ namespace sql
                 out << DumpExpression(aggregate->argument.get(), indent + 1);
             break;
         }
+        case ExpressionType::SUBQUERY:
+        {
+            const auto *subquery = static_cast<const SubqueryExpression *>(expr);
+            out << Indent(indent) << "Subquery(" << ExpressionToSQL(expr) << ")";
+            if (subquery->operand)
+                out << "\n" << DumpExpression(subquery->operand.get(), indent + 1);
+            break;
+        }
         default:
             out << Indent(indent) << "UnknownExpression";
             break;
@@ -195,7 +205,9 @@ namespace sql
         {
             const ExpressionType t = expr->GetType();
             const bool simple =
-                t == ExpressionType::LITERAL || t == ExpressionType::COLUMN_REF || t == ExpressionType::AGGREGATE;
+                t == ExpressionType::LITERAL || t == ExpressionType::COLUMN_REF || t == ExpressionType::AGGREGATE ||
+                (t == ExpressionType::SUBQUERY &&
+                 static_cast<const SubqueryExpression *>(expr)->kind == SubqueryExpression::Kind::SCALAR);
             return simple ? ExpressionToSQL(expr) : "(" + ExpressionToSQL(expr) + ")";
         }
     } // namespace
@@ -268,8 +280,117 @@ namespace sql
                    (aggregate->distinct ? "DISTINCT " : "") +
                    (aggregate->argument ? ExpressionToSQL(aggregate->argument.get()) : "*") + ")";
         }
+        case ExpressionType::SUBQUERY:
+        {
+            const auto *subquery = static_cast<const SubqueryExpression *>(expr);
+            const std::string body = "(" + SelectToSQL(*subquery->select) + ")";
+            switch (subquery->kind)
+            {
+            case SubqueryExpression::Kind::SCALAR:
+                return body;
+            case SubqueryExpression::Kind::EXISTS:
+                return (subquery->negated ? "NOT EXISTS " : "EXISTS ") + body;
+            case SubqueryExpression::Kind::IN:
+                return OperandSQL(subquery->operand.get()) + (subquery->negated ? " NOT IN " : " IN ") + body;
+            }
+            break;
+        }
         }
         return "?";
+    }
+
+    SubqueryExpression::SubqueryExpression(Kind k, bool n, std::unique_ptr<Expression> o,
+                                           std::unique_ptr<SelectStatement> s)
+        : kind(k), negated(n), operand(std::move(o)), select(std::move(s)) {}
+
+    SubqueryExpression::~SubqueryExpression() = default;
+
+    std::string SelectToSQL(const SelectStatement &select)
+    {
+        std::string sql = select.distinct ? "SELECT DISTINCT " : "SELECT ";
+        if (select.select_star)
+            sql += "*";
+        for (size_t i = 0; i < select.items.size(); ++i)
+        {
+            sql += (i ? ", " : "") + ExpressionToSQL(select.items[i].expr.get());
+            if (!select.items[i].alias.empty())
+                sql += " AS " + select.items[i].alias;
+        }
+        sql += " FROM " + select.table + (select.table_alias.empty() ? "" : " " + select.table_alias);
+        for (const auto &join : select.joins)
+        {
+            sql += join.type == JoinType::LEFT ? " LEFT JOIN " : join.type == JoinType::CROSS ? " CROSS JOIN " : " JOIN ";
+            sql += join.right.table + (join.right.alias.empty() ? "" : " " + join.right.alias);
+            if (join.on)
+                sql += " ON " + ExpressionToSQL(join.on.get());
+        }
+        if (select.where)
+            sql += " WHERE " + ExpressionToSQL(select.where.get());
+        for (size_t i = 0; i < select.group_by.size(); ++i)
+            sql += (i ? ", " : " GROUP BY ") + ExpressionToSQL(select.group_by[i].get());
+        if (select.having)
+            sql += " HAVING " + ExpressionToSQL(select.having.get());
+        for (size_t i = 0; i < select.order_by.size(); ++i)
+            sql += (i ? ", " : " ORDER BY ") + ExpressionToSQL(select.order_by[i].expr.get()) +
+                   (select.order_by[i].descending ? " DESC" : "");
+        if (select.limit)
+            sql += " LIMIT " + std::to_string(*select.limit);
+        if (select.offset > 0)
+            sql += " OFFSET " + std::to_string(select.offset);
+        return sql;
+    }
+
+    std::unique_ptr<SelectStatement> CloneSelect(
+        const SelectStatement &select, const std::function<std::unique_ptr<Expression>(const Expression *)> &replace)
+    {
+        auto copy = [&](const std::unique_ptr<Expression> &e)
+        { return RewriteExpression(e.get(), replace); };
+        auto clone = std::make_unique<SelectStatement>();
+        clone->table = select.table;
+        clone->table_alias = select.table_alias;
+        for (const auto &join : select.joins)
+        {
+            JoinClause j;
+            j.type = join.type;
+            j.right = join.right;
+            j.on = copy(join.on);
+            clone->joins.push_back(std::move(j));
+        }
+        for (const auto &item : select.items)
+            clone->items.push_back(SelectItem{copy(item.expr), item.alias});
+        clone->columns = select.columns;
+        clone->select_star = select.select_star;
+        clone->distinct = select.distinct;
+        clone->where = copy(select.where);
+        for (const auto &key : select.group_by)
+            clone->group_by.push_back(copy(key));
+        clone->having = copy(select.having);
+        for (const auto &order : select.order_by)
+            clone->order_by.push_back(OrderItem{copy(order.expr), order.descending});
+        clone->limit = select.limit;
+        clone->offset = select.offset;
+        return clone;
+    }
+
+    std::vector<const Expression *> SelectExpressions(const SelectStatement &select)
+    {
+        std::vector<const Expression *> exprs;
+        for (const auto &item : select.items)
+            exprs.push_back(item.expr.get());
+        for (const auto &join : select.joins)
+        {
+            if (join.on)
+                exprs.push_back(join.on.get());
+        }
+        if (select.where)
+            exprs.push_back(select.where.get());
+        for (const auto &key : select.group_by)
+            exprs.push_back(key.get());
+        if (select.having)
+            exprs.push_back(select.having.get());
+        for (const auto &order : select.order_by)
+            exprs.push_back(order.expr.get());
+        return exprs;
     }
 
     const char *AggregateFunctionName(AggregateFunction function)
@@ -330,6 +451,13 @@ namespace sql
             const auto *aggregate = static_cast<const AggregateExpression *>(expr);
             if (aggregate->argument)
                 return {aggregate->argument.get()};
+            return {};
+        }
+        case ExpressionType::SUBQUERY:
+        {
+            const auto *subquery = static_cast<const SubqueryExpression *>(expr);
+            if (subquery->operand)
+                return {subquery->operand.get()};
             return {};
         }
         }
@@ -416,6 +544,9 @@ namespace sql
                 return false;
             break;
         }
+        case ExpressionType::SUBQUERY:
+            // Comparing query bodies is not worth it: only a node equals itself
+            return a == b;
         }
         const std::vector<const Expression *> left = ExpressionChildren(a);
         const std::vector<const Expression *> right = ExpressionChildren(b);
@@ -484,6 +615,12 @@ namespace sql
             const auto *aggregate = static_cast<const AggregateExpression *>(expr);
             return std::make_unique<AggregateExpression>(aggregate->function, copy(aggregate->argument),
                                                          aggregate->distinct);
+        }
+        case ExpressionType::SUBQUERY:
+        {
+            const auto *subquery = static_cast<const SubqueryExpression *>(expr);
+            return std::make_unique<SubqueryExpression>(subquery->kind, subquery->negated, copy(subquery->operand),
+                                                        CloneSelect(*subquery->select, replace));
         }
         }
         throw std::logic_error("Unknown expression type");

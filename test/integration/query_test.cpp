@@ -1700,4 +1700,143 @@ namespace sql
                   (std::vector<std::string>{"ann|2"}));
     }
 
+    // ── Subqueries ─────────────────────────────────────────────────────────────────
+
+    TEST(IntegrationTest, InSubqueriesAndNulls)
+    {
+        Catalog catalog;
+        CreateOrdersAndCustomers(catalog); // orders(oid, cid): cid 10, 20, 10, 30
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT name FROM customers WHERE id IN (SELECT cid FROM orders WHERE oid < 3) "
+                                       "ORDER BY id;")),
+                  (std::vector<std::string>{"Alice", "Bob"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT id FROM customers WHERE id NOT IN (SELECT cid FROM orders "
+                                       "WHERE oid <> 4);")),
+                  (std::vector<std::string>{"30"}));
+        // A NULL in the subquery makes NOT IN unknown for every other row
+        RunSQL(catalog, "INSERT INTO orders VALUES (5, NULL);");
+        EXPECT_TRUE(RunSQL(catalog, "SELECT id FROM customers WHERE id NOT IN (SELECT cid FROM orders "
+                                    "WHERE oid <> 4);")
+                        .tuples.empty());
+        // ... but IN still finds its matches
+        EXPECT_EQ(RunSQL(catalog, "SELECT id FROM customers WHERE id IN (SELECT cid FROM orders);").tuples.size(), 3u);
+        // Empty subquery: IN is FALSE, NOT IN TRUE
+        EXPECT_EQ(RunSQL(catalog, "SELECT id FROM customers WHERE id NOT IN (SELECT cid FROM orders WHERE oid > 99);")
+                      .tuples.size(),
+                  3u);
+    }
+
+    TEST(IntegrationTest, ScalarSubqueries)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog); // ages 30, NULL, 25, 41, 25
+        // AVG is 30.25
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT name FROM p WHERE age > (SELECT AVG(age) FROM p) ORDER BY id;")),
+                  (std::vector<std::string>{"di"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT name FROM p WHERE age >= (SELECT MAX(age) FROM p WHERE id < 4) "
+                                       "ORDER BY id;")),
+                  (std::vector<std::string>{"ann", "di"}));
+        auto result = RunSQL(catalog, "SELECT name, age - (SELECT MIN(age) FROM p) AS older FROM p "
+                                      "WHERE age IS NOT NULL ORDER BY id;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(Rows(result), (std::vector<std::string>{"ann|5", "cy|0", "di|16", "ed|0"}));
+        // No row gives NULL
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT id, (SELECT name FROM p WHERE id = 99) FROM p WHERE id = 1;")),
+                  (std::vector<std::string>{"1|NULL"}));
+        EXPECT_EQ(ErrorOf(catalog, "SELECT id FROM p WHERE age = (SELECT age FROM p WHERE age = 25);"),
+                  "Scalar subquery returned more than one row");
+        EXPECT_EQ(ErrorOf(catalog, "SELECT id FROM p WHERE age = (SELECT id, age FROM p WHERE id = 1);"),
+                  "Subquery must return exactly one column, not 2");
+        EXPECT_EQ(ErrorOf(catalog, "SELECT id FROM p WHERE id IN (SELECT * FROM p);"),
+                  "Subquery must return exactly one column, not 4");
+        EXPECT_EQ(ErrorOf(catalog, "SELECT id FROM p WHERE id IN (SELECT nosuch FROM p);"), "Unknown column: nosuch");
+        EXPECT_EQ(ErrorOf(catalog, "SELECT id FROM p WHERE EXISTS (SELECT 1 FROM nosuch);"),
+                  "Table not found: nosuch");
+    }
+
+    TEST(IntegrationTest, CorrelatedSubqueries)
+    {
+        Catalog catalog;
+        CreateOrdersAndCustomers(catalog);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT name FROM customers c WHERE EXISTS "
+                                       "(SELECT 1 FROM orders WHERE orders.cid = c.id AND oid > 1) ORDER BY id;")),
+                  (std::vector<std::string>{"Alice", "Bob", "NULL"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT id FROM customers c WHERE NOT EXISTS "
+                                       "(SELECT 1 FROM orders o WHERE o.cid = c.id AND o.oid <> 4);")),
+                  (std::vector<std::string>{"30"}));
+        // A per-row count; a column of the subquery's own table shadows the
+        // outer one (orders has no "id", so id means customers.id)
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT id, (SELECT COUNT(*) FROM orders WHERE cid = id) FROM customers "
+                                       "ORDER BY id;")),
+                  (std::vector<std::string>{"10|2", "20|1", "30|1"}));
+        // Two levels, the innermost reaching the outermost query
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o "
+                                       "WHERE o.cid = c.id AND o.oid IN (SELECT o2.oid FROM orders o2 "
+                                       "WHERE o2.oid > 2 AND o2.cid = c.id)) ORDER BY c.id;")),
+                  (std::vector<std::string>{"Alice", "NULL"}));
+        // In an ON condition, over a join, and in a WHERE that is pushed down
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT o.oid, c.name FROM orders o JOIN customers c ON c.id = o.cid "
+                                       "AND o.oid = (SELECT MAX(oid) FROM orders WHERE cid = c.id) ORDER BY o.oid;")),
+                  (std::vector<std::string>{"2|Bob", "3|Alice", "4|NULL"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT o.oid FROM orders o JOIN customers c ON c.id = o.cid "
+                                       "WHERE c.id IN (SELECT cid FROM orders WHERE oid = 1) ORDER BY o.oid;")),
+                  (std::vector<std::string>{"1", "3"}));
+        // A correlated condition naming two tables is checked after the join
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT o.oid FROM orders o JOIN customers c ON c.id = o.cid "
+                                       "WHERE EXISTS (SELECT 1 FROM orders x WHERE x.cid = c.id AND x.oid > o.oid);")),
+                  (std::vector<std::string>{"1"}));
+        // o.oid alone would let this filter orders before the join, but the
+        // subquery also reads c, so it must wait for the joined rows
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT o.oid FROM orders o JOIN customers c ON c.id = o.cid "
+                                       "WHERE o.oid IN (SELECT MIN(x.oid) FROM orders x WHERE x.cid = c.id) "
+                                       "ORDER BY o.oid;")),
+                  (std::vector<std::string>{"1", "2", "4"}));
+        // Grouped queries take uncorrelated subqueries only
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT cid, COUNT(*) FROM orders GROUP BY cid "
+                                       "HAVING COUNT(*) >= (SELECT MAX(oid) - 2 FROM orders) ORDER BY cid;")),
+                  (std::vector<std::string>{"10|2"}));
+        EXPECT_NE(ErrorOf(catalog, "SELECT cid, (SELECT name FROM customers WHERE id = cid) FROM orders "
+                                   "GROUP BY cid;")
+                      .find("Correlated subqueries are not supported"),
+                  std::string::npos);
+    }
+
+    TEST(IntegrationTest, SubqueriesInUpdateAndDelete)
+    {
+        Catalog catalog;
+        CreateOrdersAndCustomers(catalog);
+        RunSQL(catalog, "CREATE TABLE totals (cid INTEGER, n INTEGER);");
+        RunSQL(catalog, "INSERT INTO totals VALUES (10, 0), (20, 0), (99, 0);");
+        ASSERT_TRUE(RunSQL(catalog, "UPDATE totals SET n = (SELECT COUNT(*) FROM orders WHERE orders.cid = totals.cid);")
+                        .success);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT cid, n FROM totals ORDER BY cid;")),
+                  (std::vector<std::string>{"10|2", "20|1", "99|0"}));
+        auto deleted = RunSQL(catalog, "DELETE FROM orders WHERE cid IN (SELECT id FROM customers WHERE name = 'Alice');");
+        ASSERT_TRUE(deleted.success) << deleted.message;
+        EXPECT_EQ(deleted.message, "2 row(s) deleted.");
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT oid FROM orders ORDER BY oid;")), (std::vector<std::string>{"2", "4"}));
+        // VALUES may use uncorrelated subqueries
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO totals VALUES ((SELECT MAX(oid) FROM orders), 1);").success);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT n FROM totals WHERE cid = 4;")), (std::vector<std::string>{"1"}));
+    }
+
+    TEST(IntegrationTest, SubqueryResultsAreReused)
+    {
+        Catalog catalog;
+        CreateOrdersAndCustomers(catalog);
+        auto run = [&](const std::string &sql)
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            Executor executor(&catalog);
+            auto result = executor.Execute(stmt.get());
+            EXPECT_TRUE(result.success) << result.message;
+            return executor.SubqueryRuns();
+        };
+        // Uncorrelated: once for all four rows
+        EXPECT_EQ(run("SELECT oid FROM orders WHERE cid IN (SELECT id FROM customers);"), 1u);
+        // Correlated: once per distinct outer value (cid 10 appears twice)
+        EXPECT_EQ(run("SELECT oid, (SELECT name FROM customers WHERE id = cid) FROM orders;"), 3u);
+    }
+
 } // namespace sql

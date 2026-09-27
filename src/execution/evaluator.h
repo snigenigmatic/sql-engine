@@ -31,6 +31,29 @@ namespace sql
     // the left one already decides the result.
     Value EvaluateExpression(const Expression *expr, const ColumnResolver &resolve_column);
 
+    // Runs a subquery for EvaluateExpression. resolve_outer gives the
+    // values of the enclosing row, for names the subquery cannot resolve.
+    using SubqueryRunner = std::function<Value(const SubqueryExpression &, const ColumnResolver &resolve_outer)>;
+
+    // Installs a subquery runner on this thread while it is alive (they
+    // nest). Without one, evaluating a subquery is an error.
+    class SubqueryScope
+    {
+    public:
+        explicit SubqueryScope(SubqueryRunner runner);
+        ~SubqueryScope();
+        SubqueryScope(const SubqueryScope &) = delete;
+        SubqueryScope &operator=(const SubqueryScope &) = delete;
+
+    private:
+        SubqueryRunner runner_;
+        const SubqueryRunner *previous_;
+    };
+
+    // x IN (values) with SQL's three-valued rules: TRUE if some value
+    // equals x, else NULL if x or some value is NULL, else FALSE
+    Value InValues(const Value &operand, const std::vector<Value> &values);
+
     // Convert a number to the other numeric type without changing its value.
     // Returns nullopt when no value of the target type equals it (2.5 as an
     // INTEGER). NULLs, non-numeric values and values already of the target

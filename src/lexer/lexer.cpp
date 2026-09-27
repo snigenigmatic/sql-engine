@@ -295,6 +295,7 @@ namespace sql
              {"LEFT", TokenType::LEFT},
              {"OUTER", TokenType::OUTER},
              {"CROSS", TokenType::CROSS},
+             {"EXISTS", TokenType::EXISTS},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

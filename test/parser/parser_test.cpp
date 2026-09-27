@@ -830,4 +830,46 @@ namespace sql
         EXPECT_NO_THROW(parser.ParseStatement());
     }
 
+    TEST(ParserTest, Subqueries)
+    {
+        Lexer lexer("SELECT name, (SELECT COUNT(*) FROM o WHERE o.cid = c.id) AS n FROM c "
+                    "WHERE id IN (SELECT cid FROM o) AND NOT EXISTS (SELECT 1 FROM b WHERE b.id = c.id) "
+                    "AND id NOT IN (SELECT x FROM y WHERE x IN (SELECT z FROM w));");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        ASSERT_EQ(select->items[1].expr->GetType(), ExpressionType::SUBQUERY);
+        const auto *scalar = static_cast<const SubqueryExpression *>(select->items[1].expr.get());
+        EXPECT_EQ(scalar->kind, SubqueryExpression::Kind::SCALAR);
+        EXPECT_EQ(scalar->select->table, "o");
+        EXPECT_EQ(ExpressionToSQL(scalar), "(SELECT COUNT(*) FROM o WHERE o.cid = c.id)");
+        EXPECT_EQ(ExpressionToSQL(select->where.get()),
+                  "((id IN (SELECT cid FROM o)) AND (NOT (EXISTS (SELECT 1 FROM b WHERE b.id = c.id)))) AND "
+                  "(id NOT IN (SELECT x FROM y WHERE x IN (SELECT z FROM w)))");
+        // A subquery's body is its own query: its column references are not
+        // the outer query's children
+        EXPECT_TRUE(ExpressionChildren(scalar).empty());
+        EXPECT_FALSE(ContainsAggregate(scalar));
+
+        // Copies are deep, and the replacement reaches nested bodies
+        auto copy = RewriteExpression(select->where.get(), [](const Expression *node) -> std::unique_ptr<Expression>
+                                      {
+            if (node->GetType() == ExpressionType::COLUMN_REF &&
+                static_cast<const ColumnExpression *>(node)->name == "z")
+                return std::make_unique<ColumnExpression>("zz");
+            return nullptr; });
+        EXPECT_NE(ExpressionToSQL(copy.get()).find("IN (SELECT zz FROM w)"), std::string::npos);
+    }
+
+    TEST(ParserTest, BadSubqueries)
+    {
+        for (const char *sql : {"SELECT * FROM t WHERE x IN (SELECT y FROM u;", "SELECT * FROM t WHERE EXISTS SELECT 1;",
+                                "SELECT * FROM t WHERE x = SELECT y FROM u;", "SELECT * FROM t WHERE (SELECT y FROM u;"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
+    }
+
 } // namespace sql
