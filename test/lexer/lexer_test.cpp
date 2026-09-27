@@ -127,4 +127,13 @@ namespace sql
         TestTokens(input, expected);
     }
 
+    TEST(LexerTest, DoubledQuoteInsideAString)
+    {
+        TestTokens("'it''s' '''' '' 'a''b''c'",
+                   {{TokenType::STRING_LITERAL, "it's"},
+                    {TokenType::STRING_LITERAL, "'"},
+                    {TokenType::STRING_LITERAL, ""},
+                    {TokenType::STRING_LITERAL, "a'b'c"}});
+    }
+
 } // namespace sql

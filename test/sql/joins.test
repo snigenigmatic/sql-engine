@@ -1,0 +1,109 @@
+# INNER / LEFT / CROSS joins, aliases, self-joins and three-way joins
+
+statement ok
+CREATE TABLE emp (id INTEGER PRIMARY KEY, name VARCHAR(10), mgr INTEGER, dept INTEGER)
+
+statement ok
+CREATE TABLE dept (id INTEGER, dname VARCHAR(10))
+
+statement ok
+INSERT INTO emp VALUES (1, 'ann', NULL, 10), (2, 'bo', 1, 10), (3, 'cy', 1, 20), (4, 'di', 2, NULL)
+
+statement ok
+INSERT INTO dept VALUES (10, 'eng'), (20, 'ops'), (30, 'hr')
+
+query nosort
+SELECT e.name, d.dname FROM emp e JOIN dept d ON e.dept = d.id ORDER BY e.id
+----
+ann|eng
+bo|eng
+cy|ops
+
+query nosort
+SELECT e.name, m.name AS boss FROM emp e JOIN emp m ON e.mgr = m.id ORDER BY e.id
+----
+bo|ann
+cy|ann
+di|bo
+
+query nosort
+SELECT e.name, d.dname FROM emp e LEFT JOIN dept d ON e.dept = d.id ORDER BY e.id
+----
+ann|eng
+bo|eng
+cy|ops
+di|NULL
+
+# ON decides what matches; WHERE runs after the join
+query nosort
+SELECT e.name, d.dname FROM emp e LEFT JOIN dept d ON e.dept = d.id AND d.dname = 'ops' ORDER BY e.id
+----
+ann|NULL
+bo|NULL
+cy|ops
+di|NULL
+
+query rowsort
+SELECT e.name FROM emp e LEFT JOIN dept d ON e.dept = d.id WHERE d.id IS NULL
+----
+di
+
+query nosort
+SELECT d.dname, COUNT(e.id) FROM dept d LEFT JOIN emp e ON e.dept = d.id GROUP BY d.dname ORDER BY 1
+----
+eng|2
+hr|0
+ops|1
+
+query nosort
+SELECT e.name, d.dname, m.name FROM emp e LEFT JOIN dept d ON e.dept = d.id LEFT JOIN emp m ON m.id = e.mgr ORDER BY e.id
+----
+ann|eng|NULL
+bo|eng|ann
+cy|ops|ann
+di|NULL|bo
+
+query nosort
+SELECT COUNT(*) FROM emp, dept
+----
+12
+
+# rowsort: compared as sorted lists, whatever order the rows come in
+query rowsort
+SELECT d.dname FROM dept d
+----
+eng
+hr
+ops
+
+query nosort
+SELECT COUNT(*) FROM emp CROSS JOIN dept WHERE emp.dept = dept.id
+----
+3
+
+query nosort
+SELECT e.name, d.id FROM emp e JOIN dept d ON e.dept < d.id ORDER BY e.id, d.id
+----
+ann|20
+ann|30
+bo|20
+bo|30
+cy|30
+
+statement error Ambiguous column: name
+SELECT name FROM emp e JOIN emp m ON e.mgr = m.id
+
+statement error specified more than once
+SELECT * FROM emp JOIN emp ON emp.id = emp.id
+
+# With indexes the plan changes, the answers do not
+statement ok
+CREATE INDEX dept_id ON dept (id)
+
+query nosort
+SELECT e.name, d.dname FROM emp e LEFT JOIN dept d ON e.dept = d.id ORDER BY e.id
+----
+ann|eng
+bo|eng
+cy|ops
+di|NULL

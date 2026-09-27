@@ -49,7 +49,7 @@ namespace sql
         return Execute(stmt.get());
     }
 
-    std::vector<ExecutionResult> Session::ExecuteScript(const std::string &sql)
+    std::vector<ExecutionResult> Session::ExecuteScript(const std::string &sql, bool stop_on_error)
     {
         std::vector<ExecutionResult> results;
         Lexer lexer(sql);
@@ -76,6 +76,8 @@ namespace sql
                 break;
             }
             results.push_back(Execute(stmt.get()));
+            if (stop_on_error && !results.back().success)
+                break;
         }
         return results;
     }

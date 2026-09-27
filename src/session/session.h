@@ -35,8 +35,9 @@ namespace sql
         ExecutionResult Execute(Statement *stmt);
 
         // Run every statement in the input, in order, returning one result
-        // each. Stops after a statement that cannot be parsed.
-        std::vector<ExecutionResult> ExecuteScript(const std::string &sql);
+        // each. Stops after a statement that cannot be parsed, and with
+        // stop_on_error after any statement that fails.
+        std::vector<ExecutionResult> ExecuteScript(const std::string &sql, bool stop_on_error = false);
 
         bool InTransaction() const { return in_transaction_; }
 

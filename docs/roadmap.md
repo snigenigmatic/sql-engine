@@ -68,11 +68,25 @@ Add these in small PRs, each with parser tests plus `query_test` cases:
    - Not yet supported: correlated subqueries in the SELECT list, HAVING or ORDER BY of a grouped query, and decorrelation into joins.
 
 ## M8 — Usability & hardening
-- CLI: `sqlengine <file.db>`, multi-line input, `.tables` / `.schema` meta-commands and running a `.sql` script from a file or stdin.
-- Pretty table output with row count and timing.
-- `ANALYZE` for basic table stats (row count, distinct count), so the optimizer can choose join order and index vs. scan by cost.
-- CI additions: ASan/UBSan job, a sqllogictest-style golden test runner (`test/sql/*.test`) and a small benchmark.
-- Update `README.md` phases and `docs/design.md` as each milestone lands.
+Split into two PRs.
+
+**M8.1 (done):**
+- CLI:
+  - `sqlengine <file.db>` with multi-line input;
+  - `.tables`, `.schema`, `.read FILE`, `.timer` and `.save` dot commands;
+  - piped scripts (`sqlengine db < script.sql`) run without a banner or prompts.
+- Output:
+  - tables with each column sized to its values, numbers right-aligned, plus a row count and optional timing;
+  - floats printed as the shortest text that reads back as the same value (`0.1`, `2.0`).
+- The lexer accepts `''` inside string literals, so `.schema` output can be run again.
+- Tests:
+  - a sqllogictest-style golden test runner over `test/sql/*.test`;
+  - expected results cross-checked against SQLite, with the intentional differences noted in the files.
+- CI: an ASan/UBSan job and a Release (`-Wall -Wextra`) job, alongside Debug.
+
+**M8.2:**
+- `ANALYZE` collects basic table statistics (row count, distinct count). The optimizer then chooses join order, the hash-join build side, and index vs. scan by cost.
+- Update `docs/design.md`.
 
 ---
 

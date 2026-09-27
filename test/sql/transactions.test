@@ -1,0 +1,59 @@
+# BEGIN / COMMIT / ROLLBACK. Outside a transaction each statement commits on
+# its own; inside one, a failed statement is undone and the rest stays.
+
+statement ok
+CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR(10))
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 'a'), (2, 'b')
+
+statement error UNIQUE constraint failed: t.id
+INSERT INTO t VALUES (3, 'c'), (1, 'dup')
+
+query nosort
+SELECT id, v FROM t ORDER BY id
+----
+1|a
+2|b
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE t SET v = 'changed'
+
+statement ok
+DELETE FROM t WHERE id = 1
+
+statement ok
+CREATE TABLE gone (x INTEGER)
+
+statement ok
+ROLLBACK
+
+query nosort
+SELECT id, v FROM t ORDER BY id
+----
+1|a
+2|b
+
+statement error Table not found: gone
+SELECT * FROM gone
+
+statement error No transaction is in progress
+COMMIT
+
+statement ok
+BEGIN
+
+statement error A transaction is already in progress
+BEGIN
+
+statement ok
+ROLLBACK

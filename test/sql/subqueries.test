@@ -1,0 +1,80 @@
+# Scalar, EXISTS and IN subqueries, correlated or not
+
+statement ok
+CREATE TABLE c (id INTEGER PRIMARY KEY, name VARCHAR(10))
+
+statement ok
+CREATE TABLE o (oid INTEGER, cid INTEGER, amt INTEGER)
+
+statement ok
+INSERT INTO c VALUES (1, 'al'), (2, 'bo'), (3, 'cy')
+
+statement ok
+INSERT INTO o VALUES (10, 1, 5), (11, 1, 7), (12, 2, 3), (13, NULL, 9)
+
+query nosort
+SELECT name FROM c WHERE EXISTS (SELECT 1 FROM o WHERE o.cid = c.id) ORDER BY id
+----
+al
+bo
+
+query nosort
+SELECT name FROM c WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.cid = c.id)
+----
+cy
+
+query nosort
+SELECT name, (SELECT COUNT(*) FROM o WHERE cid = c.id) FROM c ORDER BY id
+----
+al|2
+bo|1
+cy|0
+
+query nosort
+SELECT name FROM c WHERE id IN (SELECT cid FROM o) ORDER BY id
+----
+al
+bo
+
+# o.cid holds a NULL, so NOT IN is never true
+query nosort
+SELECT name FROM c WHERE id NOT IN (SELECT cid FROM o)
+----
+
+query nosort
+SELECT name FROM c WHERE id NOT IN (SELECT cid FROM o WHERE cid IS NOT NULL)
+----
+cy
+
+query nosort
+SELECT oid FROM o WHERE amt > (SELECT AVG(amt) FROM o) ORDER BY oid
+----
+11
+13
+
+query nosort
+SELECT oid, (SELECT name FROM c WHERE id = o.cid) FROM o ORDER BY oid
+----
+10|al
+11|al
+12|bo
+13|NULL
+
+# SQLite would use the first row; here it is an error
+statement error Scalar subquery returned more than one row
+SELECT name FROM c WHERE id = (SELECT id FROM c)
+
+statement error Subquery must return exactly one column
+SELECT name FROM c WHERE id IN (SELECT id, name FROM c)
+
+statement ok
+UPDATE c SET name = 'big' WHERE id IN (SELECT cid FROM o WHERE amt > 6)
+
+statement ok
+DELETE FROM o WHERE cid NOT IN (SELECT id FROM c WHERE name = 'big')
+
+query nosort
+SELECT oid, name FROM o JOIN c ON c.id = o.cid ORDER BY oid
+----
+10|big
+11|big

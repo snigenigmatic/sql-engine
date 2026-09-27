@@ -24,12 +24,12 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Query planner: automatically uses index scan when an index exists on the filtered column
 - Single-file database: tables and index definitions are stored in 4 KB pages (slotted heaps + a `sqlite_master`-style schema table) behind an LRU buffer pool
 - Crash safety: a write-ahead log makes every statement atomic and durable; committed work is recovered after a crash, anything uncommitted is discarded
-- Interactive REPL
+- Interactive REPL with dot commands (`.tables`, `.schema`, `.read`, `.timer`), or run a script from stdin
 
 - Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, with statement-level rollback inside a transaction
 
 ### Planned
-- Usability and hardening: CLI meta-commands, `ANALYZE` and cost-based planning, golden SQL tests (see [docs/roadmap.md](docs/roadmap.md))
+- `ANALYZE` and cost-based planning (see [docs/roadmap.md](docs/roadmap.md))
 
 ## Building
 
@@ -101,7 +101,10 @@ sql-engine/
 
 ```bash
 ./build/src/sqlengine [database-file]   # default: sqlengine.db
+./build/src/sqlengine mydb.db < script.sql   # run a script: no banner or prompts
 ```
+
+Statements end with `;` and may span lines. Results print as aligned tables (numbers right-aligned) with a row count. Floats print as the shortest text that reads back as the same value (`0.1`, `2.0`, `1e+20`).
 
 Each statement is atomic and durable: it is committed to the write-ahead log (`<file>-wal`) when it succeeds and rolled back when it fails. The log is copied into the database file by checkpoints (automatically, on `save`, and on exit), and replayed on the next start if the process crashes. Only one process can have a database open at a time. A text snapshot left in `.sqlengine/` by older versions is imported automatically the first time a new database file is created.
 
@@ -135,10 +138,15 @@ SELECT * FROM users WHERE id > 1;   -- uses index range scan
 
 | Command | Description |
 |---|---|
-| `tables` | List all tables and their columns |
-| `save` | Checkpoint: copy the write-ahead log into the database file |
-| `help` | Show SQL syntax reference |
-| `quit` / `exit` | Save and exit |
+| `.tables` | List tables with their columns and row counts |
+| `.schema [table]` | Show the `CREATE TABLE` / `CREATE INDEX` statements for one table, or all |
+| `.read FILE` | Run the SQL in a file, stopping at the first failing statement |
+| `.timer on\|off` | Show how long each statement takes |
+| `.save` | Checkpoint: copy the write-ahead log into the database file |
+| `.help` | Show commands and SQL examples |
+| `.quit` / `.exit` | Exit (an open transaction is rolled back) |
+
+The older spellings without the dot (`tables`, `save`, `help`, `quit`) still work.
 
 ## Testing
 
@@ -153,6 +161,24 @@ cmake --build build && ctest --test-dir build --output-on-failure
 # Verbose output
 ctest --test-dir build --output-on-failure --verbose
 ```
+
+Golden SQL tests live in `test/sql/*.test` (run by `sql_logic_test`), in a small subset of the sqllogictest format:
+
+```
+statement ok
+CREATE TABLE t (id INTEGER, name VARCHAR(10))
+
+statement error UNIQUE constraint failed
+INSERT INTO t VALUES (1, 'dup')
+
+query rowsort
+SELECT id, name FROM t
+----
+1|ann
+2|bo
+```
+
+`query nosort` compares rows in order; `rowsort` sorts both sides first. Each file runs in a fresh database. The expected results were cross-checked against SQLite; where this engine deliberately differs (strict `GROUP BY`, 32-bit `INTEGER`, errors instead of NULL for division by zero), the file says so. CI runs everything in Debug, Release (`-Wall -Wextra`) and ASan/UBSan builds.
 
 ## Development Phases
 
@@ -186,6 +212,10 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
   - [x] Aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `GROUP BY`, `HAVING`
   - [x] `LEFT` / `CROSS` joins, joins of any number of tables, table aliases
   - [x] Subqueries: scalar, `EXISTS`, `IN (SELECT ...)`, correlated
+- [ ] **M8**: Usability and hardening
+  - [x] Dot commands (`.tables`, `.schema`, `.read`, `.timer`), aligned output, float formatting, piped scripts
+  - [x] Golden SQL tests (`test/sql`), sanitizer and Release CI jobs
+  - [ ] `ANALYZE` and cost-based planning
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

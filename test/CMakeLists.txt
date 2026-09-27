@@ -12,6 +12,7 @@ macro(add_sqlengine_test test_name)
             storage
             catalog
             session
+            cli
     )
     add_test(NAME ${test_name} COMMAND ${test_name})
 endmacro()
@@ -29,6 +30,13 @@ add_sqlengine_test(parser_test parser/parser_test.cpp)
 
 # Integration tests
 add_sqlengine_test(query_test integration/query_test.cpp)
+
+# REPL shell
+add_sqlengine_test(cli_test cli/cli_test.cpp)
+
+# Golden SQL scripts (test/sql/*.test)
+add_sqlengine_test(sql_logic_test sql/sql_logic_test.cpp)
+target_compile_definitions(sql_logic_test PRIVATE SQL_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sql")
 # Storage tests
 add_sqlengine_test(buffer_pool_test storage/buffer_pool_test.cpp)
 add_sqlengine_test(table_heap_test storage/table_heap_test.cpp)

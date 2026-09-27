@@ -8,6 +8,10 @@
 namespace sql
 {
 
+    // A double as the shortest text that reads back as the same value, with
+    // ".0" added to whole numbers (2.0, 0.1, 1e+20, inf, nan)
+    std::string FormatFloat(double value);
+
     class Value
     {
     public:

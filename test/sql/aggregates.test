@@ -1,0 +1,82 @@
+# Aggregates, GROUP BY and HAVING. Unlike SQLite, a selected column must be
+# grouped or aggregated, and SUM of INTEGERs must fit in 32 bits.
+
+statement ok
+CREATE TABLE p (id INTEGER, city VARCHAR(10), age INTEGER, score FLOAT)
+
+query nosort
+SELECT COUNT(*), COUNT(age), SUM(age), AVG(age), MIN(city), MAX(score) FROM p
+----
+0|0|NULL|NULL|NULL|NULL
+
+query nosort
+SELECT city, COUNT(*) FROM p GROUP BY city
+----
+
+statement ok
+INSERT INTO p VALUES (1, 'oslo', 30, 1.5), (2, 'rome', NULL, 2.0), (3, 'oslo', 25, NULL), (4, 'lima', 41, 0.5), (5, 'rome', 25, 3.0), (6, NULL, 60, 1.0)
+
+query nosort
+SELECT city, COUNT(*), COUNT(age), SUM(age), MIN(age), MAX(age) FROM p GROUP BY city ORDER BY city
+----
+NULL|1|1|60|60|60
+lima|1|1|41|41|41
+oslo|2|2|55|25|30
+rome|2|1|25|25|25
+
+query nosort
+SELECT city, AVG(age), SUM(score) FROM p WHERE city IS NOT NULL GROUP BY city ORDER BY city
+----
+lima|41.0|0.5
+oslo|27.5|1.5
+rome|25.0|5.0
+
+query nosort
+SELECT COUNT(DISTINCT age), SUM(DISTINCT age), COUNT(DISTINCT city) FROM p
+----
+4|156|3
+
+query nosort
+SELECT city, COUNT(*) AS n FROM p GROUP BY city HAVING n > 1 ORDER BY city
+----
+oslo|2
+rome|2
+
+query nosort
+SELECT city FROM p GROUP BY city HAVING MAX(age) >= 30 ORDER BY MAX(age) DESC
+----
+NULL
+lima
+oslo
+
+query nosort
+SELECT age / 10 AS decade, COUNT(*) FROM p WHERE age IS NOT NULL GROUP BY decade ORDER BY 1
+----
+2|2
+3|1
+4|1
+6|1
+
+query nosort
+SELECT city, MAX(age) - MIN(age) AS spread FROM p GROUP BY 1 HAVING COUNT(age) > 1
+----
+oslo|5
+
+query nosort
+SELECT COUNT(*) FROM p HAVING COUNT(*) > 100
+----
+
+statement error must appear in the GROUP BY clause
+SELECT city, age FROM p GROUP BY city
+
+statement error Aggregate functions are not allowed in WHERE
+SELECT COUNT(*) FROM p WHERE COUNT(*) > 1
+
+statement error SUM requires numeric values
+SELECT SUM(city) FROM p
+
+statement ok
+INSERT INTO p VALUES (7, 'big', 2147483647, NULL)
+
+statement error Integer overflow
+SELECT SUM(age) FROM p

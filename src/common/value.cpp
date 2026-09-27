@@ -1,10 +1,34 @@
 #include "common/value.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <sstream>
 
 namespace sql
 {
+
+    std::string FormatFloat(double value)
+    {
+        if (std::isnan(value))
+            return "nan";
+        if (std::isinf(value))
+            return value < 0 ? "-inf" : "inf";
+        // The shortest text that reads back as the same double
+        char buffer[32];
+        for (int precision = 15; precision <= 17; ++precision)
+        {
+            std::snprintf(buffer, sizeof(buffer), "%.*g", precision, value);
+            if (std::strtod(buffer, nullptr) == value)
+                break;
+        }
+        std::string text = buffer;
+        // Keep it visibly a FLOAT: 2 prints as 2.0
+        if (text.find_first_of(".en") == std::string::npos)
+            text += ".0";
+        return text;
+    }
 
     int32_t Value::GetAsInt() const
     {
@@ -83,7 +107,7 @@ namespace sql
         case DataType::INTEGER:
             return std::to_string(std::get<int32_t>(value_));
         case DataType::FLOAT:
-            return std::to_string(std::get<double>(value_));
+            return FormatFloat(std::get<double>(value_));
         case DataType::BOOLEAN:
             return std::get<bool>(value_) ? "true" : "false";
         case DataType::VARCHAR:

@@ -224,14 +224,20 @@ namespace sql
 
     std::string Lexer::ReadString()
     {
-        size_t start = position_ + 1;
+        // 'it''s': a doubled quote inside the string is one quote
+        std::string str;
         ReadChar();
-        while (ch_ != '\'' && ch_ != 0)
+        while (ch_ != 0)
         {
+            if (ch_ == '\'')
+            {
+                if (PeekChar() != '\'')
+                    break;
+                ReadChar();
+            }
+            str += ch_;
             ReadChar();
         }
-
-        std::string str = input_.substr(start, position_ - start);
         if (ch_ == '\'')
         {
             ReadChar();
