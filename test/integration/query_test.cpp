@@ -1653,13 +1653,14 @@ namespace sql
         EXPECT_EQ(Rows(RunSQL(catalog, "SELECT e.name FROM emp e JOIN emp m ON m.id = e.mgr "
                                        "JOIN dept d ON d.id = e.dept WHERE m.dept = d.id ORDER BY e.id;")),
                   (std::vector<std::string>{"bo"}));
-        // With an index on the third table's key
+        // With an index on dept's key, dept is reached through it (the
+        // planner may join the tables in another order than written)
         RunSQL(catalog, "CREATE INDEX idx_dept ON dept (id);");
         auto indexed = RunSQL(catalog, "EXPLAIN SELECT e.name FROM emp e JOIN emp m ON m.id = e.mgr "
                                        "JOIN dept d ON d.id = e.dept;");
-        EXPECT_NE(indexed.message.find("IndexNestedLoopJoin(type=INNER, right=dept AS d, key=d.id = e.dept"),
-                  std::string::npos)
-            << indexed.message;
+        EXPECT_NE(indexed.message.find("key=d.id = e.dept"), std::string::npos) << indexed.message;
+        EXPECT_EQ(indexed.message.find("HashJoin"), std::string::npos) << indexed.message;
+        EXPECT_EQ(indexed.message.find(" NestedLoopJoin("), std::string::npos) << indexed.message;
         EXPECT_EQ(Rows(RunSQL(catalog, "SELECT e.name, d.dname FROM emp e JOIN emp m ON m.id = e.mgr "
                                        "JOIN dept d ON d.id = e.dept ORDER BY e.id;")),
                   (std::vector<std::string>{"bo|eng", "cy|ops"}));
@@ -1837,6 +1838,120 @@ namespace sql
         EXPECT_EQ(run("SELECT oid FROM orders WHERE cid IN (SELECT id FROM customers);"), 1u);
         // Correlated: once per distinct outer value (cid 10 appears twice)
         EXPECT_EQ(run("SELECT oid, (SELECT name FROM customers WHERE id = cid) FROM orders;"), 3u);
+    }
+
+    // ── ANALYZE and cost-based planning ──────────────────────────────────────────
+
+    // big: 1000 rows (id unique, flag 0/1, v = id, sid = id % 50);
+    // mid: 200 rows pointing into big; small: 5 rows matching big.sid
+    static void CreateSizedTables(Catalog &catalog)
+    {
+        std::string big = "INSERT INTO big VALUES ";
+        for (int i = 1; i <= 1000; ++i)
+            big += (i > 1 ? ", (" : "(") + std::to_string(i) + ", " + std::to_string(i % 2) + ", " +
+                   std::to_string(i) + ", " + std::to_string(i % 50) + ")";
+        std::string mid = "INSERT INTO mid VALUES ";
+        for (int i = 1; i <= 200; ++i)
+            mid += (i > 1 ? ", (" : "(") + std::to_string(i) + ", " + std::to_string(i * 7 % 1000 + 1) + ")";
+        for (const std::string &sql :
+             {std::string("CREATE TABLE big (id INTEGER UNIQUE, flag INTEGER, v INTEGER, sid INTEGER);"), big + ";",
+              std::string("CREATE INDEX big_flag ON big (flag);"), std::string("CREATE INDEX big_v ON big (v);"),
+              std::string("CREATE TABLE mid (id INTEGER, big_id INTEGER);"), mid + ";",
+              std::string("CREATE TABLE small (id INTEGER, name VARCHAR(10));"),
+              std::string("INSERT INTO small VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');")})
+            ASSERT_TRUE(RunSQL(catalog, sql).success) << sql;
+    }
+
+    static std::string Explain(Catalog &catalog, const std::string &sql)
+    {
+        auto result = RunSQL(catalog, "EXPLAIN " + sql);
+        EXPECT_TRUE(result.success) << result.message;
+        return result.message;
+    }
+
+    static bool UsesIndex(Catalog &catalog, const std::string &sql)
+    {
+        return Explain(catalog, sql).find("IndexScan") != std::string::npos;
+    }
+
+    TEST(IntegrationTest, AnalyzeChoosesBetweenIndexAndScan)
+    {
+        Catalog catalog;
+        CreateSizedTables(catalog);
+        const std::string half = "SELECT id FROM big WHERE flag = 1;";
+        const std::string wide = "SELECT id FROM big WHERE v > 100;";
+        const std::string narrow = "SELECT id FROM big WHERE v < 20;";
+        const std::string point = "SELECT id FROM big WHERE id = 5;";
+        // Without statistics every indexed condition goes through its index
+        for (const std::string &sql : {half, wide, narrow, point})
+            EXPECT_TRUE(UsesIndex(catalog, sql)) << sql;
+        const auto before = Rows(RunSQL(catalog, half));
+        EXPECT_NE(Explain(catalog, point).find("point=5) (~1 rows)"), std::string::npos) << Explain(catalog, point);
+
+        auto analyze = RunSQL(catalog, "ANALYZE;");
+        ASSERT_TRUE(analyze.success) << analyze.message;
+        EXPECT_EQ(analyze.message, "Analyzed 3 table(s).");
+        // Half the table matches flag = 1, and v > 100 keeps 90%: scans win
+        EXPECT_FALSE(UsesIndex(catalog, half)) << Explain(catalog, half);
+        EXPECT_FALSE(UsesIndex(catalog, wide)) << Explain(catalog, wide);
+        // ...while a narrow range and a unique key still use their indexes
+        EXPECT_TRUE(UsesIndex(catalog, narrow)) << Explain(catalog, narrow);
+        EXPECT_TRUE(UsesIndex(catalog, point)) << Explain(catalog, point);
+        EXPECT_NE(Explain(catalog, narrow).find("(~19 rows)"), std::string::npos) << Explain(catalog, narrow);
+        EXPECT_NE(Explain(catalog, half).find("SeqScan(table=big) (~1000 rows)"), std::string::npos);
+        // The plan changed; the answer did not
+        EXPECT_EQ(Rows(RunSQL(catalog, half)), before);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT COUNT(*) FROM big WHERE v > 100;")),
+                  (std::vector<std::string>{"900"}));
+
+        // ANALYZE t analyzes one table; an unknown table is an error
+        EXPECT_EQ(RunSQL(catalog, "ANALYZE small;").message, "Analyzed 1 table(s).");
+        EXPECT_FALSE(RunSQL(catalog, "ANALYZE ghost;").success);
+    }
+
+    TEST(IntegrationTest, AnalyzeReordersInnerJoins)
+    {
+        Catalog catalog;
+        CreateSizedTables(catalog);
+        // Written biggest first; small is the most selective starting point
+        const std::string join = "SELECT b.id, m.id, s.name FROM big b JOIN mid m ON m.big_id = b.id "
+                                 "JOIN small s ON s.id = b.sid WHERE s.name = 'c' ORDER BY m.id;";
+        const auto unanalyzed = Rows(RunSQL(catalog, join));
+        ASSERT_TRUE(RunSQL(catalog, "ANALYZE;").success);
+        const std::string plan = Explain(catalog, join);
+        const size_t small_scan = plan.find("SeqScan(table=small)");
+        const size_t big_scan = plan.find("table=big");
+        ASSERT_NE(small_scan, std::string::npos) << plan;
+        ASSERT_NE(big_scan, std::string::npos) << plan;
+        EXPECT_LT(small_scan, big_scan) << plan; // small is the innermost (first) input
+        EXPECT_NE(plan.find("right=mid AS m"), std::string::npos) << plan;
+        const auto analyzed = Rows(RunSQL(catalog, join));
+        EXPECT_EQ(analyzed, unanalyzed);
+        EXPECT_FALSE(analyzed.empty());
+        for (const std::string &row : analyzed)
+            EXPECT_EQ(row.substr(row.size() - 2), "|c") << row;
+
+        // SELECT * still lists columns in FROM order
+        auto star = RunSQL(catalog, "SELECT * FROM big b JOIN mid m ON m.big_id = b.id "
+                                    "JOIN small s ON s.id = b.sid WHERE s.name = 'c' AND b.id = 253;");
+        ASSERT_TRUE(star.success) << star.message;
+        EXPECT_EQ(star.column_names,
+                  (std::vector<std::string>{"id", "flag", "v", "sid", "id", "big_id", "id", "name"}));
+        EXPECT_EQ(Rows(star), (std::vector<std::string>{"253|1|253|3|36|253|3|c"}));
+    }
+
+    TEST(IntegrationTest, LeftJoinsAreNotReordered)
+    {
+        Catalog catalog;
+        CreateSizedTables(catalog);
+        ASSERT_TRUE(RunSQL(catalog, "ANALYZE;").success);
+        const std::string join = "SELECT COUNT(*), COUNT(m.id) FROM big b LEFT JOIN mid m ON m.big_id = b.id "
+                                 "JOIN small s ON s.id = b.sid WHERE s.name = 'c';";
+        const std::string plan = Explain(catalog, join);
+        EXPECT_NE(plan.find("type=LEFT, right=mid AS m"), std::string::npos) << plan;
+        EXPECT_LT(plan.find("table=big"), plan.find("table=small")) << plan;
+        // 20 big rows have sid = 3; mid points at 4 of them
+        EXPECT_EQ(Rows(RunSQL(catalog, join)), (std::vector<std::string>{"20|4"}));
     }
 
 } // namespace sql

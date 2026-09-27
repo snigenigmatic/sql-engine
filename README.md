@@ -17,11 +17,12 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Column projection and computed columns: `SELECT name, price * qty AS total ...`
 - `ORDER BY` (by expression, output alias or position; `ASC`/`DESC`; NULLs first), `LIMIT` / `OFFSET`, `SELECT DISTINCT`
 - Aggregates: `COUNT(*)`, `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` (optionally `DISTINCT`), `GROUP BY` (expressions, positions or aliases), `HAVING` (hash aggregation). Aggregates skip NULLs. Every selected column must be grouped or aggregated. `SUM` of integers raises an error if the total overflows `INTEGER`.
-- Joins: `[INNER] JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` and comma joins, any number of tables, any `ON` condition, and table aliases (self-joins included). Tables join in the order written, by nested loop, hash or index join. `WHERE` conditions on one table filter it before the joins where that is safe.
+- Joins: `[INNER] JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` and comma joins, any number of tables, any `ON` condition, and table aliases (self-joins included). Inner joins of three or more tables are reordered by estimated cost; `LEFT` joins keep the order written. Each step is a nested loop, hash or index join. `WHERE` conditions on one table filter it before the joins where that is safe.
 - Subqueries: scalar `(SELECT ...)`, `[NOT] EXISTS (SELECT ...)` and `x [NOT] IN (SELECT ...)`, anywhere an expression goes (including UPDATE and DELETE). They may be correlated, using columns of the enclosing query (`WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cid = c.id)`). Each subquery runs once per statement, or once per distinct set of outer values when correlated.
 - Expressions: `+ - * /` (with integer overflow checks), unary minus, `LIKE` / `NOT LIKE` (`%`, `_`), `IN (...)`, `BETWEEN ... AND ...`
 - Disk-resident B+tree indexes: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`), maintained row by row on INSERT/UPDATE/DELETE
-- Query planner: automatically uses index scan when an index exists on the filtered column
+- Query planner: uses an index scan when an index exists on the filtered column and the estimate says it keeps few enough rows; `EXPLAIN` shows each step's estimated row count
+- `ANALYZE [table]` collects per-column statistics (distinct values, NULLs, min/max) that are stored in the database file and drive the planner's estimates
 - Single-file database: tables and index definitions are stored in 4 KB pages (slotted heaps + a `sqlite_master`-style schema table) behind an LRU buffer pool
 - Crash safety: a write-ahead log makes every statement atomic and durable; committed work is recovered after a crash, anything uncommitted is discarded
 - Interactive REPL with dot commands (`.tables`, `.schema`, `.read`, `.timer`), or run a script from stdin
@@ -212,10 +213,10 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
   - [x] Aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `GROUP BY`, `HAVING`
   - [x] `LEFT` / `CROSS` joins, joins of any number of tables, table aliases
   - [x] Subqueries: scalar, `EXISTS`, `IN (SELECT ...)`, correlated
-- [ ] **M8**: Usability and hardening
+- [x] **M8**: Usability and hardening
   - [x] Dot commands (`.tables`, `.schema`, `.read`, `.timer`), aligned output, float formatting, piped scripts
   - [x] Golden SQL tests (`test/sql`), sanitizer and Release CI jobs
-  - [ ] `ANALYZE` and cost-based planning
+  - [x] `ANALYZE` and cost-based planning
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

@@ -302,6 +302,7 @@ namespace sql
              {"OUTER", TokenType::OUTER},
              {"CROSS", TokenType::CROSS},
              {"EXISTS", TokenType::EXISTS},
+             {"ANALYZE", TokenType::ANALYZE},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

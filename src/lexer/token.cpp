@@ -59,6 +59,7 @@ namespace sql
         case TokenType::OUTER: return "OUTER";
         case TokenType::CROSS: return "CROSS";
         case TokenType::EXISTS: return "EXISTS";
+        case TokenType::ANALYZE: return "ANALYZE";
         case TokenType::IDENTIFIER: return "IDENTIFIER";
         case TokenType::STRING_LITERAL: return "STRING_LITERAL";
         case TokenType::INTEGER_LITERAL: return "INTEGER_LITERAL";

@@ -31,6 +31,9 @@ add_sqlengine_test(parser_test parser/parser_test.cpp)
 # Integration tests
 add_sqlengine_test(query_test integration/query_test.cpp)
 
+# Planner cost estimates
+add_sqlengine_test(estimator_test optimizer/estimator_test.cpp)
+
 # REPL shell
 add_sqlengine_test(cli_test cli/cli_test.cpp)
 

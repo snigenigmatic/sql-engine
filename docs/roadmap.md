@@ -61,7 +61,7 @@ Add these in small PRs, each with parser tests plus `query_test` cases:
    - `SUM` of integers errors on `INTEGER` overflow, as SQLite does. `AVG` returns `FLOAT`.
    - Groups and `DISTINCT` follow `=`, so NULLs group together and 1 = 1.0.
 6. **Joins** (done): `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, multi-way joins (more than two tables), arbitrary `ON` conditions and table aliases. `join_table` became a join list.
-   - Tables join left to right, in the order written; each step picks an index, hash or nested-loop join. Cost-based join ordering waits for `ANALYZE` in M8.
+   - Tables join left to right, in the order written; each step picks an index, hash or nested-loop join. M8.2 later made inner-join order cost-based.
    - Single-table `WHERE` conditions are pushed below the joins, except onto the NULL-padded side of a LEFT JOIN or a table probed through its index.
 7. **Subqueries** (done): `IN (SELECT …)`, `EXISTS` and scalar subqueries, correlated or not.
    - A subquery is planned and run when evaluated: its references to the enclosing row become literals, and results are cached per statement by those outer values.
@@ -84,9 +84,14 @@ Split into two PRs.
   - expected results cross-checked against SQLite, with the intentional differences noted in the files.
 - CI: an ASan/UBSan job and a Release (`-Wall -Wextra`) job, alongside Debug.
 
-**M8.2:**
-- `ANALYZE` collects basic table statistics (row count, distinct count). The optimizer then chooses join order, the hash-join build side, and index vs. scan by cost.
-- Update `docs/design.md`.
+**M8.2 (done):**
+- `ANALYZE [t]` records each table's row count and, per column, distinct non-NULL values, NULLs, min and max. The statistics are a `stats` row in the schema table, so they persist, roll back with a transaction and are dropped with the table.
+- The optimizer estimates selectivity and row counts from them (fixed defaults otherwise) and uses the estimates for:
+  - index vs. scan: a unique point lookup always uses its index, any other index only when it keeps at most 25% of the rows;
+  - join order: greedy, for inner/cross joins of three or more tables; a LEFT JOIN fixes the written order;
+  - the hash-join build side.
+- `EXPLAIN` shows `(~N rows)` per node; `.tables` marks analyzed tables.
+- The cost model is described in `docs/design.md` §3.5.
 
 ---
 

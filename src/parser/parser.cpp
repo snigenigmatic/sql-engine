@@ -57,6 +57,15 @@ namespace sql
             return ParseDropTable();
         case TokenType::EXPLAIN:
             return ParseExplain();
+        case TokenType::ANALYZE:
+        {
+            auto stmt = std::make_unique<AnalyzeStatement>();
+            NextToken();
+            if (current_token_.type == TokenType::IDENTIFIER)
+                stmt->table = Expect(TokenType::IDENTIFIER).value;
+            Expect(TokenType::SEMICOLON);
+            return stmt;
+        }
         case TokenType::BEGIN:
         case TokenType::COMMIT:
         case TokenType::ROLLBACK:

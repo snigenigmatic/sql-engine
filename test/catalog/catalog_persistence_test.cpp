@@ -24,7 +24,11 @@ namespace sql
                     ::testing::UnitTest::GetInstance()->current_test_info()->name() + ".db";
             std::remove(path_.c_str());
         }
-        void TearDown() override { std::remove(path_.c_str()); }
+        void TearDown() override
+        {
+            std::remove(path_.c_str());
+            std::remove((path_ + "-wal").c_str());
+        }
 
         std::unique_ptr<Database> OpenDb(size_t pool_size = Database::DEFAULT_POOL_SIZE)
         {
@@ -492,6 +496,67 @@ namespace sql
         ASSERT_TRUE(MigrateLegacySnapshot(dir_, path_, nullptr, &error)) << error;
         auto db = OpenDb();
         EXPECT_EQ(Run(*db, "SELECT * FROM t;").tuples.size(), 1u);
+    }
+
+    TEST_F(CatalogPersistenceTest, AnalyzeStatisticsArePersisted)
+    {
+        {
+            auto db = OpenDb();
+            ASSERT_TRUE(Run(*db, "CREATE TABLE t (id INTEGER, name VARCHAR(10), x FLOAT);").success);
+            ASSERT_TRUE(Run(*db, "INSERT INTO t VALUES (1, 'a', 2.5), (2, 'b', NULL), (3, 'a', -1.0), (4, NULL, NULL);")
+                            .success);
+            EXPECT_EQ(db->GetCatalog().GetStats("t"), nullptr);
+            auto result = Run(*db, "ANALYZE t;");
+            ASSERT_TRUE(result.success) << result.message;
+            EXPECT_EQ(result.message, "Analyzed 1 table(s).");
+            ASSERT_TRUE(db->Commit());
+        }
+        {
+            auto db = OpenDb();
+            const TableStats *stats = db->GetCatalog().GetStats("t");
+            ASSERT_NE(stats, nullptr);
+            EXPECT_EQ(stats->rows, 4u);
+            ASSERT_EQ(stats->columns.size(), 3u);
+            EXPECT_EQ(stats->columns[0].distinct, 4u);
+            EXPECT_EQ(stats->columns[0].min->GetAsInt(), 1);
+            EXPECT_EQ(stats->columns[0].max->GetAsInt(), 4);
+            EXPECT_EQ(stats->columns[1].distinct, 2u); // 'a', 'b'
+            EXPECT_EQ(stats->columns[1].nulls, 1u);
+            EXPECT_EQ(stats->columns[1].min->GetAsString(), "a");
+            EXPECT_EQ(stats->columns[2].nulls, 2u);
+            EXPECT_DOUBLE_EQ(stats->columns[2].min->GetAsFloat(), -1.0);
+            EXPECT_DOUBLE_EQ(stats->columns[2].max->GetAsFloat(), 2.5);
+
+            // Running it again replaces them
+            ASSERT_TRUE(Run(*db, "DELETE FROM t WHERE id > 1;").success);
+            ASSERT_TRUE(Run(*db, "ANALYZE;").success);
+            stats = db->GetCatalog().GetStats("t");
+            ASSERT_NE(stats, nullptr);
+            EXPECT_EQ(stats->rows, 1u);
+            EXPECT_EQ(stats->columns[1].nulls, 0u);
+
+            EXPECT_FALSE(Run(*db, "ANALYZE nosuch;").success);
+            ASSERT_TRUE(db->Commit());
+        }
+        {
+            auto db = OpenDb();
+            ASSERT_NE(db->GetCatalog().GetStats("t"), nullptr);
+            EXPECT_EQ(db->GetCatalog().GetStats("t")->rows, 1u);
+            // DROP TABLE takes them along, and a new table of that name starts without
+            ASSERT_TRUE(Run(*db, "DROP TABLE t;").success);
+            ASSERT_TRUE(Run(*db, "CREATE TABLE t (y INTEGER);").success);
+            EXPECT_EQ(db->GetCatalog().GetStats("t"), nullptr);
+            ASSERT_TRUE(db->Commit());
+        }
+        {
+            auto db = OpenDb();
+            EXPECT_EQ(db->GetCatalog().GetStats("t"), nullptr);
+            // Rolled back with the transaction that made them
+            ASSERT_TRUE(Run(*db, "ANALYZE t;").success);
+            ASSERT_NE(db->GetCatalog().GetStats("t"), nullptr);
+            ASSERT_TRUE(db->Rollback());
+            EXPECT_EQ(db->GetCatalog().GetStats("t"), nullptr);
+        }
     }
 
 } // namespace sql

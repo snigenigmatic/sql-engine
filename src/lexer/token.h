@@ -61,6 +61,7 @@ namespace sql
         OUTER,
         CROSS,
         EXISTS,
+        ANALYZE,
 
         // Identifiers and Literals
         IDENTIFIER,

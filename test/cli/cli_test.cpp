@@ -105,6 +105,8 @@ namespace sql
 
         EXPECT_EQ(t.Run({".tables"}), "t (2 rows): a INTEGER\n");
         EXPECT_EQ(t.Run({"tables"}), "t (2 rows): a INTEGER\n"); // the old spelling
+        EXPECT_EQ(t.Run({"ANALYZE;"}), "Analyzed 1 table(s).\n");
+        EXPECT_EQ(t.Run({".tables"}), "t (2 rows): a INTEGER (analyzed)\n");
         EXPECT_EQ(t.Run({".schema t"}), "CREATE TABLE t (a INTEGER);\n");
         EXPECT_EQ(t.Run({".schema nosuch"}), "Error: no table named nosuch\n");
         EXPECT_NE(t.Run({".help"}).find(".read FILE"), std::string::npos);

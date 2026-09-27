@@ -64,6 +64,8 @@ namespace sql
             return "EXPLAIN";
         case StatementType::TRANSACTION_STMT:
             return "TRANSACTION";
+        case StatementType::ANALYZE_STMT:
+            return "ANALYZE";
         default:
             return "UNKNOWN_STATEMENT";
         }

@@ -1,4 +1,5 @@
 #include "optimizer/optimizer.h"
+#include "optimizer/estimator.h"
 #include <algorithm>
 #include <functional>
 #include <stdexcept>
@@ -283,8 +284,29 @@ namespace sql
 
         // An index scan of one relation for a condition on an indexed
         // column, or null
+        // Also sets *selectivity; returns null when the index would keep too
+        // many rows to beat a scan (a unique point lookup always wins)
+        std::unique_ptr<PhysicalPlanNode> IndexAccessUnchecked(const Scope::Relation &relation, size_t index,
+                                                               const Expression *condition, Catalog *catalog);
+
         std::unique_ptr<PhysicalPlanNode> IndexAccess(const Scope::Relation &relation, size_t index,
-                                                      const Expression *condition, Catalog *catalog)
+                                                      const Expression *condition, Catalog *catalog,
+                                                      const Estimator &estimator, double *selectivity)
+        {
+            auto scan = IndexAccessUnchecked(relation, index, condition, catalog);
+            if (!scan)
+                return nullptr;
+            *selectivity = estimator.Selectivity(condition);
+            bool unique = false;
+            for (const IndexInfo *info : catalog->GetTableIndexes(relation.table))
+                unique = unique || (info->column == scan->index_column && info->unique);
+            if (scan->is_point_lookup && unique)
+                return scan;
+            return *selectivity <= Estimator::INDEX_THRESHOLD ? std::move(scan) : nullptr;
+        }
+
+        std::unique_ptr<PhysicalPlanNode> IndexAccessUnchecked(const Scope::Relation &relation, size_t index,
+                                                               const Expression *condition, Catalog *catalog)
         {
             std::string column_name;
             TokenType op = TokenType::ILLEGAL;
@@ -379,6 +401,15 @@ namespace sql
             add(join.right.table, join.right.alias);
         if (scope.relations_.size() > 64)
             throw std::runtime_error("A query can join at most 64 tables");
+        return scope;
+    }
+
+    Scope Scope::Reordered(const std::vector<size_t> &order) const
+    {
+        Scope scope;
+        scope.catalog_ = catalog_;
+        for (size_t i : order)
+            scope.relations_.push_back(relations_.at(i));
         return scope;
     }
 
@@ -599,14 +630,97 @@ namespace sql
 
     std::unique_ptr<PhysicalPlanNode> Optimizer::BuildSelectPhysicalPlan(const SelectStatement *select, Catalog *catalog) const
     {
-        const Scope scope = Scope::ForSelect(*select, catalog);
-        const size_t n = scope.Size();
+        const Scope written = Scope::ForSelect(*select, catalog);
+        const size_t n = written.Size();
         if (ContainsAggregate(select->where.get()))
             throw std::runtime_error("Aggregate functions are not allowed in WHERE");
-        CheckColumnNames(*select, scope);
+        CheckColumnNames(*select, written);
 
-        // How each table joins the ones before it (tables join left to
-        // right, in the order written)
+        // The conditions each join step checks, and those in WHERE. With
+        // only inner and cross joins, ON and WHERE mean the same thing, so
+        // every condition is pooled and placed where it first applies; the
+        // join order may then change too. A LEFT JOIN keeps both as written.
+        struct StepInput
+        {
+            JoinType type = JoinType::INNER;
+            std::vector<const Expression *> on;
+            std::string label; // for EXPLAIN
+        };
+        std::vector<StepInput> inputs(n);
+        std::vector<const Expression *> where;
+        SplitConjuncts(select->where.get(), &where);
+        const bool inner_only = std::none_of(select->joins.begin(), select->joins.end(), [](const JoinClause &join)
+                                             { return join.type == JoinType::LEFT; });
+        std::vector<size_t> order(n);
+        for (size_t i = 0; i < n; ++i)
+            order[i] = i;
+        if (inner_only && n > 1)
+        {
+            std::vector<const Expression *> pool = where;
+            for (const auto &join : select->joins)
+                SplitConjuncts(join.on.get(), &pool);
+            if (n > 2)
+                order = ChooseJoinOrder(written, pool, catalog);
+        }
+        const bool reordered = !std::is_sorted(order.begin(), order.end());
+        const Scope scope = reordered ? written.Reordered(order) : written;
+        const Estimator estimator(scope, catalog);
+
+        if (inner_only && n > 1)
+        {
+            std::vector<const Expression *> pool = where;
+            for (const auto &join : select->joins)
+                SplitConjuncts(join.on.get(), &pool);
+            where.clear();
+            for (const Expression *condition : pool)
+            {
+                // On two or more tables: checked by the join that adds the
+                // last of them; anything else stays with WHERE
+                const std::optional<uint64_t> relations = scope.RelationsOf(condition);
+                if (relations && (*relations & (*relations - 1)) != 0)
+                {
+                    size_t last = 0;
+                    for (size_t r = 0; r < n; ++r)
+                    {
+                        if ((*relations >> r) & 1U)
+                            last = r;
+                    }
+                    inputs[last].on.push_back(condition);
+                }
+                else
+                    where.push_back(condition);
+            }
+            for (size_t j = 1; j < n; ++j)
+            {
+                for (const Expression *condition : inputs[j].on)
+                    inputs[j].label += (inputs[j].label.empty() ? "" : " AND ") + ExpressionToSQL(condition);
+            }
+        }
+        else
+        {
+            for (size_t j = 1; j < n; ++j)
+            {
+                const JoinClause &clause = select->joins[j - 1];
+                inputs[j].type = clause.type;
+                SplitConjuncts(clause.on.get(), &inputs[j].on);
+                inputs[j].label = clause.on ? ExpressionToSQL(clause.on.get()) : "";
+            }
+        }
+
+        // Estimated rows of each table after the WHERE conditions on it alone
+        std::vector<double> filtered(n);
+        for (size_t r = 0; r < n; ++r)
+        {
+            filtered[r] = estimator.Rows(r);
+            for (const Expression *condition : where)
+            {
+                const std::optional<uint64_t> relations = scope.RelationsOf(condition);
+                if (relations && *relations == (uint64_t{1} << r))
+                    filtered[r] *= estimator.Selectivity(condition);
+            }
+        }
+
+        // How each table joins the ones before it
         struct JoinStep
         {
             PhysicalPlanType algorithm = PhysicalPlanType::NESTED_LOOP_JOIN;
@@ -616,6 +730,7 @@ namespace sql
             Scope::Resolved right_key{0, 0};
             bool build_right = true;
             bool outer_is_left = true;
+            double estimated_rows = 0;
         };
         std::vector<JoinStep> steps(n);
         // A WHERE condition on one table can filter it before the joins,
@@ -624,13 +739,13 @@ namespace sql
         // see the padded rows)
         std::vector<bool> can_push(n, true);
         size_t rows_so_far = scope.Relations()[0].schema->GetTupleCount();
+        double estimate = filtered[0];
         for (size_t j = 1; j < n; ++j)
         {
-            const JoinClause &clause = select->joins[j - 1];
+            const StepInput &input = inputs[j];
             const Scope::Relation &right = scope.Relations()[j];
             JoinStep &step = steps[j];
-            std::vector<const Expression *> conditions;
-            SplitConjuncts(clause.on.get(), &conditions);
+            const std::vector<const Expression *> &conditions = input.on;
 
             for (const Expression *condition : conditions)
             {
@@ -664,7 +779,7 @@ namespace sql
                     step.algorithm = PhysicalPlanType::INDEX_NESTED_LOOP_JOIN;
                     can_push[j] = false;
                 }
-                else if (j == 1 && clause.type == JoinType::INNER && catalog->GetIndex(left.table, left_col) != nullptr)
+                else if (j == 1 && input.type == JoinType::INNER && catalog->GetIndex(left.table, left_col) != nullptr)
                 {
                     // Only the first table has an index: probe it for each
                     // row of the second
@@ -675,9 +790,10 @@ namespace sql
                 else if (rows_so_far + right_rows >= 16)
                 {
                     step.algorithm = PhysicalPlanType::HASH_JOIN;
-                    // Hash the smaller side; a LEFT join keeps every left
-                    // row, so it streams them past the right side's table
-                    step.build_right = clause.type == JoinType::LEFT || right_rows <= rows_so_far;
+                    // Hash the side expected to be smaller; a LEFT join
+                    // keeps every left row, so it streams them past the
+                    // right side's table
+                    step.build_right = input.type == JoinType::LEFT || filtered[j] <= estimate;
                 }
             }
             for (const Expression *condition : conditions)
@@ -685,15 +801,25 @@ namespace sql
                 if (condition != step.key || step.algorithm == PhysicalPlanType::NESTED_LOOP_JOIN)
                     step.residual.push_back(condition);
             }
-            if (clause.type == JoinType::LEFT)
+            if (input.type == JoinType::LEFT)
                 can_push[j] = false;
             rows_so_far += right_rows;
+
+            // Estimated rows out of this join
+            double out = step.key ? estimator.JoinRows(estimate, filtered[j], step.left_key, step.right_key)
+                                  : estimate * filtered[j];
+            for (const Expression *condition : conditions)
+            {
+                if (condition != step.key)
+                    out *= estimator.Selectivity(condition);
+            }
+            if (input.type == JoinType::LEFT)
+                out = std::max(out, estimate);
+            step.estimated_rows = estimate = out;
         }
 
         // Split WHERE into conditions on single tables (pushed down) and the
         // rest (checked on the joined rows)
-        std::vector<const Expression *> where;
-        SplitConjuncts(select->where.get(), &where);
         std::vector<std::vector<const Expression *>> pushed(n);
         std::vector<const Expression *> remaining;
         for (const Expression *condition : where)
@@ -714,30 +840,41 @@ namespace sql
         }
 
         // One table's rows, filtered by the conditions pushed down to it;
-        // a condition on an indexed column becomes an index scan
+        // the most selective condition on an indexed column becomes an
+        // index scan, if it keeps few enough rows to be worth it
         auto access_path = [&](size_t r) -> std::unique_ptr<PhysicalPlanNode>
         {
             const Scope::Relation &relation = scope.Relations()[r];
             std::unique_ptr<PhysicalPlanNode> path;
+            double best = 2.0;
             for (const Expression *condition : pushed[r])
             {
-                if (!path)
-                    path = IndexAccess(relation, r, condition, catalog);
+                double selectivity = 0;
+                auto candidate = IndexAccess(relation, r, condition, catalog, estimator, &selectivity);
+                if (candidate && selectivity < best)
+                {
+                    best = selectivity;
+                    path = std::move(candidate);
+                }
             }
-            if (!path)
+            if (path)
+                path->estimated_rows = estimator.Rows(r) * best;
+            else
             {
                 path = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SEQ_SCAN);
                 path->table_name = relation.table;
                 path->relation = static_cast<int>(r);
+                path->estimated_rows = estimator.Rows(r);
             }
             if (!pushed[r].empty())
             {
                 auto filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
                 filter->table_name = relation.table;
                 filter->relation = static_cast<int>(r);
-                // The whole WHERE when it all applies here
-                filter->predicate = pushed[r].size() == where.size() ? select->where.get()
-                                                                     : Conjunction(pushed[r], filter.get());
+                filter->predicate = Conjunction(pushed[r], filter.get());
+                filter->estimated_rows = estimator.Rows(r);
+                for (const Expression *condition : pushed[r])
+                    filter->estimated_rows *= estimator.Selectivity(condition);
                 filter->children.push_back(std::move(path));
                 path = std::move(filter);
             }
@@ -747,17 +884,18 @@ namespace sql
         std::unique_ptr<PhysicalPlanNode> current = access_path(0);
         for (size_t j = 1; j < n; ++j)
         {
-            const JoinClause &clause = select->joins[j - 1];
             const Scope::Relation &right = scope.Relations()[j];
             JoinStep &step = steps[j];
             auto join = std::make_unique<PhysicalPlanNode>(step.algorithm);
-            join->join_type = clause.type;
+            join->join_type = inputs[j].type == JoinType::CROSS && !inputs[j].on.empty() ? JoinType::INNER
+                                                                                          : inputs[j].type;
             join->table_name = scope.Relations()[0].table;
             join->right_table_name = right.table;
             join->right_label = RelationLabel(right);
             join->relation_count = j + 1;
             join->join_residual = step.residual;
-            join->join_on_label = clause.on ? ExpressionToSQL(clause.on.get()) : "";
+            join->join_on_label = inputs[j].label;
+            join->estimated_rows = step.estimated_rows;
             if (step.key != nullptr)
             {
                 join->join_key_label = ExpressionToSQL(step.key);
@@ -776,8 +914,10 @@ namespace sql
             auto filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
             filter->table_name = n > 1 ? "__join_context__" : select->table;
             filter->relation_count = n;
-            filter->predicate = remaining.size() == where.size() ? select->where.get()
-                                                                 : Conjunction(remaining, filter.get());
+            filter->predicate = Conjunction(remaining, filter.get());
+            filter->estimated_rows = n > 1 ? estimate : filtered[0];
+            for (const Expression *condition : remaining)
+                filter->estimated_rows *= estimator.Selectivity(condition);
             filter->children.push_back(std::move(current));
             current = std::move(filter);
         }
@@ -794,7 +934,8 @@ namespace sql
             {
                 auto sort = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SORT);
                 sort->relation_count = n;
-                ResolveSortKeys(*select, scope, sort.get());
+                // Positions count SELECT * columns in FROM order
+                ResolveSortKeys(*select, written, sort.get());
                 sort->children.push_back(std::move(current));
                 current = std::move(sort);
             }
@@ -808,6 +949,19 @@ namespace sql
                 projection->compute_projection = true;
                 for (const auto &item : select->items)
                     projection->projected_exprs.push_back(item.expr.get());
+            }
+            else if (select->select_star && reordered)
+            {
+                // SELECT * lists columns in FROM order, not join order
+                projection->compute_projection = true;
+                for (const auto &relation : written.Relations())
+                {
+                    for (const auto &col : relation.schema->GetSchema().GetColumns())
+                    {
+                        projection->owned_exprs.push_back(std::make_unique<ColumnExpression>(relation.name + "." + col.name));
+                        projection->projected_exprs.push_back(projection->owned_exprs.back().get());
+                    }
+                }
             }
             projection->children.push_back(std::move(current));
             current = std::move(projection);
@@ -827,7 +981,99 @@ namespace sql
             limit->children.push_back(std::move(current));
             current = std::move(limit);
         }
+        if (reordered)
+            current->relation_order = order;
         return current;
+    }
+
+    std::vector<size_t> Optimizer::ChooseJoinOrder(const Scope &scope, const std::vector<const Expression *> &conditions,
+                                                   Catalog *catalog) const
+    {
+        const size_t n = scope.Size();
+        const Estimator estimator(scope, catalog);
+
+        // Each table's rows after the conditions on it alone, and the
+        // col = col conditions linking two tables
+        std::vector<double> filtered(n);
+        for (size_t r = 0; r < n; ++r)
+            filtered[r] = estimator.Rows(r);
+        struct Link
+        {
+            Scope::Resolved a, b;
+        };
+        std::vector<Link> links;
+        for (const Expression *condition : conditions)
+        {
+            const std::optional<uint64_t> relations = scope.RelationsOf(condition);
+            if (!relations || *relations == 0)
+                continue;
+            if ((*relations & (*relations - 1)) == 0)
+            {
+                size_t r = 0;
+                while (!((*relations >> r) & 1U))
+                    ++r;
+                filtered[r] *= estimator.Selectivity(condition);
+                continue;
+            }
+            if (condition->GetType() != ExpressionType::BINARY_OP)
+                continue;
+            const auto *eq = static_cast<const BinaryExpression *>(condition);
+            if (eq->op == TokenType::EQ && eq->left->GetType() == ExpressionType::COLUMN_REF &&
+                eq->right->GetType() == ExpressionType::COLUMN_REF)
+            {
+                const Scope::Resolved a = scope.Resolve(static_cast<const ColumnExpression *>(eq->left.get())->name);
+                const Scope::Resolved b = scope.Resolve(static_cast<const ColumnExpression *>(eq->right.get())->name);
+                if (a.relation != b.relation)
+                    links.push_back({a, b});
+            }
+        }
+
+        // Greedy: start from the smallest table, then keep adding the linked
+        // table that gives the smallest estimated result; tables with no
+        // link come last, smallest first. Ties keep FROM order.
+        std::vector<size_t> order;
+        std::vector<bool> joined(n, false);
+        size_t first = 0;
+        for (size_t r = 1; r < n; ++r)
+        {
+            if (filtered[r] < filtered[first])
+                first = r;
+        }
+        order.push_back(first);
+        joined[first] = true;
+        double rows = filtered[first];
+        while (order.size() < n)
+        {
+            std::optional<size_t> best;
+            double best_rows = 0;
+            for (const Link &link : links)
+            {
+                for (const auto &[in, out] : {std::make_pair(link.a, link.b), std::make_pair(link.b, link.a)})
+                {
+                    if (!joined[in.relation] || joined[out.relation])
+                        continue;
+                    const double candidate = estimator.JoinRows(rows, filtered[out.relation], in, out);
+                    if (!best || candidate < best_rows || (candidate == best_rows && out.relation < *best))
+                    {
+                        best = out.relation;
+                        best_rows = candidate;
+                    }
+                }
+            }
+            if (!best)
+            {
+                for (size_t r = 0; r < n; ++r)
+                {
+                    if (!joined[r] && (!best || filtered[r] < filtered[*best]))
+                        best = r;
+                }
+                best_rows = rows * filtered[*best];
+            }
+            order.push_back(*best);
+            joined[*best] = true;
+            rows = best_rows;
+        }
+        return order;
     }
 
     std::unique_ptr<PhysicalPlanNode> Optimizer::BuildAggregatePlan(const SelectStatement &select, const Scope &scope,
@@ -1177,6 +1423,18 @@ namespace sql
             break;
         }
 
+        if (node->estimated_rows >= 0)
+        {
+            // Appended to the node's first line
+            std::string text = out.str();
+            const size_t eol = text.find('\n');
+            // A non-empty estimate below one row still shows as one
+            const double estimate = node->estimated_rows > 0 ? std::max(1.0, node->estimated_rows) : 0.0;
+            const std::string rows = " (~" + std::to_string(static_cast<long long>(estimate + 0.5)) + " rows)";
+            text.insert(eol == std::string::npos ? text.size() : eol, rows);
+            out.str(text);
+            out.seekp(0, std::ios_base::end);
+        }
         for (const auto &child : node->children)
         {
             out << "\n" << ExplainPhysicalNode(child.get(), indent + 1);

@@ -160,6 +160,8 @@ namespace sql
             const auto &columns = table->GetSchema().GetColumns();
             for (size_t i = 0; i < columns.size(); ++i)
                 out_ << (i ? ", " : "") << columns[i].name << " " << DataTypeName(columns[i].type);
+            if (db_->GetCatalog().GetStats(name) != nullptr)
+                out_ << " (analyzed)";
             out_ << "\n";
         }
     }

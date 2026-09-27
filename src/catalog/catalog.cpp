@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace sql
 {
@@ -122,6 +123,65 @@ namespace sql
         {
             return type + ":" + name;
         }
+
+        constexpr const char *TYPE_STATS = "stats";
+
+        std::string ValueHex(const std::optional<Value> &value)
+        {
+            std::string bytes;
+            if (value)
+                value->SerializeTo(&bytes);
+            return ToHex(bytes);
+        }
+
+        std::optional<Value> HexValue(const std::string &hex)
+        {
+            if (hex.empty())
+                return std::nullopt;
+            const std::string bytes = FromHex(hex);
+            const char *cursor = bytes.data();
+            Value value;
+            if (!Value::DeserializeFrom(&cursor, bytes.data() + bytes.size(), &value))
+                throw std::runtime_error("Corrupt statistics in schema");
+            return value;
+        }
+
+        // "rows;distinct:nulls:min_hex:max_hex;..." one entry per column
+        std::string EncodeStats(const TableStats &stats)
+        {
+            std::string out = std::to_string(stats.rows);
+            for (const auto &col : stats.columns)
+                out += ";" + std::to_string(col.distinct) + ":" + std::to_string(col.nulls) + ":" + ValueHex(col.min) +
+                       ":" + ValueHex(col.max);
+            return out;
+        }
+
+        TableStats DecodeStats(const std::string &text)
+        {
+            TableStats stats;
+            std::stringstream ss(text);
+            std::string item;
+            if (!std::getline(ss, item, ';'))
+                throw std::runtime_error("Corrupt statistics: " + text);
+            stats.rows = std::stoull(item);
+            while (std::getline(ss, item, ';'))
+            {
+                std::vector<std::string> fields;
+                size_t start = 0;
+                for (size_t colon; (colon = item.find(':', start)) != std::string::npos; start = colon + 1)
+                    fields.push_back(item.substr(start, colon - start));
+                fields.push_back(item.substr(start));
+                if (fields.size() != 4)
+                    throw std::runtime_error("Corrupt statistics: " + text);
+                ColumnStats col;
+                col.distinct = std::stoull(fields[0]);
+                col.nulls = std::stoull(fields[1]);
+                col.min = HexValue(fields[2]);
+                col.max = HexValue(fields[3]);
+                stats.columns.push_back(std::move(col));
+            }
+            return stats;
+        }
     } // namespace
 
     Catalog::Catalog()
@@ -195,6 +255,10 @@ namespace sql
                     throw std::runtime_error("Index '" + name + "' has invalid root page " + std::to_string(root_page));
                 index_defs.push_back({name, tbl_name, definition, root_page});
             }
+            else if (type == TYPE_STATS)
+            {
+                stats_[name] = DecodeStats(definition);
+            }
             else
             {
                 throw std::runtime_error("Unknown schema object type: " + type);
@@ -252,6 +316,57 @@ namespace sql
             return;
         schema_heap_->DeleteTuple(it->second);
         schema_rows_.erase(it);
+    }
+
+    TableStats Catalog::ComputeStats(Table *table)
+    {
+        const size_t columns = table->GetSchema().GetColumnCount();
+        TableStats stats;
+        stats.columns.resize(columns);
+        // A column holds one type, so the encoding identifies a value
+        std::vector<std::unordered_set<std::string>> seen(columns);
+        for (auto it = table->begin(); it != table->end(); ++it)
+        {
+            ++stats.rows;
+            for (size_t c = 0; c < columns; ++c)
+            {
+                const Value &value = it->GetValue(c);
+                ColumnStats &col = stats.columns[c];
+                if (value.IsNull())
+                {
+                    ++col.nulls;
+                    continue;
+                }
+                std::string key;
+                value.SerializeTo(&key);
+                seen[c].insert(std::move(key));
+                if (!col.min || value < *col.min)
+                    col.min = value;
+                if (!col.max || *col.max < value)
+                    col.max = value;
+            }
+        }
+        for (size_t c = 0; c < columns; ++c)
+            stats.columns[c].distinct = seen[c].size();
+        return stats;
+    }
+
+    bool Catalog::Analyze(const std::string &table_name)
+    {
+        Table *table = GetTable(table_name);
+        if (table == nullptr)
+            return false;
+        TableStats stats = ComputeStats(table);
+        DeleteSchemaRow(TYPE_STATS, table_name);
+        InsertSchemaRow(TYPE_STATS, table_name, table_name, INVALID_PAGE_ID, EncodeStats(stats));
+        stats_[table_name] = std::move(stats);
+        return true;
+    }
+
+    const TableStats *Catalog::GetStats(const std::string &table_name) const
+    {
+        auto it = stats_.find(table_name);
+        return it == stats_.end() ? nullptr : &it->second;
     }
 
     void Catalog::PopulateIndex(Table *table, IndexInfo *index)
@@ -534,6 +649,8 @@ namespace sql
         it->second->Drop();
         tables_.erase(it);
         DeleteSchemaRow(TYPE_TABLE, name);
+        DeleteSchemaRow(TYPE_STATS, name);
+        stats_.erase(name);
 
         // Drop the table's indexes and free their pages
         for (auto idx = indexes_.begin(); idx != indexes_.end();)

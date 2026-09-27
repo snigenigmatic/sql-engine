@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <string>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sql
@@ -21,6 +22,21 @@ namespace sql
         int column_index = -1;
         bool unique = false; // no two rows may share a non-NULL key
         std::unique_ptr<BTree> tree;
+    };
+
+    // What ANALYZE learned about one column
+    struct ColumnStats
+    {
+        size_t distinct = 0; // distinct non-NULL values
+        size_t nulls = 0;
+        std::optional<Value> min, max; // unset when every value is NULL
+    };
+
+    // What ANALYZE learned about a table, when it last ran
+    struct TableStats
+    {
+        size_t rows = 0;
+        std::vector<ColumnStats> columns; // in schema order
     };
 
     class Catalog
@@ -84,7 +100,16 @@ namespace sql
         bool DeleteRow(Table *table, const RID &rid);
         bool UpdateRow(Table *table, const RID &rid, const Tuple &tuple);
 
+        // ANALYZE: scan the table, then store its statistics in the schema
+        // table (replacing earlier ones). Returns false if no such table.
+        bool Analyze(const std::string &table_name);
+        // Statistics from the last ANALYZE of the table, or nullptr
+        const TableStats *GetStats(const std::string &table_name) const;
+        static TableStats ComputeStats(Table *table);
+
     private:
+        // table name -> statistics; stored as "stats" rows of the schema table
+        std::unordered_map<std::string, TableStats> stats_;
         // Owned storage for in-memory catalogs. Declared before tables_ so
         // tables are destroyed first.
         std::unique_ptr<Pager> owned_pager_;

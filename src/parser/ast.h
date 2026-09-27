@@ -178,7 +178,8 @@ namespace sql
         DELETE_STMT,
         UPDATE_STMT,
         EXPLAIN_STMT,
-        TRANSACTION_STMT
+        TRANSACTION_STMT,
+        ANALYZE_STMT
     };
 
     struct Statement
@@ -324,6 +325,13 @@ namespace sql
         Kind kind;
         explicit TransactionStatement(Kind k) : kind(k) {}
         StatementType GetType() const override { return StatementType::TRANSACTION_STMT; }
+    };
+
+    // ANALYZE [table]: gather the statistics the planner uses
+    struct AnalyzeStatement : public Statement
+    {
+        std::string table; // empty = every table
+        StatementType GetType() const override { return StatementType::ANALYZE_STMT; }
     };
 
     struct ExplainStatement : public Statement

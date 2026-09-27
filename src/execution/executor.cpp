@@ -189,6 +189,26 @@ namespace sql
             return ExecuteDropTable(static_cast<DropTableStatement *>(stmt));
         case StatementType::EXPLAIN_STMT:
             return ExecuteExplain(static_cast<ExplainStatement *>(stmt));
+        case StatementType::ANALYZE_STMT:
+        {
+            const auto *analyze = static_cast<AnalyzeStatement *>(stmt);
+            std::vector<std::string> tables{analyze->table};
+            if (analyze->table.empty())
+                tables = catalog_->GetTableNames();
+            try
+            {
+                for (const auto &name : tables)
+                {
+                    if (!catalog_->Analyze(name))
+                        return {false, "Table not found: " + name, {}, {}};
+                }
+            }
+            catch (const std::exception &e)
+            {
+                return {false, e.what(), {}, {}};
+            }
+            return {true, "Analyzed " + std::to_string(tables.size()) + " table(s).", {}, {}};
+        }
         case StatementType::TRANSACTION_STMT:
             return {false, "BEGIN / COMMIT / ROLLBACK must be run through a Session", {}, {}};
         default:
@@ -390,6 +410,9 @@ namespace sql
         // Operators may point into the plan (e.g. sort keys the planner
         // created), so it lives as long as the executor
         physical_plan_ = optimizer.BuildPhysicalPlan(select, catalog_);
+        // The planner may join the tables in another order than written
+        if (!physical_plan_->relation_order.empty())
+            scope_ = scope_.Reordered(physical_plan_->relation_order);
         return BuildOperatorTree(physical_plan_.get());
     }
 
@@ -402,7 +425,9 @@ namespace sql
 
             if (select->select_star)
             {
-                for (const auto &relation : scope_.Relations())
+                // Columns in FROM order, whatever order the joins ran in
+                const Scope written = Scope::ForSelect(*select, catalog_);
+                for (const auto &relation : written.Relations())
                 {
                     for (const auto &col : relation.schema->GetSchema().GetColumns())
                         result.column_names.push_back(col.name);

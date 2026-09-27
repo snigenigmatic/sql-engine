@@ -123,6 +123,14 @@ namespace sql
         // FILTER / SORT / PROJECTION: the rows are an AGGREGATE's output, and
         // the expressions refer to its columns
         bool over_aggregate = false;
+
+        // Planner's row estimate for scans, filters and joins (-1 = none)
+        double estimated_rows = -1;
+
+        // Plan root: when the planner reordered the joins, the FROM clause
+        // positions of the relations in join order. Relation numbers in the
+        // plan refer to that order (Scope::Reordered).
+        std::vector<size_t> relation_order;
     };
 
     // The tables in a SELECT's FROM clause, in join order, each known by
@@ -144,6 +152,9 @@ namespace sql
         };
 
         static Scope ForSelect(const SelectStatement &select, Catalog *catalog);
+        // The same relations in another order: order[i] is the position of
+        // the i-th relation in this scope
+        Scope Reordered(const std::vector<size_t> &order) const;
 
         const std::vector<Relation> &Relations() const { return relations_; }
         Catalog *GetCatalog() const { return catalog_; }
@@ -191,6 +202,10 @@ namespace sql
         // ORDER BY items as sort keys: positions and output aliases become the
         // selected expression they name
         void ResolveSortKeys(const SelectStatement &select, const Scope &scope, PhysicalPlanNode *sort) const;
+        // Join order for inner joins: FROM positions, smallest estimate
+        // first, then each next table linked by an equality
+        std::vector<size_t> ChooseJoinOrder(const Scope &scope, const std::vector<const Expression *> &conditions,
+                                            Catalog *catalog) const;
 
         // Aggregation, HAVING, ORDER BY and the SELECT list of a query with
         // GROUP BY or aggregate functions, over its (filtered) input rows
