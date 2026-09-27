@@ -8,14 +8,6 @@ namespace sql
 {
     namespace
     {
-        enum class PredicateTableSide
-        {
-            NONE,
-            LEFT,
-            RIGHT,
-            BOTH
-        };
-
         std::string StripQualifier(const std::string &name)
         {
             size_t dot = name.find('.');
@@ -24,133 +16,6 @@ namespace sql
                 return name;
             }
             return name.substr(dot + 1);
-        }
-
-        PredicateTableSide ResolveColumnSide(const std::string &column_name,
-                                             const std::string &left_table_name,
-                                             const std::string &right_table_name,
-                                             Table *left_table,
-                                             Table *right_table)
-        {
-            const size_t dot = column_name.find('.');
-            if (dot != std::string::npos)
-            {
-                const std::string qualifier = column_name.substr(0, dot);
-                const std::string unqualified = column_name.substr(dot + 1);
-                if (qualifier == left_table_name && left_table->GetColumnIndex(unqualified) >= 0)
-                {
-                    return PredicateTableSide::LEFT;
-                }
-                if (qualifier == right_table_name && right_table->GetColumnIndex(unqualified) >= 0)
-                {
-                    return PredicateTableSide::RIGHT;
-                }
-                return PredicateTableSide::NONE;
-            }
-
-            const bool in_left = left_table->GetColumnIndex(column_name) >= 0;
-            const bool in_right = right_table->GetColumnIndex(column_name) >= 0;
-            if (in_left && in_right)
-            {
-                return PredicateTableSide::BOTH;
-            }
-            if (in_left)
-            {
-                return PredicateTableSide::LEFT;
-            }
-            if (in_right)
-            {
-                return PredicateTableSide::RIGHT;
-            }
-            return PredicateTableSide::NONE;
-        }
-
-        PredicateTableSide ResolvePredicateSingleTable(const Expression *expr,
-                                                       const std::string &left_table_name,
-                                                       const std::string &right_table_name,
-                                                       Table *left_table,
-                                                       Table *right_table)
-        {
-            if (expr == nullptr)
-            {
-                return PredicateTableSide::NONE;
-            }
-
-            switch (expr->GetType())
-            {
-            case ExpressionType::LITERAL:
-                return PredicateTableSide::NONE;
-            case ExpressionType::COLUMN_REF:
-            {
-                const auto *col = static_cast<const ColumnExpression *>(expr);
-                return ResolveColumnSide(col->name, left_table_name, right_table_name, left_table, right_table);
-            }
-            case ExpressionType::BINARY_OP:
-            {
-                const auto *bin = static_cast<const BinaryExpression *>(expr);
-                const PredicateTableSide left = ResolvePredicateSingleTable(
-                    bin->left.get(), left_table_name, right_table_name, left_table, right_table);
-                const PredicateTableSide right = ResolvePredicateSingleTable(
-                    bin->right.get(), left_table_name, right_table_name, left_table, right_table);
-
-                if (left == PredicateTableSide::BOTH || right == PredicateTableSide::BOTH)
-                {
-                    return PredicateTableSide::BOTH;
-                }
-                if (left == PredicateTableSide::NONE)
-                {
-                    return right;
-                }
-                if (right == PredicateTableSide::NONE)
-                {
-                    return left;
-                }
-                return left == right ? left : PredicateTableSide::BOTH;
-            }
-            case ExpressionType::UNARY_OP:
-                return ResolvePredicateSingleTable(static_cast<const UnaryExpression *>(expr)->operand.get(),
-                                                   left_table_name, right_table_name, left_table, right_table);
-            case ExpressionType::IS_NULL:
-                return ResolvePredicateSingleTable(static_cast<const IsNullExpression *>(expr)->operand.get(),
-                                                   left_table_name, right_table_name, left_table, right_table);
-            case ExpressionType::LIKE:
-            case ExpressionType::IN_LIST:
-            case ExpressionType::BETWEEN:
-            {
-                // The side all operands agree on (BOTH if they disagree)
-                std::vector<const Expression *> operands;
-                if (expr->GetType() == ExpressionType::LIKE)
-                {
-                    const auto *like = static_cast<const LikeExpression *>(expr);
-                    operands = {like->value.get(), like->pattern.get()};
-                }
-                else if (expr->GetType() == ExpressionType::IN_LIST)
-                {
-                    const auto *in = static_cast<const InListExpression *>(expr);
-                    operands.push_back(in->operand.get());
-                    for (const auto &item : in->list)
-                        operands.push_back(item.get());
-                }
-                else
-                {
-                    const auto *between = static_cast<const BetweenExpression *>(expr);
-                    operands = {between->operand.get(), between->low.get(), between->high.get()};
-                }
-                PredicateTableSide side = PredicateTableSide::NONE;
-                for (const Expression *operand : operands)
-                {
-                    const PredicateTableSide s = ResolvePredicateSingleTable(operand, left_table_name, right_table_name,
-                                                                            left_table, right_table);
-                    if (s == PredicateTableSide::BOTH || (side != PredicateTableSide::NONE && s != PredicateTableSide::NONE && s != side))
-                        return PredicateTableSide::BOTH;
-                    if (s != PredicateTableSide::NONE)
-                        side = s;
-                }
-                return side;
-            }
-            default:
-                return PredicateTableSide::BOTH;
-            }
         }
 
         bool IsIndexableComparison(const Expression *expr,
@@ -206,27 +71,6 @@ namespace sql
             return labels;
         }
 
-        // The column a name refers to, spelled one way: without the table's
-        // own qualifier in a single-table query, and qualified in a join
-        std::string CanonicalColumn(const std::string &name, const SelectStatement &select, Table *table,
-                                    Table *join_table)
-        {
-            const size_t dot = name.find('.');
-            if (join_table == nullptr)
-                return dot != std::string::npos && name.substr(0, dot) == select.table ? name.substr(dot + 1) : name;
-            if (dot != std::string::npos)
-                return name;
-            switch (ResolveColumnSide(name, select.table, *select.join_table, table, join_table))
-            {
-            case PredicateTableSide::LEFT:
-                return select.table + "." + name;
-            case PredicateTableSide::RIGHT:
-                return *select.join_table + "." + name;
-            default:
-                return name; // unknown or ambiguous: evaluation reports it
-            }
-        }
-
         // GROUP BY, HAVING or an aggregate function anywhere it may appear
         bool IsAggregateQuery(const SelectStatement &select)
         {
@@ -261,7 +105,237 @@ namespace sql
             *column_name = static_cast<const ColumnExpression *>(between->operand.get())->name;
             return true;
         }
+
+        // The AND-ed parts of a condition: a AND (b AND c) gives a, b, c
+        void SplitConjuncts(const Expression *expr, std::vector<const Expression *> *out)
+        {
+            if (expr == nullptr)
+                return;
+            if (expr->GetType() == ExpressionType::BINARY_OP &&
+                static_cast<const BinaryExpression *>(expr)->op == TokenType::AND)
+            {
+                const auto *bin = static_cast<const BinaryExpression *>(expr);
+                SplitConjuncts(bin->left.get(), out);
+                SplitConjuncts(bin->right.get(), out);
+                return;
+            }
+            out->push_back(expr);
+        }
+
+        // The conditions AND-ed together: the condition itself when there
+        // is one, else a new expression kept alive by `owner`
+        const Expression *Conjunction(const std::vector<const Expression *> &conditions, PhysicalPlanNode *owner)
+        {
+            if (conditions.size() == 1)
+                return conditions[0];
+            auto copy = [](const Expression *e)
+            { return RewriteExpression(e, [](const Expression *) { return std::unique_ptr<Expression>(); }); };
+            std::unique_ptr<Expression> all = copy(conditions[0]);
+            for (size_t i = 1; i < conditions.size(); ++i)
+                all = std::make_unique<BinaryExpression>(std::move(all), TokenType::AND, copy(conditions[i]));
+            owner->owned_exprs.push_back(std::move(all));
+            return owner->owned_exprs.back().get();
+        }
+
+        // Every column reference in the expression, depth first
+        void ForEachColumn(const Expression *expr, const std::function<void(const std::string &)> &visit)
+        {
+            if (expr == nullptr)
+                return;
+            if (expr->GetType() == ExpressionType::COLUMN_REF)
+                visit(static_cast<const ColumnExpression *>(expr)->name);
+            for (const Expression *child : ExpressionChildren(expr))
+                ForEachColumn(child, visit);
+        }
+
+        // Qualified names must name a table in FROM, and ON conditions may
+        // only use the tables joined so far. (Unqualified names elsewhere
+        // may be SELECT aliases, so evaluation reports those.)
+        void CheckColumnNames(const SelectStatement &select, const Scope &scope)
+        {
+            auto check_qualified = [&](const Expression *expr)
+            {
+                ForEachColumn(expr, [&](const std::string &name)
+                              {
+                    if (name.find('.') != std::string::npos)
+                        scope.Resolve(name); });
+            };
+            for (const auto &item : select.items)
+                check_qualified(item.expr.get());
+            check_qualified(select.where.get());
+            for (const auto &key : select.group_by)
+                check_qualified(key.get());
+            check_qualified(select.having.get());
+            for (const auto &order : select.order_by)
+                check_qualified(order.expr.get());
+            for (size_t j = 0; j < select.joins.size(); ++j)
+            {
+                if (ContainsAggregate(select.joins[j].on.get()))
+                    throw std::runtime_error("Aggregate functions are not allowed in ON");
+                ForEachColumn(select.joins[j].on.get(), [&](const std::string &name)
+                              { scope.Resolve(name, j + 2); });
+            }
+        }
+
+        // An index scan of one relation for a condition on an indexed
+        // column, or null
+        std::unique_ptr<PhysicalPlanNode> IndexAccess(const Scope::Relation &relation, size_t index,
+                                                      const Expression *condition, Catalog *catalog)
+        {
+            std::string column_name;
+            TokenType op = TokenType::ILLEGAL;
+            Value literal;
+            Value low, high;
+            const bool comparison = IsIndexableComparison(condition, &column_name, &op, &literal);
+            if (!comparison && !IsIndexableRange(condition, &column_name, &low, &high))
+                return nullptr;
+
+            const std::string column = StripQualifier(column_name);
+            const int col_idx = relation.schema->GetColumnIndex(column);
+            if (col_idx < 0 || catalog->GetIndex(relation.table, column) == nullptr)
+                return nullptr;
+            const DataType type = relation.schema->GetSchema().GetColumn(static_cast<size_t>(col_idx)).type;
+
+            auto scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_SCAN);
+            scan->table_name = relation.table;
+            scan->relation = static_cast<int>(index);
+            scan->index_column = column;
+            if (!comparison)
+            {
+                if (type != low.GetType() || type != high.GetType())
+                    return nullptr;
+                scan->low_key = low;
+                scan->high_key = high;
+                return scan;
+            }
+            if (type != literal.GetType())
+                return nullptr;
+            switch (op)
+            {
+            case TokenType::EQ:
+                scan->is_point_lookup = true;
+                scan->point_key = literal;
+                break;
+            case TokenType::GT:
+            case TokenType::GEQ:
+                scan->low_key = literal;
+                scan->low_inclusive = op == TokenType::GEQ;
+                break;
+            default: // LT, LEQ
+                scan->high_key = literal;
+                scan->high_inclusive = op == TokenType::LEQ;
+                break;
+            }
+            return scan;
+        }
+
+        std::string RelationLabel(const Scope::Relation &relation)
+        {
+            return relation.name == relation.table ? relation.table : relation.table + " AS " + relation.name;
+        }
     } // namespace
+
+    Scope Scope::ForSelect(const SelectStatement &select, Catalog *catalog)
+    {
+        Scope scope;
+        auto add = [&](const std::string &table, const std::string &alias)
+        {
+            Table *schema = catalog->GetTable(table);
+            if (schema == nullptr)
+                throw std::runtime_error("Table not found: " + table);
+            const std::string name = alias.empty() ? table : alias;
+            for (const auto &existing : scope.relations_)
+            {
+                if (existing.name == name)
+                    throw std::runtime_error("Table name '" + name + "' specified more than once; use an alias");
+            }
+            scope.relations_.push_back({name, table, schema});
+        };
+        add(select.table, select.table_alias);
+        for (const auto &join : select.joins)
+            add(join.right.table, join.right.alias);
+        if (scope.relations_.size() > 64)
+            throw std::runtime_error("A query can join at most 64 tables");
+        return scope;
+    }
+
+    size_t Scope::Offset(size_t relation) const
+    {
+        size_t offset = 0;
+        for (size_t i = 0; i < relation; ++i)
+            offset += relations_[i].schema->GetSchema().GetColumnCount();
+        return offset;
+    }
+
+    Scope::Resolved Scope::Resolve(const std::string &name, size_t count) const
+    {
+        count = std::min(count, relations_.size());
+        const size_t dot = name.find('.');
+        if (dot != std::string::npos)
+        {
+            const std::string qualifier = name.substr(0, dot);
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (relations_[i].name != qualifier)
+                    continue;
+                const int idx = relations_[i].schema->GetColumnIndex(name.substr(dot + 1));
+                if (idx < 0)
+                    throw std::runtime_error("Unknown column: " + name);
+                return {i, static_cast<size_t>(idx)};
+            }
+            throw std::runtime_error("Unknown table qualifier in column: " + name);
+        }
+        std::optional<Resolved> found;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const int idx = relations_[i].schema->GetColumnIndex(name);
+            if (idx < 0)
+                continue;
+            if (found)
+                throw std::runtime_error("Ambiguous column: " + name);
+            found = Resolved{i, static_cast<size_t>(idx)};
+        }
+        if (!found)
+            throw std::runtime_error("Unknown column: " + name);
+        return *found;
+    }
+
+    bool Scope::CanResolve(const std::string &name, size_t count) const
+    {
+        try
+        {
+            Resolve(name, count);
+            return true;
+        }
+        catch (const std::runtime_error &)
+        {
+            return false;
+        }
+    }
+
+    std::string Scope::Canonical(const std::string &name) const
+    {
+        if (!CanResolve(name))
+            return name; // evaluation reports it
+        const Resolved r = Resolve(name);
+        return relations_[r.relation].name + "." +
+               relations_[r.relation].schema->GetSchema().GetColumn(r.column).name;
+    }
+
+    std::optional<uint64_t> Scope::RelationsOf(const Expression *expr, size_t count) const
+    {
+        uint64_t relations = 0;
+        bool resolved = true;
+        ForEachColumn(expr, [&](const std::string &name)
+                      {
+            if (CanResolve(name, count))
+                relations |= uint64_t{1} << Resolve(name, count).relation;
+            else
+                resolved = false; });
+        if (!resolved)
+            return std::nullopt;
+        return relations;
+    }
 
     std::unique_ptr<LogicalPlanNode> Optimizer::BuildLogicalPlan(const Statement *stmt) const
     {
@@ -402,250 +476,192 @@ namespace sql
 
     std::unique_ptr<PhysicalPlanNode> Optimizer::BuildSelectPhysicalPlan(const SelectStatement *select, Catalog *catalog) const
     {
-        Table *table = catalog->GetTable(select->table);
-        if (table == nullptr)
-        {
-            throw std::runtime_error("Table not found: " + select->table);
-        }
+        const Scope scope = Scope::ForSelect(*select, catalog);
+        const size_t n = scope.Size();
         if (ContainsAggregate(select->where.get()))
             throw std::runtime_error("Aggregate functions are not allowed in WHERE");
+        CheckColumnNames(*select, scope);
 
-        auto build_base_access_path = [&](const std::string &table_name, Table *target_table, const Expression *predicate) -> std::unique_ptr<PhysicalPlanNode>
+        // How each table joins the ones before it (tables join left to
+        // right, in the order written)
+        struct JoinStep
         {
-            std::unique_ptr<PhysicalPlanNode> access_path;
-            std::string column_name;
-            TokenType op = TokenType::ILLEGAL;
-            Value literal_value;
-            if (IsIndexableComparison(predicate, &column_name, &op, &literal_value))
+            PhysicalPlanType algorithm = PhysicalPlanType::NESTED_LOOP_JOIN;
+            std::vector<const Expression *> residual;
+            const Expression *key = nullptr; // left.col = right.col used by hash / index joins
+            Scope::Resolved left_key{0, 0};
+            Scope::Resolved right_key{0, 0};
+            bool build_right = true;
+            bool outer_is_left = true;
+        };
+        std::vector<JoinStep> steps(n);
+        // A WHERE condition on one table can filter it before the joins,
+        // unless that table is reached through an index (every row of it is
+        // probed) or is NULL-padded by a LEFT JOIN (the condition must also
+        // see the padded rows)
+        std::vector<bool> can_push(n, true);
+        size_t rows_so_far = scope.Relations()[0].schema->GetTupleCount();
+        for (size_t j = 1; j < n; ++j)
+        {
+            const JoinClause &clause = select->joins[j - 1];
+            const Scope::Relation &right = scope.Relations()[j];
+            JoinStep &step = steps[j];
+            std::vector<const Expression *> conditions;
+            SplitConjuncts(clause.on.get(), &conditions);
+
+            for (const Expression *condition : conditions)
             {
-                const std::string unqualified = StripQualifier(column_name);
-                BTree *index = catalog->GetIndex(table_name, unqualified);
-                if (index != nullptr)
+                if (condition->GetType() != ExpressionType::BINARY_OP)
+                    continue;
+                const auto *eq = static_cast<const BinaryExpression *>(condition);
+                if (eq->op != TokenType::EQ || eq->left->GetType() != ExpressionType::COLUMN_REF ||
+                    eq->right->GetType() != ExpressionType::COLUMN_REF)
+                    continue;
+                Scope::Resolved a = scope.Resolve(static_cast<const ColumnExpression *>(eq->left.get())->name, j + 1);
+                Scope::Resolved b = scope.Resolve(static_cast<const ColumnExpression *>(eq->right.get())->name, j + 1);
+                if (a.relation == j)
+                    std::swap(a, b);
+                if (b.relation == j && a.relation < j)
                 {
-                    int col_idx = target_table->GetColumnIndex(unqualified);
-                    if (col_idx < 0)
-                    {
-                        throw std::runtime_error("Indexed column not found in table schema: " + unqualified);
-                    }
-
-                    const Column &column = target_table->GetSchema().GetColumn(static_cast<size_t>(col_idx));
-                    if (column.type != literal_value.GetType())
-                    {
-                        index = nullptr;
-                    }
-                }
-
-                if (index != nullptr)
-                {
-                    auto index_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_SCAN);
-                    index_scan->table_name = table_name;
-                    index_scan->index_column = unqualified;
-
-                    switch (op)
-                    {
-                    case TokenType::EQ:
-                        index_scan->is_point_lookup = true;
-                        index_scan->point_key = literal_value;
-                        break;
-                    case TokenType::GT:
-                        index_scan->low_key = literal_value;
-                        index_scan->low_inclusive = false;
-                        break;
-                    case TokenType::GEQ:
-                        index_scan->low_key = literal_value;
-                        index_scan->low_inclusive = true;
-                        break;
-                    case TokenType::LT:
-                        index_scan->high_key = literal_value;
-                        index_scan->high_inclusive = false;
-                        break;
-                    case TokenType::LEQ:
-                        index_scan->high_key = literal_value;
-                        index_scan->high_inclusive = true;
-                        break;
-                    default:
-                        break;
-                    }
-                    access_path = std::move(index_scan);
+                    step.key = condition;
+                    step.left_key = a;
+                    step.right_key = b;
+                    break;
                 }
             }
 
-            Value range_low, range_high;
-            if (!access_path && IsIndexableRange(predicate, &column_name, &range_low, &range_high))
+            const size_t right_rows = right.schema->GetTupleCount();
+            if (step.key != nullptr)
             {
-                const std::string unqualified = StripQualifier(column_name);
-                BTree *index = catalog->GetIndex(table_name, unqualified);
-                const int col_idx = target_table->GetColumnIndex(unqualified);
-                if (index != nullptr && col_idx >= 0)
+                const Scope::Relation &left = scope.Relations()[step.left_key.relation];
+                const std::string &right_col = right.schema->GetSchema().GetColumn(step.right_key.column).name;
+                const std::string &left_col = left.schema->GetSchema().GetColumn(step.left_key.column).name;
+                if (catalog->GetIndex(right.table, right_col) != nullptr)
                 {
-                    const Column &column = target_table->GetSchema().GetColumn(static_cast<size_t>(col_idx));
-                    if (column.type == range_low.GetType() && column.type == range_high.GetType())
-                    {
-                        auto index_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_SCAN);
-                        index_scan->table_name = table_name;
-                        index_scan->index_column = unqualified;
-                        index_scan->low_key = range_low;
-                        index_scan->low_inclusive = true;
-                        index_scan->high_key = range_high;
-                        index_scan->high_inclusive = true;
-                        access_path = std::move(index_scan);
-                    }
+                    step.algorithm = PhysicalPlanType::INDEX_NESTED_LOOP_JOIN;
+                    can_push[j] = false;
+                }
+                else if (j == 1 && clause.type == JoinType::INNER && catalog->GetIndex(left.table, left_col) != nullptr)
+                {
+                    // Only the first table has an index: probe it for each
+                    // row of the second
+                    step.algorithm = PhysicalPlanType::INDEX_NESTED_LOOP_JOIN;
+                    step.outer_is_left = false;
+                    can_push[0] = false;
+                }
+                else if (rows_so_far + right_rows >= 16)
+                {
+                    step.algorithm = PhysicalPlanType::HASH_JOIN;
+                    // Hash the smaller side; a LEFT join keeps every left
+                    // row, so it streams them past the right side's table
+                    step.build_right = clause.type == JoinType::LEFT || right_rows <= rows_so_far;
                 }
             }
-
-            if (!access_path)
+            for (const Expression *condition : conditions)
             {
-                auto seq_scan = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SEQ_SCAN);
-                seq_scan->table_name = table_name;
-                access_path = std::move(seq_scan);
+                if (condition != step.key || step.algorithm == PhysicalPlanType::NESTED_LOOP_JOIN)
+                    step.residual.push_back(condition);
             }
-            return access_path;
+            if (clause.type == JoinType::LEFT)
+                can_push[j] = false;
+            rows_so_far += right_rows;
+        }
+
+        // Split WHERE into conditions on single tables (pushed down) and the
+        // rest (checked on the joined rows)
+        std::vector<const Expression *> where;
+        SplitConjuncts(select->where.get(), &where);
+        std::vector<std::vector<const Expression *>> pushed(n);
+        std::vector<const Expression *> remaining;
+        for (const Expression *condition : where)
+        {
+            const std::optional<uint64_t> relations = scope.RelationsOf(condition);
+            if (relations && *relations != 0 && (*relations & (*relations - 1)) == 0)
+            {
+                size_t r = 0;
+                while (!((*relations >> r) & 1U))
+                    ++r;
+                if (can_push[r])
+                {
+                    pushed[r].push_back(condition);
+                    continue;
+                }
+            }
+            remaining.push_back(condition);
+        }
+
+        // One table's rows, filtered by the conditions pushed down to it;
+        // a condition on an indexed column becomes an index scan
+        auto access_path = [&](size_t r) -> std::unique_ptr<PhysicalPlanNode>
+        {
+            const Scope::Relation &relation = scope.Relations()[r];
+            std::unique_ptr<PhysicalPlanNode> path;
+            for (const Expression *condition : pushed[r])
+            {
+                if (!path)
+                    path = IndexAccess(relation, r, condition, catalog);
+            }
+            if (!path)
+            {
+                path = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SEQ_SCAN);
+                path->table_name = relation.table;
+                path->relation = static_cast<int>(r);
+            }
+            if (!pushed[r].empty())
+            {
+                auto filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
+                filter->table_name = relation.table;
+                filter->relation = static_cast<int>(r);
+                // The whole WHERE when it all applies here
+                filter->predicate = pushed[r].size() == where.size() ? select->where.get()
+                                                                     : Conjunction(pushed[r], filter.get());
+                filter->children.push_back(std::move(path));
+                path = std::move(filter);
+            }
+            return path;
         };
 
-        std::unique_ptr<PhysicalPlanNode> current;
-        if (select->join_table.has_value())
+        std::unique_ptr<PhysicalPlanNode> current = access_path(0);
+        for (size_t j = 1; j < n; ++j)
         {
-            Table *right_table = catalog->GetTable(*select->join_table);
-            if (right_table == nullptr)
+            const JoinClause &clause = select->joins[j - 1];
+            const Scope::Relation &right = scope.Relations()[j];
+            JoinStep &step = steps[j];
+            auto join = std::make_unique<PhysicalPlanNode>(step.algorithm);
+            join->join_type = clause.type;
+            join->table_name = scope.Relations()[0].table;
+            join->right_table_name = right.table;
+            join->right_label = RelationLabel(right);
+            join->relation_count = j + 1;
+            join->join_residual = step.residual;
+            join->join_on_label = clause.on ? ExpressionToSQL(clause.on.get()) : "";
+            if (step.key != nullptr)
             {
-                throw std::runtime_error("Join table not found: " + *select->join_table);
+                join->join_key_label = ExpressionToSQL(step.key);
+                join->left_key = scope.Offset(step.left_key.relation) + step.left_key.column;
+                join->right_key = step.right_key.column;
             }
-            if (!select->join_left_column.has_value() || !select->join_right_column.has_value())
-            {
-                throw std::runtime_error("JOIN requires ON left_col = right_col");
-            }
-
-            const size_t left_count = table->GetTupleCount();
-            const size_t right_count = right_table->GetTupleCount();
-
-            // Resolve which join column belongs to which table.
-            // The ON clause may have columns in either order (e.g., ON right.x = left.y),
-            // so we must check before looking up indexes.
-            const auto left_side = ResolveColumnSide(*select->join_left_column,
-                                                      select->table, *select->join_table,
-                                                      table, right_table);
-            const auto right_side = ResolveColumnSide(*select->join_right_column,
-                                                       select->table, *select->join_table,
-                                                       table, right_table);
-
-            // Determine the actual column name for each table side.
-            std::string col_on_left_table;  // column belonging to select->table
-            std::string col_on_right_table; // column belonging to select->join_table
-            if (left_side == PredicateTableSide::LEFT && right_side == PredicateTableSide::RIGHT)
-            {
-                col_on_left_table = StripQualifier(*select->join_left_column);
-                col_on_right_table = StripQualifier(*select->join_right_column);
-            }
-            else if (left_side == PredicateTableSide::RIGHT && right_side == PredicateTableSide::LEFT)
-            {
-                col_on_left_table = StripQualifier(*select->join_right_column);
-                col_on_right_table = StripQualifier(*select->join_left_column);
-            }
-            // else: ambiguous or unresolved — skip INLJ
-
-            // Check if either join column has an index → prefer INDEX_NESTED_LOOP_JOIN.
-            std::unique_ptr<PhysicalPlanNode> join;
-            if (!col_on_left_table.empty() && !col_on_right_table.empty())
-            {
-                BTree *left_index = catalog->GetIndex(select->table, col_on_left_table);
-                BTree *right_index = catalog->GetIndex(*select->join_table, col_on_right_table);
-
-                if (right_index != nullptr)
-                {
-                    // Right table has index → right is inner, left is outer.
-                    join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_NESTED_LOOP_JOIN);
-                    join->join_right_as_outer = false; // left is outer
-                }
-                else if (left_index != nullptr)
-                {
-                    // Left table has index → left is inner, right is outer.
-                    join = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::INDEX_NESTED_LOOP_JOIN);
-                    join->join_right_as_outer = true; // right is outer
-                }
-            }
-
-            if (join == nullptr)
-            {
-                // Rule-based choice between HASH_JOIN and NESTED_LOOP_JOIN.
-                const size_t total_rows = left_count + right_count;
-                const bool use_hash_join = total_rows >= 16;
-                join = std::make_unique<PhysicalPlanNode>(
-                    use_hash_join ? PhysicalPlanType::HASH_JOIN : PhysicalPlanType::NESTED_LOOP_JOIN);
-                // Iterate smaller table in outer loop for nested loop.
-                join->join_right_as_outer = right_count < left_count;
-                // Build hash table on smaller side for hash join.
-                join->join_build_right = right_count <= left_count;
-            }
-
-            std::unique_ptr<PhysicalPlanNode> left_input = build_base_access_path(select->table, table, nullptr);
-            std::unique_ptr<PhysicalPlanNode> right_input = build_base_access_path(*select->join_table, right_table, nullptr);
-            const Expression *remaining_predicate = select->where.get();
-            if (remaining_predicate != nullptr)
-            {
-                const PredicateTableSide side = ResolvePredicateSingleTable(
-                    remaining_predicate, select->table, *select->join_table, table, right_table);
-                // An index nested loop join reaches its inner table through
-                // the index, so a filter on that side stays after the join
-                const bool inner_side_of_index_join =
-                    join->type == PhysicalPlanType::INDEX_NESTED_LOOP_JOIN &&
-                    side == (join->join_right_as_outer ? PredicateTableSide::LEFT : PredicateTableSide::RIGHT);
-                if ((side == PredicateTableSide::LEFT || side == PredicateTableSide::RIGHT) && !inner_side_of_index_join)
-                {
-                    const std::string target_table_name = (side == PredicateTableSide::LEFT) ? select->table : *select->join_table;
-                    Table *target_table = (side == PredicateTableSide::LEFT) ? table : right_table;
-                    std::unique_ptr<PhysicalPlanNode> side_input = build_base_access_path(target_table_name, target_table, remaining_predicate);
-                    auto side_filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
-                    side_filter->table_name = target_table_name;
-                    side_filter->predicate = remaining_predicate;
-                    side_filter->children.push_back(std::move(side_input));
-                    side_input = std::move(side_filter);
-
-                    if (side == PredicateTableSide::LEFT)
-                    {
-                        left_input = std::move(side_input);
-                    }
-                    else
-                    {
-                        right_input = std::move(side_input);
-                    }
-                    remaining_predicate = nullptr;
-                }
-            }
-
-            join->table_name = select->table;
-            join->right_table_name = *select->join_table;
-            join->join_left_column = *select->join_left_column;
-            join->join_right_column = *select->join_right_column;
-            join->children.push_back(std::move(left_input));
-            join->children.push_back(std::move(right_input));
+            join->join_build_right = step.build_right;
+            join->join_outer_is_left = step.outer_is_left;
+            join->children.push_back(std::move(current));
+            join->children.push_back(access_path(j));
             current = std::move(join);
-
-            if (remaining_predicate != nullptr)
-            {
-                auto filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
-                filter->table_name = "__join_context__";
-                filter->predicate = remaining_predicate;
-                filter->children.push_back(std::move(current));
-                current = std::move(filter);
-            }
         }
-        else
+
+        if (!remaining.empty())
         {
-            current = build_base_access_path(select->table, table, select->where.get());
-            if (select->where != nullptr)
-            {
-                auto filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
-                filter->table_name = select->table;
-                filter->predicate = select->where.get();
-                filter->children.push_back(std::move(current));
-                current = std::move(filter);
-            }
+            auto filter = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::FILTER);
+            filter->table_name = n > 1 ? "__join_context__" : select->table;
+            filter->relation_count = n;
+            filter->predicate = remaining.size() == where.size() ? select->where.get()
+                                                                 : Conjunction(remaining, filter.get());
+            filter->children.push_back(std::move(current));
+            current = std::move(filter);
         }
 
-        Table *join_table = select->join_table ? catalog->GetTable(*select->join_table) : nullptr;
         if (IsAggregateQuery(*select))
         {
-            current = BuildAggregatePlan(*select, table, join_table, std::move(current));
+            current = BuildAggregatePlan(*select, scope, std::move(current));
         }
         else
         {
@@ -654,12 +670,14 @@ namespace sql
             if (!select->order_by.empty())
             {
                 auto sort = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SORT);
-                ResolveSortKeys(*select, table, join_table, sort.get());
+                sort->relation_count = n;
+                ResolveSortKeys(*select, scope, sort.get());
                 sort->children.push_back(std::move(current));
                 current = std::move(sort);
             }
 
             auto projection = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::PROJECTION);
+            projection->relation_count = n;
             projection->project_all = select->select_star;
             projection->projected_columns = ProjectionLabels(*select);
             if (select->HasComputedItems())
@@ -689,18 +707,16 @@ namespace sql
         return current;
     }
 
-    std::unique_ptr<PhysicalPlanNode> Optimizer::BuildAggregatePlan(const SelectStatement &select, Table *table,
-                                                                    Table *join_table,
+    std::unique_ptr<PhysicalPlanNode> Optimizer::BuildAggregatePlan(const SelectStatement &select, const Scope &scope,
                                                                     std::unique_ptr<PhysicalPlanNode> input) const
     {
         if (select.select_star)
             throw std::runtime_error("SELECT * cannot be used with GROUP BY or aggregate functions");
         auto same_column = [&](const std::string &a, const std::string &b)
-        {
-            return CanonicalColumn(a, select, table, join_table) == CanonicalColumn(b, select, table, join_table);
-        };
+        { return scope.Canonical(a) == scope.Canonical(b); };
 
         auto aggregate = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::AGGREGATE);
+        aggregate->relation_count = scope.Size();
         // Output columns are named by their SQL text (what EXPLAIN shows);
         // equal texts for different expressions get a suffix
         auto add_column = [&](const std::string &name)
@@ -733,9 +749,7 @@ namespace sql
             else if (key->GetType() == ExpressionType::COLUMN_REF)
             {
                 const std::string &name = static_cast<const ColumnExpression *>(key)->name;
-                const bool is_column = join_table ? ResolveColumnSide(name, select.table, *select.join_table, table,
-                                                                      join_table) != PredicateTableSide::NONE
-                                                  : table->GetColumnIndex(CanonicalColumn(name, select, table, nullptr)) >= 0;
+                const bool is_column = scope.CanResolve(name);
                 for (const auto &item : select.items)
                 {
                     if (!is_column && !item.alias.empty() && item.alias == name)
@@ -825,7 +839,7 @@ namespace sql
         {
             // Positions and aliases name SELECT items; then rewrite
             PhysicalPlanNode resolved(PhysicalPlanType::SORT);
-            ResolveSortKeys(select, table, join_table, &resolved);
+            ResolveSortKeys(select, scope, &resolved);
             sort = std::make_unique<PhysicalPlanNode>(PhysicalPlanType::SORT);
             sort->over_aggregate = true;
             sort->sort_descending = resolved.sort_descending;
@@ -852,8 +866,7 @@ namespace sql
         return projection;
     }
 
-    void Optimizer::ResolveSortKeys(const SelectStatement &select, Table *table, Table *join_table,
-                                    PhysicalPlanNode *sort) const
+    void Optimizer::ResolveSortKeys(const SelectStatement &select, const Scope &scope, PhysicalPlanNode *sort) const
     {
         for (const auto &order : select.order_by)
         {
@@ -868,14 +881,12 @@ namespace sql
                     const int64_t pos = v.GetAsInt();
                     if (select.select_star)
                     {
-                        // Output columns are the table's (then the joined table's)
+                        // Output columns are every table's, in FROM order
                         std::vector<std::string> names;
-                        for (const auto &col : table->GetSchema().GetColumns())
-                            names.push_back(join_table ? table->GetName() + "." + col.name : col.name);
-                        if (join_table)
+                        for (const auto &relation : scope.Relations())
                         {
-                            for (const auto &col : join_table->GetSchema().GetColumns())
-                                names.push_back(join_table->GetName() + "." + col.name);
+                            for (const auto &col : relation.schema->GetSchema().GetColumns())
+                                names.push_back(scope.Size() > 1 ? relation.name + "." + col.name : col.name);
                         }
                         if (pos < 1 || pos > static_cast<int64_t>(names.size()))
                             throw std::runtime_error("ORDER BY position " + std::to_string(pos) + " is out of range");
@@ -908,10 +919,7 @@ namespace sql
             if (select.distinct)
             {
                 auto same_column = [&](const std::string &a, const std::string &b)
-                {
-                    return CanonicalColumn(a, select, table, join_table) ==
-                           CanonicalColumn(b, select, table, join_table);
-                };
+                { return scope.Canonical(a) == scope.Canonical(b); };
                 bool selected = select.select_star && key->GetType() == ExpressionType::COLUMN_REF;
                 for (const auto &item : select.items)
                     selected = selected || ExpressionsEqual(item.expr.get(), key, same_column);
@@ -958,34 +966,26 @@ namespace sql
             out << ")";
             break;
         case PhysicalPlanType::NESTED_LOOP_JOIN:
-            out << pad << "NestedLoopJoin(left=" << node->table_name
-                << ", right=" << node->right_table_name
-                << ", on=" << node->join_left_column
-                << " = " << node->join_right_column
-                << ", outer=" << (node->join_right_as_outer ? "right" : "left")
-                << ")";
+            out << pad << "NestedLoopJoin(type=" << JoinTypeName(node->join_type) << ", right=" << node->right_label;
+            if (!node->join_on_label.empty())
+                out << ", on=" << node->join_on_label;
+            out << ")";
             break;
         case PhysicalPlanType::HASH_JOIN:
-            out << pad << "HashJoin(left=" << node->table_name
-                << ", right=" << node->right_table_name
-                << ", on=" << node->join_left_column
-                << " = " << node->join_right_column
-                << ", build=" << (node->join_build_right ? "right" : "left")
-                << ")";
+            out << pad << "HashJoin(type=" << JoinTypeName(node->join_type) << ", right=" << node->right_label
+                << ", key=" << node->join_key_label << ", build=" << (node->join_build_right ? "right" : "left");
+            if (!node->join_residual.empty())
+                out << ", on=" << node->join_on_label;
+            out << ")";
             break;
         case PhysicalPlanType::INDEX_NESTED_LOOP_JOIN:
-        {
-            const std::string &outer = node->join_right_as_outer ? node->right_table_name : node->table_name;
-            const std::string &inner = node->join_right_as_outer ? node->table_name : node->right_table_name;
-            const std::string &inner_col = node->join_right_as_outer ? node->join_left_column : node->join_right_column;
-            out << pad << "IndexNestedLoopJoin(outer=" << outer
-                << ", inner=" << inner
-                << "(index on " << inner_col << ")"
-                << ", on=" << node->join_left_column
-                << " = " << node->join_right_column
-                << ")";
+            out << pad << "IndexNestedLoopJoin(type=" << JoinTypeName(node->join_type) << ", right="
+                << node->right_label << ", key=" << node->join_key_label
+                << ", probe=" << (node->join_outer_is_left ? "right" : "left") << " index";
+            if (!node->join_residual.empty())
+                out << ", on=" << node->join_on_label;
+            out << ")";
             break;
-        }
         case PhysicalPlanType::FILTER:
             out << pad << "Filter";
             if (node->predicate != nullptr)

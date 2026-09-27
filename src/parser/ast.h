@@ -127,6 +127,9 @@ namespace sql
         ExpressionType GetType() const override { return ExpressionType::AGGREGATE; }
     };
 
+    // The direct subexpressions of an expression, in order
+    std::vector<const Expression *> ExpressionChildren(const Expression *expr);
+
     // True if the expression contains an aggregate function call
     bool ContainsAggregate(const Expression *expr);
 
@@ -168,6 +171,31 @@ namespace sql
         std::string alias; // empty if none
     };
 
+    // A table in FROM, and the name the query knows it by
+    struct TableRef
+    {
+        std::string table;
+        std::string alias; // empty if none
+        const std::string &Name() const { return alias.empty() ? table : alias; }
+    };
+
+    enum class JoinType
+    {
+        INNER,
+        LEFT, // LEFT [OUTER] JOIN: unmatched left rows are kept, NULL-padded
+        CROSS // CROSS JOIN, or a comma in FROM: every pair of rows
+    };
+
+    const char *JoinTypeName(JoinType type);
+
+    // One "JOIN t [AS a] ON cond" after the first table in FROM
+    struct JoinClause
+    {
+        JoinType type = JoinType::INNER;
+        TableRef right;
+        std::unique_ptr<Expression> on; // null for CROSS
+    };
+
     // ORDER BY entry: an expression, an output alias, or a 1-based position
     struct OrderItem
     {
@@ -177,10 +205,10 @@ namespace sql
 
     struct SelectStatement : public Statement
     {
+        // FROM table [AS alias] followed by joins, joined left to right
         std::string table;
-        std::optional<std::string> join_table;
-        std::optional<std::string> join_left_column;
-        std::optional<std::string> join_right_column;
+        std::string table_alias; // empty if none
+        std::vector<JoinClause> joins;
         std::vector<SelectItem> items;    // the SELECT list (empty for SELECT *)
         std::vector<std::string> columns; // column names, when every item is a bare column
         bool select_star = false;

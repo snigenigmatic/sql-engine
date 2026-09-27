@@ -43,101 +43,6 @@ namespace sql
         return *converted;
     }
 
-    int Executor::ResolveColumnIndexForSelect(const std::string &name, Table *base_table, Table *join_table, bool *from_join_table) const
-    {
-        if (base_table == nullptr)
-        {
-            throw std::runtime_error("Base table is null while resolving projection");
-        }
-
-        const size_t dot = name.find('.');
-        if (dot != std::string::npos)
-        {
-            const std::string qualifier = name.substr(0, dot);
-            const std::string column = name.substr(dot + 1);
-            if (qualifier == base_table->GetName())
-            {
-                int idx = base_table->GetColumnIndex(column);
-                if (idx < 0)
-                    throw std::runtime_error("Unknown column: " + name);
-                if (from_join_table)
-                    *from_join_table = false;
-                return idx;
-            }
-            if (join_table && qualifier == join_table->GetName())
-            {
-                int idx = join_table->GetColumnIndex(column);
-                if (idx < 0)
-                    throw std::runtime_error("Unknown column: " + name);
-                if (from_join_table)
-                    *from_join_table = true;
-                return idx;
-            }
-            throw std::runtime_error("Unknown table qualifier in column: " + name);
-        }
-
-        int base_idx = base_table->GetColumnIndex(name);
-        int join_idx = -1;
-        if (join_table)
-        {
-            join_idx = join_table->GetColumnIndex(name);
-        }
-
-        if (base_idx >= 0 && join_idx >= 0)
-        {
-            throw std::runtime_error("Ambiguous column reference: " + name);
-        }
-        if (base_idx >= 0)
-        {
-            if (from_join_table)
-                *from_join_table = false;
-            return base_idx;
-        }
-
-        if (join_idx >= 0)
-        {
-            if (from_join_table)
-                *from_join_table = true;
-            return join_idx;
-        }
-
-        throw std::runtime_error("Unknown column: " + name);
-    }
-
-    void Executor::EnsureJoinContextTable(Table *left, Table *right)
-    {
-        if (left == nullptr || right == nullptr)
-        {
-            throw std::runtime_error("Cannot create join context schema without both tables");
-        }
-        std::vector<Column> join_columns;
-        join_columns.reserve(left->GetSchema().GetColumnCount() + right->GetSchema().GetColumnCount());
-        for (const auto &col : left->GetSchema().GetColumns())
-        {
-            join_columns.emplace_back(left->GetName() + "." + col.name, col.type, col.length);
-        }
-        for (const auto &col : right->GetSchema().GetColumns())
-        {
-            join_columns.emplace_back(right->GetName() + "." + col.name, col.type, col.length);
-        }
-        join_context_table_ = std::make_unique<Table>("__join_context__", Schema(std::move(join_columns)));
-    }
-
-    std::pair<std::string, std::string> Executor::ResolveJoinColumns(const PhysicalPlanNode *node, Table *left, Table *right) const
-    {
-        std::string left_col = StripQualifier(node->join_left_column);
-        std::string right_col = StripQualifier(node->join_right_column);
-        if (left->GetColumnIndex(left_col) < 0)
-        {
-            std::swap(left_col, right_col);
-        }
-        if (left->GetColumnIndex(left_col) < 0 || right->GetColumnIndex(right_col) < 0)
-        {
-            throw std::runtime_error("Invalid JOIN columns in ON clause");
-        }
-        return {left_col, right_col};
-    }
-
     Value Executor::ResolveColumnValue(const ColumnExpression &col, const Tuple *tuple, Table *table) const
     {
         if (!tuple || !table)
@@ -236,50 +141,53 @@ namespace sql
         }
     }
 
-    std::vector<int> Executor::ResolveProjectionIndices(const PhysicalPlanNode *node, Table *table, Table *join_table) const
+    Table *Executor::MaterializeOperatorToTable(std::unique_ptr<Operator> op, Table *source_table)
     {
-        std::vector<int> column_indices;
-        if (node == nullptr || table == nullptr || node->project_all)
-        {
-            return column_indices;
-        }
-
-        for (const auto &col_name : node->projected_columns)
-        {
-            bool from_join = false;
-            int idx = ResolveColumnIndexForSelect(col_name, table, join_table, &from_join);
-            if (from_join)
-            {
-                idx += static_cast<int>(table->GetSchema().GetColumnCount());
-            }
-            column_indices.push_back(idx);
-        }
-        return column_indices;
-    }
-
-    Table *Executor::MaterializeOperatorToTable(std::unique_ptr<Operator> op, Table *source_table, const std::string &name_suffix)
-    {
-        if (op == nullptr || source_table == nullptr)
-        {
-            throw std::runtime_error("Cannot materialize null operator or source table");
-        }
-
-        (void)name_suffix;
-        auto materialized = std::make_unique<Table>(
-            source_table->GetName(),
-            source_table->GetSchema());
+        auto materialized = std::make_unique<Table>(source_table->GetName(), source_table->GetSchema());
         op->Open();
         Tuple row;
         while (op->Next(&row))
-        {
             materialized->Insert(row);
-        }
         op->Close();
         materialized_tables_.push_back(std::move(materialized));
         return materialized_tables_.back().get();
     }
 
-    Table *Executor::RowContext(const PhysicalPlanNode *node, Table *table) const
+    Table *Executor::JoinedContext(size_t count)
+    {
+        if (count == 0 || count > scope_.Size())
+            throw std::logic_error("Plan node covers no known relations");
+        if (count == 1)
+            return RelationContext(0);
+        if (joined_contexts_.size() <= count)
+            joined_contexts_.resize(count + 1);
+        if (!joined_contexts_[count])
+        {
+            std::vector<Column> columns;
+            for (size_t r = 0; r < count; ++r)
+            {
+                const Scope::Relation &relation = scope_.Relations()[r];
+                for (const auto &col : relation.schema->GetSchema().GetColumns())
+                    columns.emplace_back(relation.name + "." + col.name, col.type, col.length);
+            }
+            joined_contexts_[count] = std::make_unique<Table>("__join_context__", Schema(std::move(columns)));
+        }
+        return joined_contexts_[count].get();
+    }
+
+    Table *Executor::RelationContext(size_t relation)
+    {
+        const Scope::Relation &r = scope_.Relations().at(relation);
+        if (r.name == r.table)
+            return r.schema;
+        if (relation_contexts_.size() <= relation)
+            relation_contexts_.resize(relation + 1);
+        if (!relation_contexts_[relation])
+            relation_contexts_[relation] = std::make_unique<Table>(r.name, r.schema->GetSchema());
+        return relation_contexts_[relation].get();
+    }
+
+    Table *Executor::RowContext(const PhysicalPlanNode *node)
     {
         if (node->over_aggregate)
         {
@@ -287,171 +195,102 @@ namespace sql
                 throw std::logic_error("Aggregate output used before the aggregate was built");
             return aggregate_context_table_.get();
         }
-        return join_context_table_ ? join_context_table_.get() : table;
+        if (node->relation >= 0)
+            return RelationContext(static_cast<size_t>(node->relation));
+        return JoinedContext(node->relation_count);
     }
 
-    std::unique_ptr<Operator> Executor::BuildOperatorTree(const PhysicalPlanNode *node, Table *table, Table *join_table)
+    Table *Executor::JoinRightInput(const PhysicalPlanNode *access_path, const Scope::Relation &relation)
+    {
+        if (access_path->type == PhysicalPlanType::SEQ_SCAN)
+            return relation.schema;
+        return MaterializeOperatorToTable(BuildOperatorTree(access_path), relation.schema);
+    }
+
+    std::unique_ptr<Operator> Executor::BuildOperatorTree(const PhysicalPlanNode *node)
     {
         if (node == nullptr)
-        {
             throw std::runtime_error("Null physical plan node");
-        }
 
         switch (node->type)
         {
         case PhysicalPlanType::SEQ_SCAN:
-            return std::make_unique<SeqScan>(table);
+            return std::make_unique<SeqScan>(scope_.Relations().at(static_cast<size_t>(node->relation)).schema);
         case PhysicalPlanType::INDEX_SCAN:
         {
+            Table *table = scope_.Relations().at(static_cast<size_t>(node->relation)).schema;
             BTree *index = catalog_->GetIndex(node->table_name, node->index_column);
             if (!index)
                 throw std::runtime_error("Expected index not found on " + node->table_name + "." + node->index_column);
-
             if (node->is_point_lookup)
             {
                 if (!node->point_key.has_value())
                     throw std::runtime_error("Point lookup index scan missing key");
                 return std::make_unique<IndexScan>(table, index, *node->point_key);
             }
-            return std::make_unique<IndexScan>(
-                table, index,
-                node->low_key, node->low_inclusive,
-                node->high_key, node->high_inclusive);
+            return std::make_unique<IndexScan>(table, index, node->low_key, node->low_inclusive, node->high_key,
+                                               node->high_inclusive);
         }
         case PhysicalPlanType::NESTED_LOOP_JOIN:
-        {
-            Table *left = catalog_->GetTable(node->table_name);
-            Table *right = catalog_->GetTable(node->right_table_name);
-            if (left == nullptr || right == nullptr)
-            {
-                throw std::runtime_error("JOIN table not found while building operator tree");
-            }
-            if (node->children.size() == 2)
-            {
-                auto left_access = BuildOperatorTree(node->children[0].get(), left, nullptr);
-                auto right_access = BuildOperatorTree(node->children[1].get(), right, nullptr);
-                Table *left_materialized = MaterializeOperatorToTable(std::move(left_access), left, "__left_input__");
-                Table *right_materialized = MaterializeOperatorToTable(std::move(right_access), right, "__right_input__");
-                const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
-                EnsureJoinContextTable(left, right);
-                return std::make_unique<NestedLoopJoin>(
-                    left_materialized,
-                    right_materialized,
-                    left_col,
-                    right_col,
-                    node->join_right_as_outer);
-            }
-            const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
-            EnsureJoinContextTable(left, right);
-            return std::make_unique<NestedLoopJoin>(left, right, left_col, right_col, node->join_right_as_outer);
-        }
         case PhysicalPlanType::HASH_JOIN:
-        {
-            Table *left = catalog_->GetTable(node->table_name);
-            Table *right = catalog_->GetTable(node->right_table_name);
-            if (left == nullptr || right == nullptr)
-            {
-                throw std::runtime_error("JOIN table not found while building operator tree");
-            }
-            if (node->children.size() == 2)
-            {
-                auto left_access = BuildOperatorTree(node->children[0].get(), left, nullptr);
-                auto right_access = BuildOperatorTree(node->children[1].get(), right, nullptr);
-                Table *left_materialized = MaterializeOperatorToTable(std::move(left_access), left, "__left_input__");
-                Table *right_materialized = MaterializeOperatorToTable(std::move(right_access), right, "__right_input__");
-                const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
-                EnsureJoinContextTable(left, right);
-                return std::make_unique<HashJoin>(
-                    left_materialized,
-                    right_materialized,
-                    left_col,
-                    right_col,
-                    node->join_build_right);
-            }
-            const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
-            EnsureJoinContextTable(left, right);
-            return std::make_unique<HashJoin>(left, right, left_col, right_col, node->join_build_right);
-        }
         case PhysicalPlanType::INDEX_NESTED_LOOP_JOIN:
         {
-            Table *left = catalog_->GetTable(node->table_name);
-            Table *right = catalog_->GetTable(node->right_table_name);
-            if (left == nullptr || right == nullptr)
-                throw std::runtime_error("JOIN table not found while building operator tree");
+            const size_t j = node->relation_count - 1; // the right relation
+            const Scope::Relation &right = scope_.Relations().at(j);
+            JoinOutput output;
+            output.type = node->join_type;
+            output.residual = node->join_residual;
+            output.context = JoinedContext(node->relation_count);
+            output.right_schema = &right.schema->GetSchema();
+            const PhysicalPlanNode *left_input = node->children.at(0).get();
+            const PhysicalPlanNode *right_input = node->children.at(1).get();
 
-            // Resolve which ON-clause column belongs to which table (handles swapped ON order).
-            const auto [left_col, right_col] = ResolveJoinColumns(node, left, right);
+            if (node->type == PhysicalPlanType::NESTED_LOOP_JOIN)
+                return std::make_unique<NestedLoopJoin>(BuildOperatorTree(left_input), JoinRightInput(right_input, right),
+                                                        std::move(output));
+            if (node->type == PhysicalPlanType::HASH_JOIN)
+                return std::make_unique<HashJoin>(BuildOperatorTree(left_input), JoinRightInput(right_input, right),
+                                                  node->left_key, node->right_key, std::move(output),
+                                                  node->join_build_right);
 
-            // join_right_as_outer: true → right is outer, left is inner (has index)
-            //                      false → left is outer, right is inner (has index)
-            const bool right_is_outer = node->join_right_as_outer;
-            Table *outer_table = right_is_outer ? right : left;
-            Table *inner_table = right_is_outer ? left : right;
-            const std::string outer_col = right_is_outer ? right_col : left_col;
-            const std::string inner_col = right_is_outer ? left_col : right_col;
-            const std::string &inner_table_name = right_is_outer ? node->table_name : node->right_table_name;
-
-            BTree *inner_index = catalog_->GetIndex(inner_table_name, inner_col);
-            if (inner_index == nullptr)
-                throw std::runtime_error("Expected index not found on " + inner_table_name + "." + inner_col);
-
-            // Inputs may carry pushed-down filters. The outer input is read
-            // row by row, so filter it up front; the inner table is reached
-            // through its index, so its filter (the optimizer does not push
-            // one there) is applied to the joined rows instead.
-            const PhysicalPlanNode *inner_filter = nullptr;
-            if (node->children.size() == 2)
+            // Index join: the probed side is read only through its index
+            if (node->join_outer_is_left)
             {
-                const PhysicalPlanNode *outer_input = node->children[right_is_outer ? 1 : 0].get();
-                const PhysicalPlanNode *inner_input = node->children[right_is_outer ? 0 : 1].get();
-                if (outer_input->type != PhysicalPlanType::SEQ_SCAN)
-                    outer_table = MaterializeOperatorToTable(BuildOperatorTree(outer_input, outer_table, nullptr),
-                                                             outer_table, "__outer_input__");
-                if (inner_input->type == PhysicalPlanType::FILTER)
-                    inner_filter = inner_input;
-                else if (inner_input->type != PhysicalPlanType::SEQ_SCAN)
-                    throw std::logic_error("Unsupported inner input for index nested loop join");
+                const std::string &column = right.schema->GetSchema().GetColumn(node->right_key).name;
+                BTree *index = catalog_->GetIndex(right.table, column);
+                if (index == nullptr || right_input->type != PhysicalPlanType::SEQ_SCAN)
+                    throw std::logic_error("Index join needs an unfiltered, indexed right table");
+                return std::make_unique<IndexNestedLoopJoin>(
+                    BuildOperatorTree(left_input), right.schema, index, node->left_key,
+                    right.schema->GetSchema().GetColumn(node->right_key).type, std::move(output), true);
             }
-
-            EnsureJoinContextTable(left, right);
-            // outer_is_left: left table is outer when right_is_outer=false
-            const bool outer_is_left = !right_is_outer;
-            std::unique_ptr<Operator> join = std::make_unique<IndexNestedLoopJoin>(
-                outer_table, inner_table, inner_index,
-                outer_col, inner_col, outer_is_left);
-            if (inner_filter != nullptr)
-                join = std::make_unique<Filter>(std::move(join), inner_filter->predicate, join_context_table_.get());
-            return join;
+            const Scope::Relation &left = scope_.Relations().at(0);
+            const std::string &column = left.schema->GetSchema().GetColumn(node->left_key).name;
+            BTree *index = catalog_->GetIndex(left.table, column);
+            if (index == nullptr || left_input->type != PhysicalPlanType::SEQ_SCAN || j != 1)
+                throw std::logic_error("Index join needs an unfiltered, indexed left table");
+            return std::make_unique<IndexNestedLoopJoin>(BuildOperatorTree(right_input), left.schema, index,
+                                                         node->right_key,
+                                                         left.schema->GetSchema().GetColumn(node->left_key).type,
+                                                         std::move(output), false);
         }
         case PhysicalPlanType::FILTER:
         {
-            if (node->children.empty())
-                throw std::runtime_error("Filter node missing child");
-            auto child = BuildOperatorTree(node->children[0].get(), table, join_table);
-            Table *filter_table = table;
-            if (node->over_aggregate)
-            {
-                filter_table = RowContext(node, table);
-            }
-            else if (join_context_table_ &&
-                     node->table_name == "__join_context__")
-            {
-                filter_table = join_context_table_.get();
-            }
-            return std::make_unique<Filter>(std::move(child), node->predicate, filter_table);
+            auto child = BuildOperatorTree(node->children.at(0).get());
+            return std::make_unique<Filter>(std::move(child), node->predicate, RowContext(node));
         }
         case PhysicalPlanType::SORT:
         {
-            auto child = BuildOperatorTree(node->children.at(0).get(), table, join_table);
-            // Rows below the projection: the base table's, joined rows, or
-            // an aggregate's output
+            auto child = BuildOperatorTree(node->children.at(0).get());
+            // Rows below the projection: a table's, joined rows, or an
+            // aggregate's output
             return std::make_unique<Sort>(std::move(child), node->sort_keys, node->sort_descending,
-                                          RowContext(node, table));
+                                          RowContext(node));
         }
         case PhysicalPlanType::AGGREGATE:
         {
-            auto child = BuildOperatorTree(node->children.at(0).get(), table, join_table);
-            Table *input = join_context_table_ ? join_context_table_.get() : table;
+            auto child = BuildOperatorTree(node->children.at(0).get());
+            Table *input = RowContext(node);
             std::vector<Column> columns;
             for (const auto &name : node->aggregate_columns)
                 columns.emplace_back(name, DataType::INTEGER, 0); // the type is not used
@@ -459,55 +298,44 @@ namespace sql
             return std::make_unique<HashAggregate>(std::move(child), node->group_keys, node->aggregates, input);
         }
         case PhysicalPlanType::DISTINCT:
-            return std::make_unique<Distinct>(BuildOperatorTree(node->children.at(0).get(), table, join_table));
+            return std::make_unique<Distinct>(BuildOperatorTree(node->children.at(0).get()));
         case PhysicalPlanType::LIMIT:
-            return std::make_unique<Limit>(BuildOperatorTree(node->children.at(0).get(), table, join_table),
-                                           node->limit, node->offset);
+            return std::make_unique<Limit>(BuildOperatorTree(node->children.at(0).get()), node->limit, node->offset);
         case PhysicalPlanType::PROJECTION:
         {
-            if (node->children.empty())
-                throw std::runtime_error("Projection node missing child");
-            auto child = BuildOperatorTree(node->children[0].get(), table, join_table);
-            Table *projection_join_table = join_table;
-            if (node->children[0]->type == PhysicalPlanType::NESTED_LOOP_JOIN ||
-                node->children[0]->type == PhysicalPlanType::HASH_JOIN ||
-                node->children[0]->type == PhysicalPlanType::INDEX_NESTED_LOOP_JOIN)
-            {
-                projection_join_table = catalog_->GetTable(node->children[0]->right_table_name);
-            }
+            auto child = BuildOperatorTree(node->children.at(0).get());
+            Table *context = RowContext(node);
             if (node->compute_projection)
+                return std::make_unique<ExpressionProjection>(std::move(child), node->projected_exprs, context);
+            std::vector<int> column_indices;
+            if (!node->project_all)
             {
-                // Rows from a join are shaped like the qualified join schema
-                return std::make_unique<ExpressionProjection>(std::move(child), node->projected_exprs,
-                                                              RowContext(node, table));
+                for (const auto &name : node->projected_columns)
+                {
+                    const int idx = FindColumnIndex(*context, name);
+                    if (idx < 0)
+                        throw std::runtime_error("Unknown column: " + name);
+                    column_indices.push_back(idx);
+                }
             }
-            auto column_indices = ResolveProjectionIndices(node, table, projection_join_table);
             return std::make_unique<Projection>(std::move(child), std::move(column_indices), node->project_all);
         }
-        default:
-            throw std::runtime_error("Unknown physical plan node type");
         }
+        throw std::runtime_error("Unknown physical plan node type");
     }
 
     std::unique_ptr<Operator> Executor::BuildPlan(SelectStatement *select)
     {
-        Table *table = catalog_->GetTable(select->table);
-        if (!table)
-            throw std::runtime_error("Table not found: " + select->table);
-
         materialized_tables_.clear();
-        join_context_table_.reset();
+        joined_contexts_.clear();
+        relation_contexts_.clear();
         aggregate_context_table_.reset();
+        scope_ = Scope::ForSelect(*select, catalog_);
         Optimizer optimizer;
         // Operators may point into the plan (e.g. sort keys the planner
         // created), so it lives as long as the executor
         physical_plan_ = optimizer.BuildPhysicalPlan(select, catalog_);
-        Table *right = nullptr;
-        if (select->join_table.has_value())
-        {
-            right = catalog_->GetTable(*select->join_table);
-        }
-        return BuildOperatorTree(physical_plan_.get(), table, right);
+        return BuildOperatorTree(physical_plan_.get());
     }
 
     ExecutionResult Executor::ExecuteSelect(SelectStatement *select)
@@ -516,18 +344,12 @@ namespace sql
         try
         {
             auto plan = BuildPlan(select);
-            Table *table = catalog_->GetTable(select->table);
 
             if (select->select_star)
             {
-                for (const auto &col : table->GetSchema().GetColumns())
-                    result.column_names.push_back(col.name);
-                if (select->join_table.has_value())
+                for (const auto &relation : scope_.Relations())
                 {
-                    Table *right = catalog_->GetTable(*select->join_table);
-                    if (!right)
-                        throw std::runtime_error("Join table not found: " + *select->join_table);
-                    for (const auto &col : right->GetSchema().GetColumns())
+                    for (const auto &col : relation.schema->GetSchema().GetColumns())
                         result.column_names.push_back(col.name);
                 }
             }
@@ -850,9 +672,6 @@ namespace sql
         ExecutionResult result;
         try
         {
-            materialized_tables_.clear();
-            join_context_table_.reset();
-            aggregate_context_table_.reset();
             Optimizer optimizer;
             auto physical_plan = optimizer.BuildPhysicalPlan(explain->select.get(), catalog_);
             result.success = true;

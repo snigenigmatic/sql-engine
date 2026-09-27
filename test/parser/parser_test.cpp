@@ -385,12 +385,11 @@ namespace sql
         auto select = static_cast<SelectStatement *>(stmt.get());
 
         EXPECT_EQ(select->table, "users");
-        ASSERT_TRUE(select->join_table.has_value());
-        EXPECT_EQ(*select->join_table, "orders");
-        ASSERT_TRUE(select->join_left_column.has_value());
-        ASSERT_TRUE(select->join_right_column.has_value());
-        EXPECT_EQ(*select->join_left_column, "users.id");
-        EXPECT_EQ(*select->join_right_column, "orders.user_id");
+        ASSERT_EQ(select->joins.size(), 1u);
+        EXPECT_EQ(select->joins[0].type, JoinType::INNER);
+        EXPECT_EQ(select->joins[0].right.table, "orders");
+        EXPECT_EQ(select->joins[0].right.alias, "");
+        EXPECT_EQ(ExpressionToSQL(select->joins[0].on.get()), "users.id = orders.user_id");
         ASSERT_EQ(select->columns.size(), 2);
         EXPECT_EQ(select->columns[0], "users.id");
         EXPECT_EQ(select->columns[1], "orders.amount");
@@ -420,40 +419,36 @@ namespace sql
 
         EXPECT_NE(explain.find("Projection(columns=[users.id, orders.amount])"), std::string::npos);
         EXPECT_NE(explain.find("Filter"), std::string::npos);
-        EXPECT_NE(explain.find("NestedLoopJoin(left=users, right=orders, on=users.id = orders.user_id"), std::string::npos);
+        EXPECT_NE(explain.find("NestedLoopJoin(type=INNER, right=orders, on=users.id = orders.user_id)"), std::string::npos)
+            << explain;
     }
 
-    TEST(ParserTest, BuildPhysicalPlanForJoinChoosesSmallerOuter)
+    TEST(ParserTest, BuildPhysicalPlanForHashJoinBuildsOnTheSmallerSide)
     {
         Catalog catalog;
-        ASSERT_TRUE(catalog.CreateTable("users", Schema({
-                                                 Column("id", DataType::INTEGER),
-                                             })));
-        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
-                                                  Column("id", DataType::INTEGER),
-                                                  Column("user_id", DataType::INTEGER),
-                                              })));
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({Column("id", DataType::INTEGER)})));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({Column("id", DataType::INTEGER),
+                                                          Column("user_id", DataType::INTEGER)})));
+        for (int i = 1; i <= 20; ++i)
+            catalog.GetTable("users")->Insert(Tuple({Value(i)}));
+        catalog.GetTable("orders")->Insert(Tuple({Value(10), Value(1)}));
 
-        auto *users = catalog.GetTable("users");
-        auto *orders = catalog.GetTable("orders");
-        ASSERT_NE(users, nullptr);
-        ASSERT_NE(orders, nullptr);
-        users->Insert(Tuple({Value(1)}));
-        users->Insert(Tuple({Value(2)}));
-        users->Insert(Tuple({Value(3)}));
-        users->Insert(Tuple({Value(4)}));
-        orders->Insert(Tuple({Value(10), Value(1)}));
-
-        std::string sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id;";
-        Lexer lexer(sql);
-        Parser parser(lexer);
-        auto stmt = parser.ParseStatement();
-
-        Optimizer optimizer;
-        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
-        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
-
-        EXPECT_NE(explain.find("outer=right"), std::string::npos);
+        auto explain = [&](const std::string &sql)
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            Optimizer optimizer;
+            return optimizer.ExplainPhysicalPlan(optimizer.BuildPhysicalPlan(stmt.get(), &catalog).get());
+        };
+        // orders is smaller: hash it, stream users past it
+        EXPECT_NE(explain("SELECT * FROM users JOIN orders ON users.id = orders.user_id;").find("build=right"),
+                  std::string::npos);
+        EXPECT_NE(explain("SELECT * FROM orders JOIN users ON users.id = orders.user_id;").find("build=left"),
+                  std::string::npos);
+        // A LEFT join always streams its left rows
+        EXPECT_NE(explain("SELECT * FROM orders LEFT JOIN users ON users.id = orders.user_id;").find("build=right"),
+                  std::string::npos);
     }
 
     TEST(ParserTest, BuildPhysicalPlanForJoinChoosesHashJoinForLargerInputs)
@@ -490,7 +485,9 @@ namespace sql
         auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
         auto explain = optimizer.ExplainPhysicalPlan(plan.get());
 
-        EXPECT_NE(explain.find("HashJoin(left=users, right=orders, on=users.id = orders.user_id"), std::string::npos);
+        EXPECT_NE(explain.find("HashJoin(type=INNER, right=orders, key=users.id = orders.user_id, build=right)"),
+                  std::string::npos)
+            << explain;
     }
 
     TEST(ParserTest, BuildPhysicalPlanForJoinAddsPushdownFilterOnSingleSidePredicate)
@@ -790,6 +787,47 @@ namespace sql
         auto explain = optimizer.ExplainLogicalPlan(optimizer.BuildLogicalPlan(stmt.get()).get());
         EXPECT_NE(explain.find("Aggregate(group=[city])"), std::string::npos) << explain;
         EXPECT_LT(explain.find("Filter"), explain.find("Aggregate")) << explain; // HAVING above
+    }
+
+    TEST(ParserTest, FromListWithAliasesAndJoinKinds)
+    {
+        Lexer lexer("SELECT e.name FROM emp AS e LEFT OUTER JOIN dept d ON e.dept = d.id AND d.open "
+                    "JOIN emp m ON m.id = e.mgr CROSS JOIN t, u x LEFT JOIN v ON TRUE;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_EQ(select->table, "emp");
+        EXPECT_EQ(select->table_alias, "e");
+        ASSERT_EQ(select->joins.size(), 5u);
+        EXPECT_EQ(select->joins[0].type, JoinType::LEFT);
+        EXPECT_EQ(select->joins[0].right.Name(), "d");
+        EXPECT_EQ(ExpressionToSQL(select->joins[0].on.get()), "(e.dept = d.id) AND d.open");
+        EXPECT_EQ(select->joins[1].type, JoinType::INNER);
+        EXPECT_EQ(select->joins[1].right.table, "emp");
+        EXPECT_EQ(select->joins[1].right.alias, "m");
+        EXPECT_EQ(select->joins[2].type, JoinType::CROSS);
+        EXPECT_EQ(select->joins[2].on, nullptr);
+        EXPECT_EQ(select->joins[3].type, JoinType::CROSS); // comma
+        EXPECT_EQ(select->joins[3].right.Name(), "x");
+        EXPECT_EQ(select->joins[4].type, JoinType::LEFT);
+        EXPECT_EQ(select->joins[4].right.Name(), "v");
+    }
+
+    TEST(ParserTest, BadJoins)
+    {
+        for (const char *sql : {"SELECT * FROM a JOIN b;", "SELECT * FROM a LEFT JOIN b WHERE x = 1;",
+                                "SELECT * FROM a CROSS JOIN b ON a.x = b.x;", "SELECT * FROM a, a;",
+                                "SELECT * FROM a x JOIN b x ON TRUE;", "SELECT * FROM a LEFT b ON TRUE;",
+                                "SELECT * FROM a JOIN a ON TRUE;"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
+        // A table may appear twice under different names
+        Lexer lexer("SELECT * FROM a JOIN a b ON TRUE;");
+        Parser parser(lexer);
+        EXPECT_NO_THROW(parser.ParseStatement());
     }
 
 } // namespace sql

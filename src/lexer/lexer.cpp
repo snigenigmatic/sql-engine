@@ -292,6 +292,9 @@ namespace sql
              {"DISTINCT", TokenType::DISTINCT},
              {"GROUP", TokenType::GROUP},
              {"HAVING", TokenType::HAVING},
+             {"LEFT", TokenType::LEFT},
+             {"OUTER", TokenType::OUTER},
+             {"CROSS", TokenType::CROSS},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

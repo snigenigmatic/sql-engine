@@ -60,7 +60,9 @@ Add these in small PRs, each with parser tests plus `query_test` cases:
    - Grouping is strict, as in PostgreSQL: every selected, HAVING or ORDER BY column must be grouped or aggregated.
    - `SUM` of integers errors on `INTEGER` overflow, as SQLite does. `AVG` returns `FLOAT`.
    - Groups and `DISTINCT` follow `=`, so NULLs group together and 1 = 1.0.
-6. **Joins**: `LEFT [OUTER] JOIN`, multi-way joins (more than two tables) and table aliases. Generalize `join_table` from `optional` to a join list.
+6. **Joins** (done): `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, multi-way joins (more than two tables), arbitrary `ON` conditions and table aliases. `join_table` became a join list.
+   - Tables join left to right, in the order written; each step picks an index, hash or nested-loop join. Cost-based join ordering waits for `ANALYZE` in M8.
+   - Single-table `WHERE` conditions are pushed below the joins, except onto the NULL-padded side of a LEFT JOIN or a table probed through its index.
 7. **Subqueries** (stretch goal): `IN (SELECT …)`, `EXISTS` and scalar subqueries.
 
 ## M8 — Usability & hardening

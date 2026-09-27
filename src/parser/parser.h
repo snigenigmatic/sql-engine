@@ -44,7 +44,7 @@ namespace sql
         std::unique_ptr<Expression> ParseUnary();
         std::unique_ptr<Expression> ParsePrimary();
         std::unique_ptr<Expression> ParseFunctionCall(const std::string &name);
-        std::string ParseQualifiedColumnName();
+        TableRef ParseTableRef();
 
         Lexer &lexer_;
         Token current_token_;

@@ -290,54 +290,65 @@ namespace sql
         return "?";
     }
 
-    namespace
+    // The direct subexpressions of an expression, in order
+    std::vector<const Expression *> ExpressionChildren(const Expression *expr)
     {
-        // The direct subexpressions of an expression, in order
-        std::vector<const Expression *> Children(const Expression *expr)
+        switch (expr->GetType())
         {
-            switch (expr->GetType())
-            {
-            case ExpressionType::LITERAL:
-            case ExpressionType::COLUMN_REF:
-                return {};
-            case ExpressionType::BINARY_OP:
-            {
-                const auto *bin = static_cast<const BinaryExpression *>(expr);
-                return {bin->left.get(), bin->right.get()};
-            }
-            case ExpressionType::UNARY_OP:
-                return {static_cast<const UnaryExpression *>(expr)->operand.get()};
-            case ExpressionType::IS_NULL:
-                return {static_cast<const IsNullExpression *>(expr)->operand.get()};
-            case ExpressionType::LIKE:
-            {
-                const auto *like = static_cast<const LikeExpression *>(expr);
-                return {like->value.get(), like->pattern.get()};
-            }
-            case ExpressionType::IN_LIST:
-            {
-                const auto *in = static_cast<const InListExpression *>(expr);
-                std::vector<const Expression *> children{in->operand.get()};
-                for (const auto &item : in->list)
-                    children.push_back(item.get());
-                return children;
-            }
-            case ExpressionType::BETWEEN:
-            {
-                const auto *between = static_cast<const BetweenExpression *>(expr);
-                return {between->operand.get(), between->low.get(), between->high.get()};
-            }
-            case ExpressionType::AGGREGATE:
-            {
-                const auto *aggregate = static_cast<const AggregateExpression *>(expr);
-                if (aggregate->argument)
-                    return {aggregate->argument.get()};
-                return {};
-            }
-            }
+        case ExpressionType::LITERAL:
+        case ExpressionType::COLUMN_REF:
+            return {};
+        case ExpressionType::BINARY_OP:
+        {
+            const auto *bin = static_cast<const BinaryExpression *>(expr);
+            return {bin->left.get(), bin->right.get()};
+        }
+        case ExpressionType::UNARY_OP:
+            return {static_cast<const UnaryExpression *>(expr)->operand.get()};
+        case ExpressionType::IS_NULL:
+            return {static_cast<const IsNullExpression *>(expr)->operand.get()};
+        case ExpressionType::LIKE:
+        {
+            const auto *like = static_cast<const LikeExpression *>(expr);
+            return {like->value.get(), like->pattern.get()};
+        }
+        case ExpressionType::IN_LIST:
+        {
+            const auto *in = static_cast<const InListExpression *>(expr);
+            std::vector<const Expression *> children{in->operand.get()};
+            for (const auto &item : in->list)
+                children.push_back(item.get());
+            return children;
+        }
+        case ExpressionType::BETWEEN:
+        {
+            const auto *between = static_cast<const BetweenExpression *>(expr);
+            return {between->operand.get(), between->low.get(), between->high.get()};
+        }
+        case ExpressionType::AGGREGATE:
+        {
+            const auto *aggregate = static_cast<const AggregateExpression *>(expr);
+            if (aggregate->argument)
+                return {aggregate->argument.get()};
             return {};
         }
-    } // namespace
+        }
+        return {};
+    }
+
+    const char *JoinTypeName(JoinType type)
+    {
+        switch (type)
+        {
+        case JoinType::INNER:
+            return "INNER";
+        case JoinType::LEFT:
+            return "LEFT";
+        case JoinType::CROSS:
+            return "CROSS";
+        }
+        return "?";
+    }
 
     bool ContainsAggregate(const Expression *expr)
     {
@@ -345,7 +356,7 @@ namespace sql
             return false;
         if (expr->GetType() == ExpressionType::AGGREGATE)
             return true;
-        for (const Expression *child : Children(expr))
+        for (const Expression *child : ExpressionChildren(expr))
         {
             if (ContainsAggregate(child))
                 return true;
@@ -406,8 +417,8 @@ namespace sql
             break;
         }
         }
-        const std::vector<const Expression *> left = Children(a);
-        const std::vector<const Expression *> right = Children(b);
+        const std::vector<const Expression *> left = ExpressionChildren(a);
+        const std::vector<const Expression *> right = ExpressionChildren(b);
         if (left.size() != right.size())
             return false;
         for (size_t i = 0; i < left.size(); ++i)
@@ -508,11 +519,12 @@ namespace sql
                 out << "]";
             }
             out << ")";
-            if (select->join_table.has_value())
+            for (const auto &join : select->joins)
             {
-                out << ", join=" << *select->join_table
-                    << ", on=" << select->join_left_column.value_or("")
-                    << " = " << select->join_right_column.value_or("");
+                out << ", " << JoinTypeName(join.type) << " join=" << join.right.table
+                    << (join.right.alias.empty() ? "" : " AS " + join.right.alias);
+                if (join.on)
+                    out << ", on=" << ExpressionToSQL(join.on.get());
             }
             out << "\n";
             out << "  where:\n";

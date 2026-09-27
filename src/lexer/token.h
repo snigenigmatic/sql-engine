@@ -57,6 +57,9 @@ namespace sql
         DISTINCT,
         GROUP,
         HAVING,
+        LEFT,
+        OUTER,
+        CROSS,
 
         // Identifiers and Literals
         IDENTIFIER,

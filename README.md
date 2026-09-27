@@ -17,6 +17,7 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Column projection and computed columns: `SELECT name, price * qty AS total ...`
 - `ORDER BY` (by expression, output alias or position; `ASC`/`DESC`; NULLs first), `LIMIT` / `OFFSET`, `SELECT DISTINCT`
 - Aggregates: `COUNT(*)`, `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` (optionally `DISTINCT`), `GROUP BY` (expressions, positions or aliases), `HAVING` (hash aggregation). Aggregates skip NULLs. Every selected column must be grouped or aggregated. `SUM` of integers raises an error if the total overflows `INTEGER`.
+- Joins: `[INNER] JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` and comma joins, any number of tables, any `ON` condition, and table aliases (self-joins included). Tables join in the order written, by nested loop, hash or index join. `WHERE` conditions on one table filter it before the joins where that is safe.
 - Expressions: `+ - * /` (with integer overflow checks), unary minus, `LIKE` / `NOT LIKE` (`%`, `_`), `IN (...)`, `BETWEEN ... AND ...`
 - Disk-resident B+tree indexes: `CREATE INDEX`, point lookups (`=`), range scans (`>`, `>=`, `<`, `<=`), maintained row by row on INSERT/UPDATE/DELETE
 - Query planner: automatically uses index scan when an index exists on the filtered column
@@ -27,7 +28,7 @@ An educational SQL database engine built from scratch in C++ to understand datab
 - Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, with statement-level rollback inside a transaction
 
 ### Planned
-- SQL coverage: outer and multi-way joins, table aliases, subqueries (see [docs/roadmap.md](docs/roadmap.md))
+- SQL coverage: subqueries (see [docs/roadmap.md](docs/roadmap.md))
 
 ## Building
 
@@ -113,6 +114,7 @@ INSERT INTO users VALUES (1, 'Alice', 25), (2, 'Bob', 30);
 SELECT * FROM users WHERE age > 25 ORDER BY age DESC LIMIT 10;
 SELECT name, age + 1 AS next_age FROM users WHERE name LIKE 'A%';
 SELECT age, COUNT(*) AS n FROM users GROUP BY age HAVING n > 1 ORDER BY n DESC;
+SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.name;
 UPDATE users SET age = 99 WHERE id = 1;
 DELETE FROM users WHERE id = 2;
 
@@ -181,6 +183,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
   - [x] Expressions: arithmetic, computed and aliased SELECT columns, `LIKE`, `IN`, `BETWEEN` (index range scans)
   - [x] `ORDER BY`, `LIMIT` / `OFFSET`, `SELECT DISTINCT`
   - [x] Aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `GROUP BY`, `HAVING`
+  - [x] `LEFT` / `CROSS` joins, joins of any number of tables, table aliases
 ### Extra Goal
 - [ ] **Distributed Query Processing**
 ## Architecture

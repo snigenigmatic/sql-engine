@@ -3,6 +3,7 @@
 #include "catalog/catalog.h"
 #include "parser/ast.h"
 #include <memory>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -61,9 +62,12 @@ namespace sql
         PhysicalPlanType type;
         std::vector<std::unique_ptr<PhysicalPlanNode>> children;
 
-        // Common context
+        // Row shape. Scans, and filters pushed below the joins, produce rows
+        // of one relation (its index in the Scope); everything else produces
+        // rows of the first relation_count relations joined.
         std::string table_name;
-        std::string right_table_name;
+        int relation = -1;
+        size_t relation_count = 0;
 
         // INDEX_SCAN
         std::string index_column;
@@ -74,13 +78,19 @@ namespace sql
         std::optional<Value> high_key;
         bool high_inclusive = true;
 
-        // NESTED_LOOP_JOIN / HASH_JOIN / INDEX_NESTED_LOOP_JOIN
-        std::string join_left_column;
-        std::string join_right_column;
-        bool join_right_as_outer = false; // NLJ: right is outer loop; INLJ: right is outer (left has index)
-
-        // HASH_JOIN
-        bool join_build_right = true;
+        // NESTED_LOOP_JOIN / HASH_JOIN / INDEX_NESTED_LOOP_JOIN: children
+        // are the left input (the relations joined so far) and the right
+        // relation's access path; output rows are left || right
+        JoinType join_type = JoinType::INNER;
+        std::string right_table_name;
+        std::string right_label;                      // "table" or "table AS alias"
+        std::vector<const Expression *> join_residual; // ON conditions checked on joined rows
+        size_t left_key = 0;                           // HASH / INDEX: key column in left rows
+        size_t right_key = 0;                          // ... and in the right relation's rows
+        std::string join_key_label;                    // "a.x = b.y"
+        std::string join_on_label;                     // the whole ON condition
+        bool join_build_right = true;                  // HASH_JOIN
+        bool join_outer_is_left = true;                // INDEX: false probes the left table's index
 
         // FILTER
         const Expression *predicate = nullptr; // non-owning, refers to AST owned by Statement
@@ -115,6 +125,45 @@ namespace sql
         bool over_aggregate = false;
     };
 
+    // The tables in a SELECT's FROM clause, in join order, each known by
+    // its alias or else its name. Joined rows hold every relation's
+    // columns, in this order.
+    class Scope
+    {
+    public:
+        struct Relation
+        {
+            std::string name;  // alias, else table name
+            std::string table; // table name in the catalog
+            Table *schema;
+        };
+        struct Resolved
+        {
+            size_t relation;
+            size_t column;
+        };
+
+        static Scope ForSelect(const SelectStatement &select, Catalog *catalog);
+
+        const std::vector<Relation> &Relations() const { return relations_; }
+        size_t Size() const { return relations_.size(); }
+        // Position of a relation's first column in joined rows
+        size_t Offset(size_t relation) const;
+
+        // The column a name refers to among the first `count` relations.
+        // Throws for an unknown table qualifier, unknown or ambiguous column.
+        Resolved Resolve(const std::string &name, size_t count = SIZE_MAX) const;
+        bool CanResolve(const std::string &name, size_t count = SIZE_MAX) const;
+        // "relation.column" when the name resolves, else the name itself
+        std::string Canonical(const std::string &name) const;
+        // Bit i set when the expression reads relation i; nullopt if some
+        // column does not resolve
+        std::optional<uint64_t> RelationsOf(const Expression *expr, size_t count = SIZE_MAX) const;
+
+    private:
+        std::vector<Relation> relations_;
+    };
+
     class Optimizer
     {
     public:
@@ -128,13 +177,11 @@ namespace sql
     private:
         // ORDER BY items as sort keys: positions and output aliases become the
         // selected expression they name
-        void ResolveSortKeys(const SelectStatement &select, Table *table, Table *join_table,
-                             PhysicalPlanNode *sort) const;
+        void ResolveSortKeys(const SelectStatement &select, const Scope &scope, PhysicalPlanNode *sort) const;
 
         // Aggregation, HAVING, ORDER BY and the SELECT list of a query with
         // GROUP BY or aggregate functions, over its (filtered) input rows
-        std::unique_ptr<PhysicalPlanNode> BuildAggregatePlan(const SelectStatement &select, Table *table,
-                                                             Table *join_table,
+        std::unique_ptr<PhysicalPlanNode> BuildAggregatePlan(const SelectStatement &select, const Scope &scope,
                                                              std::unique_ptr<PhysicalPlanNode> input) const;
 
         std::unique_ptr<LogicalPlanNode> BuildSelectLogicalPlan(const SelectStatement *select) const;

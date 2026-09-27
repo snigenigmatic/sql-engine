@@ -1537,4 +1537,167 @@ namespace sql
                   (std::vector<std::string>{"lima", "oslo", "rome"}));
     }
 
+    // ── Joins: aliases, LEFT / CROSS, more than two tables ───────────────────────
+
+    static void CreateEmployees(Catalog &catalog)
+    {
+        RunSQL(catalog, "CREATE TABLE emp (id INTEGER PRIMARY KEY, name VARCHAR(10), mgr INTEGER, dept INTEGER);");
+        RunSQL(catalog, "CREATE TABLE dept (id INTEGER, dname VARCHAR(10));");
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO emp VALUES (1, 'ann', NULL, 10), (2, 'bo', 1, 10), (3, 'cy', 1, 20), "
+                                    "(4, 'di', 2, NULL);")
+                        .success);
+        ASSERT_TRUE(RunSQL(catalog, "INSERT INTO dept VALUES (10, 'eng'), (20, 'ops'), (30, 'hr');").success);
+    }
+
+    TEST(IntegrationTest, SelfJoinThroughAliases)
+    {
+        Catalog catalog;
+        CreateEmployees(catalog);
+        auto result = RunSQL(catalog, "SELECT e.name, m.name AS boss FROM emp e JOIN emp AS m ON e.mgr = m.id "
+                                      "ORDER BY e.id;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(result.column_names, (std::vector<std::string>{"name", "boss"}));
+        EXPECT_EQ(Rows(result), (std::vector<std::string>{"bo|ann", "cy|ann", "di|bo"}));
+        // Unqualified names must be unique across the joined tables
+        EXPECT_EQ(ErrorOf(catalog, "SELECT name FROM emp e JOIN emp m ON e.mgr = m.id;"), "Ambiguous column: name");
+        // An aliased table is known only by its alias
+        EXPECT_EQ(ErrorOf(catalog, "SELECT emp.name FROM emp e JOIN dept ON e.dept = dept.id;"),
+                  "Unknown table qualifier in column: emp.name");
+        EXPECT_EQ(ErrorOf(catalog, "SELECT e.nosuch FROM emp e JOIN dept ON e.dept = dept.id;"),
+                  "Unknown column: e.nosuch");
+        EXPECT_THROW(RunSQL(catalog, "SELECT * FROM emp e JOIN emp e ON e.id = e.id;"), std::runtime_error);
+        // ON sees only the tables joined so far
+        EXPECT_EQ(ErrorOf(catalog, "SELECT * FROM emp e JOIN dept d ON e.dept = x.id JOIN emp x ON x.id = e.mgr;"),
+                  "Unknown table qualifier in column: x.id");
+    }
+
+    TEST(IntegrationTest, AliasOnASingleTable)
+    {
+        Catalog catalog;
+        CreatePeopleWithCities(catalog);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT x.name FROM p AS x WHERE x.id >= 4 ORDER BY x.id;")),
+                  (std::vector<std::string>{"di", "ed"}));
+        auto explain = RunSQL(catalog, "EXPLAIN SELECT x.name FROM p x WHERE x.id = 4;");
+        EXPECT_NE(explain.message.find("IndexScan(table=p, column=id, point=4)"), std::string::npos)
+            << explain.message;
+        EXPECT_EQ(ErrorOf(catalog, "SELECT p.name FROM p x;"), "Unknown table qualifier in column: p.name");
+    }
+
+    // The same LEFT JOIN queries, run with each join algorithm
+    TEST(IntegrationTest, LeftJoinWithEveryAlgorithm)
+    {
+        const std::vector<std::pair<std::string, std::string>> queries = {
+            {"SELECT e.name, d.dname FROM emp e LEFT JOIN dept d ON e.dept = d.id ORDER BY e.id;",
+             "ann|eng,bo|eng,cy|ops,di|NULL"},
+            // ON decides what matches; unmatched left rows are still kept
+            {"SELECT e.name, d.dname FROM emp e LEFT JOIN dept d ON e.dept = d.id AND d.dname = 'ops' ORDER BY e.id;",
+             "ann|NULL,bo|NULL,cy|ops,di|NULL"},
+            // WHERE runs after the join, so it can find the unmatched rows...
+            {"SELECT e.name FROM emp e LEFT JOIN dept d ON e.dept = d.id WHERE d.id IS NULL;", "di"},
+            // ... or drop them
+            {"SELECT e.name FROM emp e LEFT JOIN dept d ON e.dept = d.id WHERE d.dname = 'ops';", "cy"},
+            {"SELECT e.name, d.dname FROM emp e LEFT JOIN dept d ON e.dept = d.id WHERE e.id > 2 ORDER BY e.id;",
+             "cy|ops,di|NULL"},
+        };
+        auto joined = [](const ExecutionResult &result)
+        {
+            std::string text;
+            for (const auto &row : Rows(result))
+                text += (text.empty() ? "" : ",") + row;
+            return text;
+        };
+        const std::vector<std::string> algorithms = {"NestedLoopJoin(type=LEFT", "HashJoin(type=LEFT",
+                                                     "IndexNestedLoopJoin(type=LEFT"};
+        for (size_t a = 0; a < algorithms.size(); ++a)
+        {
+            Catalog catalog;
+            CreateEmployees(catalog);
+            if (a == 1)
+            {
+                // Enough rows for a hash join; none of them match
+                for (int i = 0; i < 20; ++i)
+                    RunSQL(catalog, "INSERT INTO dept VALUES (" + std::to_string(100 + i) + ", 'x');");
+            }
+            if (a == 2)
+                RunSQL(catalog, "CREATE INDEX idx_dept ON dept (id);");
+            for (const auto &[sql, expected] : queries)
+            {
+                auto explain = RunSQL(catalog, "EXPLAIN " + sql);
+                EXPECT_NE(explain.message.find(algorithms[a]), std::string::npos) << sql << "\n" << explain.message;
+                auto result = RunSQL(catalog, sql);
+                ASSERT_TRUE(result.success) << sql << ": " << result.message;
+                EXPECT_EQ(joined(result), expected) << algorithms[a] << ": " << sql;
+            }
+        }
+    }
+
+    TEST(IntegrationTest, ThreeWayJoins)
+    {
+        Catalog catalog;
+        CreateEmployees(catalog);
+        auto result = RunSQL(catalog, "SELECT e.name, d.dname, m.name FROM emp e LEFT JOIN dept d ON e.dept = d.id "
+                                      "LEFT JOIN emp m ON m.id = e.mgr ORDER BY e.id;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(Rows(result), (std::vector<std::string>{"ann|eng|NULL", "bo|eng|ann", "cy|ops|ann", "di|NULL|bo"}));
+        // An inner join after a LEFT join drops rows it cannot match
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT e.name, m.name FROM emp e LEFT JOIN dept d ON e.dept = d.id "
+                                       "JOIN emp m ON m.id = e.mgr WHERE d.dname = 'eng';")),
+                  (std::vector<std::string>{"bo|ann"}));
+        // SELECT * lists every table's columns in FROM order
+        auto star = RunSQL(catalog, "SELECT * FROM emp e JOIN dept d ON e.dept = d.id JOIN emp m ON m.id = e.mgr;");
+        ASSERT_TRUE(star.success) << star.message;
+        EXPECT_EQ(star.column_names.size(), 10u);
+        ASSERT_EQ(star.tuples.size(), 2u);
+        EXPECT_EQ(star.tuples[0].GetValueCount(), 10u);
+        // A WHERE condition on two tables is checked after they are joined
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT e.name FROM emp e JOIN emp m ON m.id = e.mgr "
+                                       "JOIN dept d ON d.id = e.dept WHERE m.dept = d.id ORDER BY e.id;")),
+                  (std::vector<std::string>{"bo"}));
+        // With an index on the third table's key
+        RunSQL(catalog, "CREATE INDEX idx_dept ON dept (id);");
+        auto indexed = RunSQL(catalog, "EXPLAIN SELECT e.name FROM emp e JOIN emp m ON m.id = e.mgr "
+                                       "JOIN dept d ON d.id = e.dept;");
+        EXPECT_NE(indexed.message.find("IndexNestedLoopJoin(type=INNER, right=dept AS d, key=d.id = e.dept"),
+                  std::string::npos)
+            << indexed.message;
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT e.name, d.dname FROM emp e JOIN emp m ON m.id = e.mgr "
+                                       "JOIN dept d ON d.id = e.dept ORDER BY e.id;")),
+                  (std::vector<std::string>{"bo|eng", "cy|ops"}));
+    }
+
+    TEST(IntegrationTest, CrossAndNonEquiJoins)
+    {
+        Catalog catalog;
+        CreateEmployees(catalog);
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT COUNT(*) FROM emp, dept;")), (std::vector<std::string>{"12"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT COUNT(*) FROM emp CROSS JOIN dept CROSS JOIN emp e2;")),
+                  (std::vector<std::string>{"48"}));
+        // Comma join + WHERE works like an inner join
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT emp.name, dname FROM emp, dept WHERE emp.dept = dept.id "
+                                       "ORDER BY emp.id;")),
+                  (std::vector<std::string>{"ann|eng", "bo|eng", "cy|ops"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT e.name, d.id FROM emp e JOIN dept d ON e.dept < d.id "
+                                       "ORDER BY e.id, d.id;")),
+                  (std::vector<std::string>{"ann|20", "ann|30", "bo|20", "bo|30", "cy|30"}));
+        // A LEFT join with a condition no row meets keeps every left row
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT COUNT(*), COUNT(d.id) FROM emp e LEFT JOIN dept d ON FALSE;")),
+                  (std::vector<std::string>{"4|0"}));
+    }
+
+    TEST(IntegrationTest, AggregatesOverLeftJoins)
+    {
+        Catalog catalog;
+        CreateEmployees(catalog);
+        auto result = RunSQL(catalog, "SELECT d.dname, COUNT(e.id) AS staff, COUNT(*) FROM dept d "
+                                      "LEFT JOIN emp e ON e.dept = d.id GROUP BY d.dname ORDER BY staff DESC, 1;");
+        ASSERT_TRUE(result.success) << result.message;
+        EXPECT_EQ(Rows(result), (std::vector<std::string>{"eng|2|2", "ops|1|1", "hr|0|1"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT DISTINCT d.dname FROM emp e JOIN dept d ON e.dept = d.id "
+                                       "ORDER BY d.dname;")),
+                  (std::vector<std::string>{"eng", "ops"}));
+        EXPECT_EQ(Rows(RunSQL(catalog, "SELECT m.name, COUNT(*) FROM emp e JOIN emp m ON e.mgr = m.id "
+                                       "GROUP BY m.name HAVING COUNT(*) > 1;")),
+                  (std::vector<std::string>{"ann|2"}));
+    }
+
 } // namespace sql

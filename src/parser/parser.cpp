@@ -98,30 +98,58 @@ namespace sql
         }
 
         Expect(TokenType::FROM);
-        Token table = Expect(TokenType::IDENTIFIER);
-        stmt->table = table.value;
+        TableRef first = ParseTableRef();
+        stmt->table = first.table;
+        stmt->table_alias = first.alias;
+        std::vector<std::string> names{first.Name()};
 
-        bool has_join = false;
-        if (Match(TokenType::INNER))
+        // [INNER] JOIN / LEFT [OUTER] JOIN / CROSS JOIN / ","
+        while (true)
         {
-            Expect(TokenType::JOIN);
-            has_join = true;
-        }
-        else if (Match(TokenType::JOIN))
-        {
-            has_join = true;
-        }
+            JoinType type;
+            if (Match(TokenType::COMMA))
+                type = JoinType::CROSS;
+            else if (Match(TokenType::CROSS))
+            {
+                Expect(TokenType::JOIN);
+                type = JoinType::CROSS;
+            }
+            else if (Match(TokenType::LEFT))
+            {
+                Match(TokenType::OUTER);
+                Expect(TokenType::JOIN);
+                type = JoinType::LEFT;
+            }
+            else if (Match(TokenType::INNER))
+            {
+                Expect(TokenType::JOIN);
+                type = JoinType::INNER;
+            }
+            else if (Match(TokenType::JOIN))
+                type = JoinType::INNER;
+            else
+                break;
 
-        if (has_join)
-        {
-            Token join_table = Expect(TokenType::IDENTIFIER);
-            stmt->join_table = join_table.value;
-            Expect(TokenType::ON);
-            std::string left = ParseQualifiedColumnName();
-            Expect(TokenType::EQ);
-            std::string right = ParseQualifiedColumnName();
-            stmt->join_left_column = left;
-            stmt->join_right_column = right;
+            JoinClause join;
+            join.type = type;
+            join.right = ParseTableRef();
+            for (const auto &name : names)
+            {
+                if (name == join.right.Name())
+                    throw std::runtime_error("Table name '" + name + "' specified more than once; use an alias");
+            }
+            names.push_back(join.right.Name());
+            if (type == JoinType::CROSS)
+            {
+                if (current_token_.type == TokenType::ON)
+                    throw std::runtime_error("CROSS JOIN does not take an ON condition");
+            }
+            else
+            {
+                Expect(TokenType::ON);
+                join.on = ParseExpression();
+            }
+            stmt->joins.push_back(std::move(join));
         }
 
         if (Match(TokenType::WHERE))
@@ -617,16 +645,16 @@ namespace sql
         return std::make_unique<AggregateExpression>(function, std::move(argument), distinct);
     }
 
-    std::string Parser::ParseQualifiedColumnName()
+    // table [[AS] alias]
+    TableRef Parser::ParseTableRef()
     {
-        Token first = Expect(TokenType::IDENTIFIER);
-        std::string name = first.value;
-        if (Match(TokenType::DOT))
-        {
-            Token second = Expect(TokenType::IDENTIFIER);
-            name += "." + second.value;
-        }
-        return name;
+        TableRef ref;
+        ref.table = Expect(TokenType::IDENTIFIER).value;
+        if (Match(TokenType::AS))
+            ref.alias = Expect(TokenType::IDENTIFIER).value;
+        else if (current_token_.type == TokenType::IDENTIFIER)
+            ref.alias = Expect(TokenType::IDENTIFIER).value;
+        return ref;
     }
 
     std::unique_ptr<ExplainStatement> Parser::ParseExplain()

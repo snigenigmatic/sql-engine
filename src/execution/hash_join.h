@@ -1,6 +1,8 @@
 #pragma once
 
+#include "execution/join_util.h"
 #include "execution/operator.h"
+#include <memory>
 #include "storage/table.h"
 #include <cstdint>
 #include <string>
@@ -10,11 +12,15 @@
 namespace sql
 {
 
+    // Equi-join through a hash table on the key columns. build_right hashes
+    // the right input and streams the left rows past it, which also serves
+    // LEFT joins; otherwise (INNER only) the left rows are hashed and the
+    // right input streamed. NULL keys never match.
     class HashJoin : public Operator
     {
     public:
-        // build_right=true means build hash table on right table and probe with left table.
-        HashJoin(Table *left_table, Table *right_table, std::string left_column, std::string right_column, bool build_right = true);
+        HashJoin(std::unique_ptr<Operator> left, Table *right, size_t left_key, size_t right_key, JoinOutput output,
+                 bool build_right = true);
 
         void Open() override;
         bool Next(Tuple *tuple) override;
@@ -61,27 +67,27 @@ namespace sql
             size_t operator()(const JoinKey &key) const;
         };
 
-        Table *left_table_;
-        Table *right_table_;
-        std::string left_column_;
-        std::string right_column_;
+        std::unique_ptr<Operator> left_;
+        Table *right_;
+        size_t left_key_;
+        size_t right_key_;
+        JoinOutput output_;
         bool build_right_ = true;
 
-        int left_column_index_ = -1;
-        int right_column_index_ = -1;
-
-        // Build side is materialized; hash table values index into build_rows_
+        // Build rows; hash table values index into build_rows_
         std::unordered_map<JoinKey, std::vector<size_t>, JoinKeyHasher> hash_table_;
         std::vector<Tuple> build_rows_;
-        Table *probe_table_ = nullptr;
-        bool probe_is_left_ = true;
 
-        TableIterator probe_it_;
-        bool probe_started_ = false;
-        bool probe_valid_ = false;
+        // Probe side: the left operator, or the right table's rows
+        std::vector<Tuple> probe_rows_;
+        size_t probe_cursor_ = 0;
+        bool NextProbe(Tuple *row);
+
         Tuple probe_tuple_;
+        bool probe_valid_ = false;
+        bool matched_ = false;
         size_t match_cursor_ = 0;
-        std::vector<size_t> current_matches_;
+        const std::vector<size_t> *current_matches_ = nullptr;
 
         static JoinKey MakeJoinKey(const Value &value);
     };
