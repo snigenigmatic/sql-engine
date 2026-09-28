@@ -1,11 +1,18 @@
 add_library(execution
     executor.cpp
+    evaluator.cpp
     seq_scan.cpp
     filter.cpp
     projection.cpp
+    expression_projection.cpp
+    sort.cpp
+    distinct.cpp
+    aggregate.cpp
+    limit.cpp
     index_scan.cpp
     nested_loop_join.cpp
     hash_join.cpp
+    join_util.cpp
     index_nested_loop_join.cpp
 )
 

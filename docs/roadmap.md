@@ -1,0 +1,111 @@
+# Roadmap: SQLite-like embedded database
+
+## Context
+Phases 0–5 are done: lexer, parser, Volcano executor, joins (NLJ/Hash/INLJ), EXPLAIN. But the engine isn't a real database yet:
+- `Table` (`src/storage/table.h`) is a `std::vector<Tuple>` in memory. Data only persists when the user types `save`, which writes text files (`DiskManager::SaveCatalog`). A crash loses everything.
+- `Page` and `BufferPoolManager` (`src/storage/page.h`, `buffer_pool.h`) are empty stubs.
+- `BTree` is in-memory only. It stores vector positions (`row_index`), is never persisted, and `Catalog::RebuildIndexesForTable` rebuilds it after every INSERT/UPDATE/DELETE.
+- There are no transactions, no NULL/constraint semantics, and no ORDER BY, GROUP BY, aggregates or LIMIT.
+
+**Target (agreed):** a SQLite-like embedded database. It runs in a single process with a single database file, stores data in pages, survives crashes using a WAL, supports ACID transactions and covers the everyday SQL features. The REPL stays the interface.
+**Order (agreed):** build the storage foundation first, then transactions, then SQL features.
+
+Each milestone below ships as its own PR with tests. CI must stay green (`cmake --build build && ctest`).
+
+---
+
+## M1 — Page layer + buffer pool
+- `Page`: 4 KB frame with `page_id`, pin count and dirty flag, plus typed header accessors.
+- New `src/storage/pager.{h,cpp}` (or repurpose `DiskManager`) to do raw `ReadPage` / `WritePage` / `AllocatePage` on one `.db` file. Page 0 is the file header (magic, version, page count, free-list head, catalog root page).
+- `BufferPoolManager`: fixed number of frames, a page table, LRU (or clock) replacement, `FetchPage` / `NewPage` / `UnpinPage` / `FlushPage` / `FlushAll`, and an RAII `PageGuard` so pages are never left pinned.
+- Tests: `test/storage/buffer_pool_test.cpp` covering eviction, dirty write-back and pin safety.
+
+## M2 — Slotted-page heap files + RID
+- Tuple serialization: add binary `Serialize` / `Deserialize` to `Tuple` / `Value` (`src/common/`), including a null bitmap.
+- `TablePage` (slotted page) and `TableHeap` (linked list of pages) with `InsertTuple → RID{page_id, slot}`, `GetTuple(RID)`, `UpdateTuple` (in place, or delete + insert when the row grows), `MarkDelete`, and an iterator.
+- Rewrite `Table` as a thin wrapper around `TableHeap`. Replace `GetTuples()` / `row_index` users with an iterator that yields `(RID, Tuple)`. Call sites to migrate: `seq_scan.cpp`, `index_scan.cpp`, `nested_loop_join.cpp`, `hash_join.cpp`, `index_nested_loop_join.cpp`, and the DELETE/UPDATE paths in `executor.cpp` (~L598–693).
+- Keep the executor's operator interfaces (`operator.h`) unchanged so the existing `query_test` suite keeps working as a regression suite.
+
+## M3 — Persistent catalog
+- Store the system tables `__tables(name, root_page, schema_blob)` and `__indexes(name, table, column, root_page)` as heap tables, with their root recorded in the page-0 header.
+- `Catalog` loads from and writes to them. Remove the text-based `SaveCatalog` / `LoadCatalog` and make the `save` REPL command a no-op or checkpoint. Also make the `tables` command read from the catalog.
+- DROP TABLE frees the table's pages onto the free list.
+
+## M4 — On-disk B+tree
+- Replace the `shared_ptr` nodes in `btree.{h,cpp}` with page-backed internal and leaf nodes. Leaves are linked through a `next_page_id`. Keys are fixed-width for INT/FLOAT/BOOL, and VARCHAR keys use a prefix with overflow or a length cap.
+- Values become `RID`. Support duplicate keys with `(key, RID)` composite ordering.
+- Implement real `Insert` / `Delete` (with split, merge and redistribute) and range iterators.
+- Maintain indexes incrementally inside INSERT/UPDATE/DELETE and delete `RebuildIndexesForTable`.
+- Update `IndexScan` / `IndexNestedLoopJoin` to use RIDs. The optimizer (`optimizer.cpp`) needs only signature changes.
+
+## M5 — WAL + crash recovery (durability)
+- New `src/recovery/`: `LogManager` appends physical/physiological records (page_id, offset, before/after images, txn_id, LSN) to `<db>.wal`. Each page header stores `page_lsn`.
+- Enforce the WAL rule in `BufferPoolManager` (flush the log up to `page_lsn` before writing the page) and fsync on commit.
+- Recovery on open does an ARIES-lite redo of committed work and undo of losers. Checkpointing is triggered by the `save` command and on clean exit.
+- Tests: a crash-simulation harness (kill the process or drop the buffer pool without flushing, reopen, assert state).
+
+## M6 — Transactions (Phase 6)
+- Parser/lexer: `BEGIN`, `COMMIT`, `ROLLBACK`. Every statement runs in auto-commit mode unless it is inside an explicit transaction.
+- `TransactionManager` + `Transaction` (txn_id, state, write set, undo chain through the WAL).
+- Isolation: a single-writer database lock with serializable semantics, like SQLite's model. This is enough for embedded use. MVCC is out of scope.
+- ROLLBACK undoes changes to both heap and index pages through log records.
+
+## M7 — SQL completeness
+Add these in small PRs, each with parser tests plus `query_test` cases:
+1. **NULL semantics**: the `NULL` literal, `IS [NOT] NULL`, three-valued logic in `filter.cpp`, and NULL-aware comparisons and joins.
+2. **Constraints**: `PRIMARY KEY` (auto-creates a unique index), `NOT NULL`, `UNIQUE`, `DEFAULT`, and `INSERT INTO t(cols) VALUES`.
+3. **Expressions**: arithmetic in SELECT/WHERE/SET, column aliases (`AS`), `SELECT` of expressions, `LIKE`, `IN (...)` and `BETWEEN`. Generalize `SelectStatement::columns` from `vector<string>` to a vector of expressions.
+4. **ORDER BY / LIMIT / OFFSET / DISTINCT**: new `Sort` (external merge sort over temporary pages when the input exceeds the buffer), `Limit` and `Distinct` operators.
+5. **Aggregates** (done): `COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`, `HAVING` and a `HashAggregate` operator.
+   - Grouping is strict, as in PostgreSQL: every selected, HAVING or ORDER BY column must be grouped or aggregated.
+   - `SUM` of integers errors on `INTEGER` overflow, as SQLite does. `AVG` returns `FLOAT`.
+   - Groups and `DISTINCT` follow `=`, so NULLs group together and 1 = 1.0.
+6. **Joins** (done): `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, multi-way joins (more than two tables), arbitrary `ON` conditions and table aliases. `join_table` became a join list.
+   - Tables join left to right, in the order written; each step picks an index, hash or nested-loop join. M8.2 later made inner-join order cost-based.
+   - Single-table `WHERE` conditions are pushed below the joins, except onto the NULL-padded side of a LEFT JOIN or a table probed through its index.
+7. **Subqueries** (done): `IN (SELECT …)`, `EXISTS` and scalar subqueries, correlated or not.
+   - A subquery is planned and run when evaluated: its references to the enclosing row become literals, and results are cached per statement by those outer values.
+   - Not yet supported: correlated subqueries in the SELECT list, HAVING or ORDER BY of a grouped query, and decorrelation into joins.
+
+## M8 — Usability & hardening
+Split into two PRs.
+
+**M8.1 (done):**
+- CLI:
+  - `sqlengine <file.db>` with multi-line input;
+  - `.tables`, `.schema`, `.read FILE`, `.timer` and `.save` dot commands;
+  - piped scripts (`sqlengine db < script.sql`) run without a banner or prompts.
+- Output:
+  - tables with each column sized to its values, numbers right-aligned, plus a row count and optional timing;
+  - floats printed as the shortest text that reads back as the same value (`0.1`, `2.0`).
+- The lexer accepts `''` inside string literals, so `.schema` output can be run again.
+- Tests:
+  - a sqllogictest-style golden test runner over `test/sql/*.test`;
+  - expected results cross-checked against SQLite, with the intentional differences noted in the files.
+- CI: an ASan/UBSan job and a Release (`-Wall -Wextra`) job, alongside Debug.
+
+**M8.2 (done):**
+- `ANALYZE [t]` records each table's row count and, per column, distinct non-NULL values, NULLs, min and max. The statistics are a `stats` row in the schema table, so they persist, roll back with a transaction and are dropped with the table.
+- The optimizer estimates selectivity and row counts from them (fixed defaults otherwise) and uses the estimates for:
+  - index vs. scan: a unique point lookup always uses its index, any other index only when it keeps at most 25% of the rows;
+  - join order: greedy, for inner/cross joins of three or more tables; a LEFT JOIN fixes the written order;
+  - the hash-join build side.
+- `EXPLAIN` shows `(~N rows)` per node; `.tables` marks analyzed tables.
+- The cost model is described in `docs/design.md` §3.5.
+
+---
+
+## Critical files
+- Storage: `src/storage/{page,buffer_pool,disk_manager,table,btree}.{h,cpp}`, plus new `table_heap`, `table_page`, `b_plus_tree_page` and `pager` files
+- Catalog: `src/catalog/catalog.{h,cpp}`
+- Execution: `src/execution/*.cpp` (RID migration, new Sort/Limit/Aggregate operators), `executor.cpp`
+- Front end: `src/lexer/lexer.cpp` (keywords), `src/parser/{ast.h,parser.cpp}`
+- New: `src/recovery/`, `src/concurrency/` (transaction manager)
+- Tests: `test/CMakeLists.txt` (`add_sqlengine_test` macro), new `test/storage/`, `test/recovery/`
+
+## Verification (per milestone)
+- `cmake -B build && cmake --build build && ctest --test-dir build --output-on-failure` passes. The existing `query_test` must stay green throughout M1–M4 as the regression suite.
+- M1–M4: run the REPL, insert about 100k rows with a buffer pool smaller than the data, restart, and confirm that SELECT and index queries return the same results.
+- M5–M6: kill the process with `kill -9` in the middle of a transaction, reopen, and verify that committed rows are present and uncommitted ones are gone. `BEGIN; …; ROLLBACK;` must restore the prior state, including indexes.
+- M7: golden SQL tests compared against expected outputs. sqlite3 can serve as an oracle for the expected results.
+

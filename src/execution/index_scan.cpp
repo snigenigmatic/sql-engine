@@ -14,15 +14,10 @@ namespace sql
 
     bool IndexScan::Next(Tuple *tuple)
     {
-        const auto &tuples = table_->GetTuples();
         while (cursor_ < matching_rows_.size())
         {
-            size_t row_idx = matching_rows_[cursor_++];
-            if (row_idx < tuples.size())
-            {
-                *tuple = tuples[row_idx];
+            if (table_->GetTuple(matching_rows_[cursor_++], tuple))
                 return true;
-            }
         }
         return false;
     }

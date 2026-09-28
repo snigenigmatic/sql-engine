@@ -1,8 +1,11 @@
 add_library(storage
     table.cpp
+    table_page.cpp
+    table_heap.cpp
     page.cpp
     buffer_pool.cpp
-    disk_manager.cpp
+    pager.cpp
+    wal.cpp
     btree.cpp
 )
 

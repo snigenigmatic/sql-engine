@@ -1,0 +1,113 @@
+# ANALYZE collects statistics for the planner; it changes plans, never results
+
+statement ok
+CREATE TABLE item (id INTEGER PRIMARY KEY, kind INTEGER, price INTEGER, note VARCHAR(10))
+
+statement ok
+CREATE INDEX item_kind ON item (kind)
+
+statement ok
+CREATE INDEX item_price ON item (price)
+
+statement ok
+INSERT INTO item VALUES (1, 0, 10, 'a'), (2, 1, 20, NULL), (3, 0, 30, 'c'), (4, 1, 40, 'd'), (5, 0, 50, NULL), (6, 1, 60, 'f'), (7, 0, 70, 'g'), (8, 1, 80, 'h')
+
+statement ok
+CREATE TABLE kind (id INTEGER, label VARCHAR(10))
+
+statement ok
+INSERT INTO kind VALUES (0, 'even'), (1, 'odd')
+
+statement ok
+CREATE TABLE tag (item_id INTEGER, tag VARCHAR(10))
+
+statement ok
+INSERT INTO tag VALUES (1, 'x'), (3, 'y'), (3, 'z'), (8, 'x'), (9, 'none')
+
+query nosort
+SELECT id FROM item WHERE kind = 1 ORDER BY id
+----
+2
+4
+6
+8
+
+query nosort
+SELECT i.id, k.label, t.tag FROM tag t JOIN item i ON i.id = t.item_id JOIN kind k ON k.id = i.kind ORDER BY t.tag, i.id
+----
+1|even|x
+8|odd|x
+3|even|y
+3|even|z
+
+statement ok
+ANALYZE
+
+# The same queries after ANALYZE
+query nosort
+SELECT id FROM item WHERE kind = 1 ORDER BY id
+----
+2
+4
+6
+8
+
+query nosort
+SELECT i.id, k.label, t.tag FROM tag t JOIN item i ON i.id = t.item_id JOIN kind k ON k.id = i.kind ORDER BY t.tag, i.id
+----
+1|even|x
+8|odd|x
+3|even|y
+3|even|z
+
+query nosort
+SELECT id FROM item WHERE price > 15 AND price <= 40 ORDER BY id
+----
+2
+3
+4
+
+query nosort
+SELECT COUNT(*), COUNT(note) FROM item WHERE note IS NULL OR kind = 0
+----
+5|3
+
+# LEFT joins keep their written order
+query nosort
+SELECT i.id, t.tag FROM item i LEFT JOIN tag t ON t.item_id = i.id JOIN kind k ON k.id = i.kind WHERE k.label = 'even' ORDER BY i.id, t.tag
+----
+1|x
+3|y
+3|z
+5|NULL
+7|NULL
+
+# SELECT * keeps FROM order whatever order the tables are joined in
+query nosort
+SELECT * FROM tag t JOIN item i ON i.id = t.item_id JOIN kind k ON k.id = i.kind WHERE t.tag = 'y'
+----
+3|y|3|0|30|c|0|even
+
+# Statistics go stale safely: changed data is still answered correctly
+statement ok
+UPDATE item SET kind = 2 WHERE id > 4
+
+query nosort
+SELECT id FROM item WHERE kind = 2 ORDER BY id
+----
+5
+6
+7
+8
+
+statement ok
+ANALYZE item
+
+statement error
+ANALYZE nosuch
+
+statement ok
+DROP TABLE tag
+
+statement ok
+ANALYZE

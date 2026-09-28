@@ -148,10 +148,23 @@ factor     := identifier | literal | (expression)
 - Predicate pushdown (apply WHERE filters early)
 - Projection pushdown (only fetch needed columns)
 
-**Phase 2+:** Cost-based optimization
-- Statistics collection
-- Join order selection
-- Index selection
+**Phase 2+:** Cost-based optimization (`src/optimizer/estimator.{h,cpp}`)
+- Statistics: `ANALYZE [t]` scans each table once and stores its row count and, per column, the distinct non-NULL count, NULL count, min and max as a `stats` row of the schema table. Statistics are not maintained on writes; they describe the table as of the last `ANALYZE`, and estimates scale them to the current row count.
+- Selectivity of one condition:
+
+  | Condition | With statistics | Without |
+  |---|---|---|
+  | `col = literal` | non-NULL share / distinct | 0.1 (1 / rows on a unique index) |
+  | `col <, <=, >, >=, BETWEEN` | linear interpolation over [min, max], at least 0.01 | 0.2 |
+  | `IS [NOT] NULL` | NULL share | 0.1 |
+  | `IN (list)` | sum of the `=` selectivities | 0.33 |
+  | `LIKE` / anything else | 0.25 / 0.33 | same |
+
+  `AND` multiplies, `OR` is p + q − pq, and `NOT` is 1 − p (independence assumed).
+- Equi-join size: |L| × |R| / max(distinct(l), distinct(r)); an unanalyzed column counts as a key.
+- Index selection: a unique point lookup always uses its index; any other index is used only when its conditions keep at most 25% of the rows. The defaults sit below that, so an unanalyzed database uses every applicable index.
+- Join order: for inner and cross joins of three or more tables, all `ON` and `WHERE` conjuncts go into one pool. Start from the relation with the smallest filtered estimate, then keep adding the connected relation that gives the smallest result (unconnected ones last). Each conjunct is applied at the first step where its tables are available. A `LEFT JOIN` anywhere keeps the written order. `SELECT *` still lists columns in `FROM` order.
+- Hash joins build on the input with the smaller estimate.
 
 **Output:** Physical execution plan (tree of operators)
 

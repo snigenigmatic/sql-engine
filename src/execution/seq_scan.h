@@ -9,7 +9,7 @@ namespace sql
     class SeqScan : public Operator
     {
     public:
-        explicit SeqScan(Table *table) : table_(table), cursor_(0) {}
+        explicit SeqScan(Table *table) : table_(table) {}
 
         void Open() override;
         bool Next(Tuple *tuple) override;
@@ -20,7 +20,8 @@ namespace sql
 
     private:
         Table *table_;
-        size_t cursor_;
+        TableIterator it_;
+        bool started_ = false;
     };
 
 } // namespace sql

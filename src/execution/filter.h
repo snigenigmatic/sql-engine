@@ -8,6 +8,12 @@
 namespace sql
 {
 
+    // Index of a column referenced by name in rows shaped like `table`:
+    // an exact match, or else a unique match ignoring "table." qualifiers
+    // (join rows use qualified names). Returns -1 if absent; throws if an
+    // unqualified name matches more than one column.
+    int FindColumnIndex(const Table &table, const std::string &name);
+
     class Filter : public Operator
     {
     public:
@@ -21,6 +27,7 @@ namespace sql
     private:
         // Evaluate an expression against a tuple, returns the resulting Value
         Value Evaluate(const Expression *expr, const Tuple &tuple) const;
+        Value ResolveColumn(const ColumnExpression &col, const Tuple &tuple) const;
 
         // Check if the predicate is satisfied by the tuple
         bool EvaluatePredicate(const Tuple &tuple) const;

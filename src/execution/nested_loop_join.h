@@ -1,37 +1,37 @@
 #pragma once
 
+#include "execution/join_util.h"
 #include "execution/operator.h"
 #include "storage/table.h"
-#include <string>
+#include <memory>
+#include <vector>
 
 namespace sql
 {
 
+    // Pairs every left row with every right row and keeps the pairs for
+    // which the ON conditions hold (all pairs for a CROSS join). The right
+    // input is read once and kept in memory.
     class NestedLoopJoin : public Operator
     {
     public:
-        NestedLoopJoin(Table *left_table, Table *right_table, std::string left_column, std::string right_column, bool right_as_outer = false)
-            : left_table_(left_table),
-              right_table_(right_table),
-              left_column_(std::move(left_column)),
-              right_column_(std::move(right_column)),
-              right_as_outer_(right_as_outer) {}
+        NestedLoopJoin(std::unique_ptr<Operator> left, Table *right, JoinOutput output)
+            : left_(std::move(left)), right_(right), output_(std::move(output)) {}
 
         void Open() override;
         bool Next(Tuple *tuple) override;
         void Close() override;
 
     private:
-        Table *left_table_;
-        Table *right_table_;
-        std::string left_column_;
-        std::string right_column_;
+        std::unique_ptr<Operator> left_;
+        Table *right_;
+        JoinOutput output_;
 
-        int left_column_index_ = -1;
-        int right_column_index_ = -1;
-        size_t left_cursor_ = 0;
-        size_t right_cursor_ = 0;
-        bool right_as_outer_ = false;
+        std::vector<Tuple> right_rows_;
+        Tuple left_row_;
+        bool has_left_ = false;
+        bool matched_ = false;
+        size_t cursor_ = 0;
     };
 
 } // namespace sql
