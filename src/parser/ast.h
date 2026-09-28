@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <functional>
 #include <optional>
 
 namespace sql
@@ -16,8 +17,17 @@ namespace sql
     {
         LITERAL,
         COLUMN_REF,
-        BINARY_OP
+        BINARY_OP,
+        UNARY_OP, // NOT, unary minus
+        IS_NULL,  // IS NULL / IS NOT NULL
+        LIKE,     // [NOT] LIKE
+        IN_LIST,  // [NOT] IN (...)
+        BETWEEN,   // [NOT] BETWEEN ... AND ...
+        AGGREGATE, // COUNT / SUM / AVG / MIN / MAX
+        SUBQUERY   // (SELECT ...), [NOT] EXISTS (SELECT ...), x [NOT] IN (SELECT ...)
     };
+
+    struct SelectStatement;
 
     struct Expression
     {
@@ -49,6 +59,113 @@ namespace sql
         ExpressionType GetType() const override { return ExpressionType::BINARY_OP; }
     };
 
+    struct UnaryExpression : public Expression
+    {
+        TokenType op;
+        std::unique_ptr<Expression> operand;
+        UnaryExpression(TokenType o, std::unique_ptr<Expression> e) : op(o), operand(std::move(e)) {}
+        ExpressionType GetType() const override { return ExpressionType::UNARY_OP; }
+    };
+
+    struct IsNullExpression : public Expression
+    {
+        std::unique_ptr<Expression> operand;
+        bool negated; // IS NOT NULL
+        IsNullExpression(std::unique_ptr<Expression> e, bool n) : operand(std::move(e)), negated(n) {}
+        ExpressionType GetType() const override { return ExpressionType::IS_NULL; }
+    };
+
+    struct LikeExpression : public Expression
+    {
+        std::unique_ptr<Expression> value;
+        std::unique_ptr<Expression> pattern; // % matches any run, _ any one character
+        bool negated;
+        LikeExpression(std::unique_ptr<Expression> v, std::unique_ptr<Expression> p, bool n)
+            : value(std::move(v)), pattern(std::move(p)), negated(n) {}
+        ExpressionType GetType() const override { return ExpressionType::LIKE; }
+    };
+
+    struct InListExpression : public Expression
+    {
+        std::unique_ptr<Expression> operand;
+        std::vector<std::unique_ptr<Expression>> list;
+        bool negated;
+        InListExpression(std::unique_ptr<Expression> o, std::vector<std::unique_ptr<Expression>> l, bool n)
+            : operand(std::move(o)), list(std::move(l)), negated(n) {}
+        ExpressionType GetType() const override { return ExpressionType::IN_LIST; }
+    };
+
+    struct BetweenExpression : public Expression
+    {
+        std::unique_ptr<Expression> operand;
+        std::unique_ptr<Expression> low;
+        std::unique_ptr<Expression> high;
+        bool negated;
+        BetweenExpression(std::unique_ptr<Expression> o, std::unique_ptr<Expression> l, std::unique_ptr<Expression> h,
+                          bool n)
+            : operand(std::move(o)), low(std::move(l)), high(std::move(h)), negated(n) {}
+        ExpressionType GetType() const override { return ExpressionType::BETWEEN; }
+    };
+
+    enum class AggregateFunction
+    {
+        COUNT,
+        SUM,
+        AVG,
+        MIN,
+        MAX
+    };
+
+    const char *AggregateFunctionName(AggregateFunction function);
+
+    // COUNT(*), COUNT([DISTINCT] x), SUM(x), ... Only valid in the SELECT
+    // list, HAVING and ORDER BY of a query; the planner computes it per group
+    struct AggregateExpression : public Expression
+    {
+        AggregateFunction function;
+        std::unique_ptr<Expression> argument; // null for COUNT(*)
+        bool distinct;
+        AggregateExpression(AggregateFunction f, std::unique_ptr<Expression> a, bool d)
+            : function(f), argument(std::move(a)), distinct(d) {}
+        ExpressionType GetType() const override { return ExpressionType::AGGREGATE; }
+    };
+
+    // A SELECT used as a value. Its body is a query of its own: names it
+    // cannot resolve refer to the enclosing query's current row.
+    struct SubqueryExpression : public Expression
+    {
+        enum class Kind
+        {
+            SCALAR, // (SELECT x ...): the single value, or NULL for no rows
+            EXISTS, // [NOT] EXISTS (SELECT ...)
+            IN      // operand [NOT] IN (SELECT x ...)
+        };
+        Kind kind;
+        bool negated;
+        std::unique_ptr<Expression> operand; // IN only
+        std::unique_ptr<SelectStatement> select;
+        SubqueryExpression(Kind k, bool n, std::unique_ptr<Expression> o, std::unique_ptr<SelectStatement> s);
+        ~SubqueryExpression() override;
+        ExpressionType GetType() const override { return ExpressionType::SUBQUERY; }
+    };
+
+    // The direct subexpressions of an expression, in order. A subquery's
+    // body is a separate query, so only an IN subquery's operand counts.
+    std::vector<const Expression *> ExpressionChildren(const Expression *expr);
+
+    // True if the expression contains an aggregate function call
+    bool ContainsAggregate(const Expression *expr);
+
+    // Structural equality. Column references are compared with same_column,
+    // which decides whether two names refer to the same column.
+    bool ExpressionsEqual(const Expression *a, const Expression *b,
+                          const std::function<bool(const std::string &, const std::string &)> &same_column);
+
+    // Deep copy of an expression. replace is called on every node first; a
+    // non-null result is used in place of that node's copy.
+    std::unique_ptr<Expression> RewriteExpression(
+        const Expression *expr, const std::function<std::unique_ptr<Expression>(const Expression *)> &replace);
+
     // --- Statements ---
 
     enum class StatementType
@@ -60,7 +177,9 @@ namespace sql
         CREATE_INDEX,
         DELETE_STMT,
         UPDATE_STMT,
-        EXPLAIN_STMT
+        EXPLAIN_STMT,
+        TRANSACTION_STMT,
+        ANALYZE_STMT
     };
 
     struct Statement
@@ -69,14 +188,71 @@ namespace sql
         virtual StatementType GetType() const = 0;
     };
 
-    struct SelectStatement : public Statement
+    // One entry of a SELECT list: an expression and its optional alias
+    struct SelectItem
+    {
+        std::unique_ptr<Expression> expr;
+        std::string alias; // empty if none
+    };
+
+    // A table in FROM, and the name the query knows it by
+    struct TableRef
     {
         std::string table;
-        std::optional<std::string> join_table;
-        std::optional<std::string> join_left_column;
-        std::optional<std::string> join_right_column;
-        std::vector<std::string> columns;
+        std::string alias; // empty if none
+        const std::string &Name() const { return alias.empty() ? table : alias; }
+    };
+
+    enum class JoinType
+    {
+        INNER,
+        LEFT, // LEFT [OUTER] JOIN: unmatched left rows are kept, NULL-padded
+        CROSS // CROSS JOIN, or a comma in FROM: every pair of rows
+    };
+
+    const char *JoinTypeName(JoinType type);
+
+    // One "JOIN t [AS a] ON cond" after the first table in FROM
+    struct JoinClause
+    {
+        JoinType type = JoinType::INNER;
+        TableRef right;
+        std::unique_ptr<Expression> on; // null for CROSS
+    };
+
+    // ORDER BY entry: an expression, an output alias, or a 1-based position
+    struct OrderItem
+    {
+        std::unique_ptr<Expression> expr;
+        bool descending = false;
+    };
+
+    struct SelectStatement : public Statement
+    {
+        // FROM table [AS alias] followed by joins, joined left to right
+        std::string table;
+        std::string table_alias; // empty if none
+        std::vector<JoinClause> joins;
+        std::vector<SelectItem> items;    // the SELECT list (empty for SELECT *)
+        std::vector<std::string> columns; // column names, when every item is a bare column
         bool select_star = false;
+        bool distinct = false;
+        std::vector<std::unique_ptr<Expression>> group_by;
+        std::unique_ptr<Expression> having;
+        std::vector<OrderItem> order_by;
+        std::optional<int64_t> limit;
+        int64_t offset = 0;
+
+        // True when some item is more than a bare column reference
+        bool HasComputedItems() const
+        {
+            for (const auto &item : items)
+            {
+                if (item.expr->GetType() != ExpressionType::COLUMN_REF)
+                    return true;
+            }
+            return false;
+        }
         std::unique_ptr<Expression> where;
         StatementType GetType() const override { return StatementType::SELECT; }
     };
@@ -86,6 +262,10 @@ namespace sql
         std::string name;
         TokenType type_token; // INTEGER, VARCHAR, FLOAT, BOOLEAN
         int length = 0;       // For VARCHAR(n)
+        bool not_null = false;
+        bool primary_key = false;
+        bool unique = false;
+        std::optional<Value> default_value;
     };
 
     struct CreateTableStatement : public Statement
@@ -104,6 +284,7 @@ namespace sql
     struct InsertStatement : public Statement
     {
         std::string table;
+        std::vector<std::string> columns;                           // empty = every column, in order
         std::vector<std::vector<std::unique_ptr<Expression>>> rows; // VALUES (...), (...)
         StatementType GetType() const override { return StatementType::INSERT; }
     };
@@ -113,6 +294,7 @@ namespace sql
         std::string index_name;
         std::string table;
         std::string column;
+        bool unique = false;
         StatementType GetType() const override { return StatementType::CREATE_INDEX; }
     };
 
@@ -131,6 +313,27 @@ namespace sql
         StatementType GetType() const override { return StatementType::UPDATE_STMT; }
     };
 
+    // BEGIN / COMMIT / ROLLBACK [TRANSACTION]
+    struct TransactionStatement : public Statement
+    {
+        enum class Kind
+        {
+            BEGIN,
+            COMMIT,
+            ROLLBACK
+        };
+        Kind kind;
+        explicit TransactionStatement(Kind k) : kind(k) {}
+        StatementType GetType() const override { return StatementType::TRANSACTION_STMT; }
+    };
+
+    // ANALYZE [table]: gather the statistics the planner uses
+    struct AnalyzeStatement : public Statement
+    {
+        std::string table; // empty = every table
+        StatementType GetType() const override { return StatementType::ANALYZE_STMT; }
+    };
+
     struct ExplainStatement : public Statement
     {
         std::unique_ptr<SelectStatement> select;
@@ -140,6 +343,21 @@ namespace sql
     std::string ExpressionTypeToString(ExpressionType type);
     std::string StatementTypeToString(StatementType type);
     std::string DumpExpression(const Expression *expr, int indent = 0);
+
+    // SQL text for an expression (used to name computed result columns)
+    std::string ExpressionToSQL(const Expression *expr);
     std::string DumpStatement(const Statement *stmt);
+
+    // SQL text of a SELECT, without the final ";"
+    std::string SelectToSQL(const SelectStatement &select);
+
+    // Deep copy of a SELECT; replace is applied to every expression in it,
+    // as in RewriteExpression (including the bodies of nested subqueries)
+    std::unique_ptr<SelectStatement> CloneSelect(
+        const SelectStatement &select, const std::function<std::unique_ptr<Expression>(const Expression *)> &replace);
+
+    // Every expression that belongs to this SELECT itself (not to its
+    // subqueries): items, ON, WHERE, GROUP BY, HAVING, ORDER BY
+    std::vector<const Expression *> SelectExpressions(const SelectStatement &select);
 
 } // namespace sql

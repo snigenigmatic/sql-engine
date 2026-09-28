@@ -1,4 +1,6 @@
 #include "parser/parser.h"
+#include <cctype>
+#include <climits>
 #include <stdexcept>
 #include <vector>
 
@@ -55,15 +57,29 @@ namespace sql
             return ParseDropTable();
         case TokenType::EXPLAIN:
             return ParseExplain();
+        case TokenType::ANALYZE:
+        {
+            auto stmt = std::make_unique<AnalyzeStatement>();
+            NextToken();
+            if (current_token_.type == TokenType::IDENTIFIER)
+                stmt->table = Expect(TokenType::IDENTIFIER).value;
+            Expect(TokenType::SEMICOLON);
+            return stmt;
+        }
+        case TokenType::BEGIN:
+        case TokenType::COMMIT:
+        case TokenType::ROLLBACK:
+            return ParseTransaction();
         default:
             throw std::runtime_error("Unexpected token at start of statement: " + current_token_.value);
         }
     }
 
-    std::unique_ptr<SelectStatement> Parser::ParseSelect()
+    std::unique_ptr<SelectStatement> Parser::ParseSelectBody()
     {
         auto stmt = std::make_unique<SelectStatement>();
         Expect(TokenType::SELECT);
+        stmt->distinct = Match(TokenType::DISTINCT);
 
         if (Match(TokenType::STAR))
         {
@@ -73,35 +89,76 @@ namespace sql
         {
             do
             {
-                stmt->columns.push_back(ParseQualifiedColumnName());
+                SelectItem item;
+                item.expr = ParseExpression();
+                // expr AS alias, or expr alias
+                if (Match(TokenType::AS))
+                    item.alias = Expect(TokenType::IDENTIFIER).value;
+                else if (current_token_.type == TokenType::IDENTIFIER)
+                    item.alias = Expect(TokenType::IDENTIFIER).value;
+                stmt->items.push_back(std::move(item));
             } while (Match(TokenType::COMMA));
+
+            if (!stmt->HasComputedItems())
+            {
+                for (const auto &item : stmt->items)
+                    stmt->columns.push_back(static_cast<const ColumnExpression *>(item.expr.get())->name);
+            }
         }
 
         Expect(TokenType::FROM);
-        Token table = Expect(TokenType::IDENTIFIER);
-        stmt->table = table.value;
+        TableRef first = ParseTableRef();
+        stmt->table = first.table;
+        stmt->table_alias = first.alias;
+        std::vector<std::string> names{first.Name()};
 
-        bool has_join = false;
-        if (Match(TokenType::INNER))
+        // [INNER] JOIN / LEFT [OUTER] JOIN / CROSS JOIN / ","
+        while (true)
         {
-            Expect(TokenType::JOIN);
-            has_join = true;
-        }
-        else if (Match(TokenType::JOIN))
-        {
-            has_join = true;
-        }
+            JoinType type;
+            if (Match(TokenType::COMMA))
+                type = JoinType::CROSS;
+            else if (Match(TokenType::CROSS))
+            {
+                Expect(TokenType::JOIN);
+                type = JoinType::CROSS;
+            }
+            else if (Match(TokenType::LEFT))
+            {
+                Match(TokenType::OUTER);
+                Expect(TokenType::JOIN);
+                type = JoinType::LEFT;
+            }
+            else if (Match(TokenType::INNER))
+            {
+                Expect(TokenType::JOIN);
+                type = JoinType::INNER;
+            }
+            else if (Match(TokenType::JOIN))
+                type = JoinType::INNER;
+            else
+                break;
 
-        if (has_join)
-        {
-            Token join_table = Expect(TokenType::IDENTIFIER);
-            stmt->join_table = join_table.value;
-            Expect(TokenType::ON);
-            std::string left = ParseQualifiedColumnName();
-            Expect(TokenType::EQ);
-            std::string right = ParseQualifiedColumnName();
-            stmt->join_left_column = left;
-            stmt->join_right_column = right;
+            JoinClause join;
+            join.type = type;
+            join.right = ParseTableRef();
+            for (const auto &name : names)
+            {
+                if (name == join.right.Name())
+                    throw std::runtime_error("Table name '" + name + "' specified more than once; use an alias");
+            }
+            names.push_back(join.right.Name());
+            if (type == JoinType::CROSS)
+            {
+                if (current_token_.type == TokenType::ON)
+                    throw std::runtime_error("CROSS JOIN does not take an ON condition");
+            }
+            else
+            {
+                Expect(TokenType::ON);
+                join.on = ParseExpression();
+            }
+            stmt->joins.push_back(std::move(join));
         }
 
         if (Match(TokenType::WHERE))
@@ -109,8 +166,54 @@ namespace sql
             stmt->where = ParseExpression();
         }
 
+        if (Match(TokenType::GROUP))
+        {
+            Expect(TokenType::BY);
+            do
+            {
+                stmt->group_by.push_back(ParseExpression());
+            } while (Match(TokenType::COMMA));
+        }
+        if (Match(TokenType::HAVING))
+            stmt->having = ParseExpression();
+
+        if (Match(TokenType::ORDER))
+        {
+            Expect(TokenType::BY);
+            do
+            {
+                OrderItem item;
+                item.expr = ParseExpression();
+                if (Match(TokenType::DESC))
+                    item.descending = true;
+                else
+                    Match(TokenType::ASC);
+                stmt->order_by.push_back(std::move(item));
+            } while (Match(TokenType::COMMA));
+        }
+
+        if (Match(TokenType::LIMIT))
+        {
+            stmt->limit = std::stoll(Expect(TokenType::INTEGER_LITERAL).value);
+            if (Match(TokenType::OFFSET))
+                stmt->offset = std::stoll(Expect(TokenType::INTEGER_LITERAL).value);
+        }
+        return stmt;
+    }
+
+    std::unique_ptr<SelectStatement> Parser::ParseSelect()
+    {
+        auto stmt = ParseSelectBody();
         Expect(TokenType::SEMICOLON);
         return stmt;
+    }
+
+    // "(SELECT ...)", after the "(" has been read
+    std::unique_ptr<SelectStatement> Parser::ParseSubqueryBody()
+    {
+        auto select = ParseSelectBody();
+        Expect(TokenType::RPAREN);
+        return select;
     }
 
     std::unique_ptr<Statement> Parser::ParseCreate()
@@ -120,7 +223,56 @@ namespace sql
             return ParseCreateTable();
         if (current_token_.type == TokenType::INDEX)
             return ParseCreateIndex();
-        throw std::runtime_error("Expected TABLE or INDEX after CREATE");
+        if (Match(TokenType::UNIQUE))
+        {
+            auto index = ParseCreateIndex();
+            index->unique = true;
+            return index;
+        }
+        throw std::runtime_error("Expected TABLE, INDEX or UNIQUE INDEX after CREATE");
+    }
+
+    // NOT NULL | NULL | PRIMARY KEY | UNIQUE | DEFAULT literal, in any order
+    void Parser::ParseColumnConstraints(ColumnDef *col)
+    {
+        while (true)
+        {
+            if (Match(TokenType::NOT))
+            {
+                Expect(TokenType::NULL_KW);
+                col->not_null = true;
+            }
+            else if (Match(TokenType::NULL_KW))
+            {
+                // explicitly nullable: the default
+            }
+            else if (Match(TokenType::PRIMARY))
+            {
+                // KEY is not reserved (columns may be called "key")
+                Token key = Expect(TokenType::IDENTIFIER);
+                std::string upper = key.value;
+                for (char &c : upper)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (upper != "KEY")
+                    throw std::runtime_error("Expected KEY after PRIMARY, got: " + key.value);
+                col->primary_key = true;
+            }
+            else if (Match(TokenType::UNIQUE))
+            {
+                col->unique = true;
+            }
+            else if (Match(TokenType::DEFAULT))
+            {
+                auto expr = ParsePrimary();
+                if (expr->GetType() != ExpressionType::LITERAL)
+                    throw std::runtime_error("DEFAULT must be a literal value");
+                col->default_value = static_cast<LiteralExpression *>(expr.get())->value;
+            }
+            else
+            {
+                return;
+            }
+        }
     }
 
     std::unique_ptr<CreateTableStatement> Parser::ParseCreateTable()
@@ -161,6 +313,7 @@ namespace sql
                 Expect(TokenType::RPAREN);
             }
 
+            ParseColumnConstraints(&col);
             stmt->columns.push_back(std::move(col));
         } while (Match(TokenType::COMMA));
 
@@ -194,6 +347,16 @@ namespace sql
 
         Token table = Expect(TokenType::IDENTIFIER);
         stmt->table = table.value;
+
+        // Optional column list: INSERT INTO t (a, b) VALUES ...
+        if (Match(TokenType::LPAREN))
+        {
+            do
+            {
+                stmt->columns.push_back(Expect(TokenType::IDENTIFIER).value);
+            } while (Match(TokenType::COMMA));
+            Expect(TokenType::RPAREN);
+        }
 
         Expect(TokenType::VALUES);
 
@@ -259,6 +422,23 @@ namespace sql
         return stmt;
     }
 
+    std::unique_ptr<TransactionStatement> Parser::ParseTransaction()
+    {
+        TransactionStatement::Kind kind;
+        if (Match(TokenType::BEGIN))
+            kind = TransactionStatement::Kind::BEGIN;
+        else if (Match(TokenType::COMMIT))
+            kind = TransactionStatement::Kind::COMMIT;
+        else
+        {
+            Expect(TokenType::ROLLBACK);
+            kind = TransactionStatement::Kind::ROLLBACK;
+        }
+        Match(TokenType::TRANSACTION); // optional
+        Expect(TokenType::SEMICOLON);
+        return std::make_unique<TransactionStatement>(kind);
+    }
+
     std::unique_ptr<DropTableStatement> Parser::ParseDropTable()
     {
         auto stmt = std::make_unique<DropTableStatement>();
@@ -285,20 +465,64 @@ namespace sql
 
     std::unique_ptr<Expression> Parser::ParseTerm()
     {
-        auto left = ParseComparison();
+        auto left = ParseNot();
         while (current_token_.type == TokenType::AND)
         {
             TokenType op = current_token_.type;
             NextToken();
-            auto right = ParseComparison();
+            auto right = ParseNot();
             left = std::make_unique<BinaryExpression>(std::move(left), op, std::move(right));
         }
         return left;
     }
 
+    // NOT binds tighter than AND / OR and looser than comparisons
+    std::unique_ptr<Expression> Parser::ParseNot()
+    {
+        if (Match(TokenType::NOT))
+            return std::make_unique<UnaryExpression>(TokenType::NOT, ParseNot());
+        return ParseComparison();
+    }
+
     std::unique_ptr<Expression> Parser::ParseComparison()
     {
-        auto left = ParsePrimary();
+        auto left = ParseAdditive();
+        if (Match(TokenType::IS))
+        {
+            const bool negated = Match(TokenType::NOT);
+            Expect(TokenType::NULL_KW);
+            return std::make_unique<IsNullExpression>(std::move(left), negated);
+        }
+
+        // [NOT] LIKE / IN / BETWEEN
+        const bool negated = Match(TokenType::NOT);
+        if (Match(TokenType::LIKE))
+            return std::make_unique<LikeExpression>(std::move(left), ParseAdditive(), negated);
+        if (Match(TokenType::IN))
+        {
+            Expect(TokenType::LPAREN);
+            if (current_token_.type == TokenType::SELECT)
+                return std::make_unique<SubqueryExpression>(SubqueryExpression::Kind::IN, negated, std::move(left),
+                                                            ParseSubqueryBody());
+            std::vector<std::unique_ptr<Expression>> list;
+            do
+            {
+                list.push_back(ParseExpression());
+            } while (Match(TokenType::COMMA));
+            Expect(TokenType::RPAREN);
+            return std::make_unique<InListExpression>(std::move(left), std::move(list), negated);
+        }
+        if (Match(TokenType::BETWEEN))
+        {
+            // The AND here separates the bounds; it is not a logical AND
+            auto low = ParseAdditive();
+            Expect(TokenType::AND);
+            auto high = ParseAdditive();
+            return std::make_unique<BetweenExpression>(std::move(left), std::move(low), std::move(high), negated);
+        }
+        if (negated)
+            throw std::runtime_error("Expected LIKE, IN or BETWEEN after NOT, got: " + current_token_.value);
+
         if (current_token_.type == TokenType::EQ ||
             current_token_.type == TokenType::NEQ ||
             current_token_.type == TokenType::LT ||
@@ -308,10 +532,53 @@ namespace sql
         {
             TokenType op = current_token_.type;
             NextToken();
-            auto right = ParsePrimary();
+            auto right = ParseAdditive();
             left = std::make_unique<BinaryExpression>(std::move(left), op, std::move(right));
         }
         return left;
+    }
+
+    std::unique_ptr<Expression> Parser::ParseAdditive()
+    {
+        auto left = ParseMultiplicative();
+        while (current_token_.type == TokenType::PLUS || current_token_.type == TokenType::MINUS)
+        {
+            TokenType op = current_token_.type;
+            NextToken();
+            left = std::make_unique<BinaryExpression>(std::move(left), op, ParseMultiplicative());
+        }
+        return left;
+    }
+
+    std::unique_ptr<Expression> Parser::ParseMultiplicative()
+    {
+        auto left = ParseUnary();
+        while (current_token_.type == TokenType::STAR || current_token_.type == TokenType::SLASH)
+        {
+            TokenType op = current_token_.type;
+            NextToken();
+            left = std::make_unique<BinaryExpression>(std::move(left), op, ParseUnary());
+        }
+        return left;
+    }
+
+    std::unique_ptr<Expression> Parser::ParseUnary()
+    {
+        if (Match(TokenType::MINUS))
+        {
+            auto operand = ParseUnary();
+            // Fold "-5" into a literal so it stays usable as an index key
+            if (operand->GetType() == ExpressionType::LITERAL)
+            {
+                const Value &v = static_cast<LiteralExpression *>(operand.get())->value;
+                if (!v.IsNull() && v.GetType() == DataType::INTEGER && v.GetAsInt() != INT32_MIN)
+                    return std::make_unique<LiteralExpression>(Value(-v.GetAsInt()));
+                if (!v.IsNull() && v.GetType() == DataType::FLOAT)
+                    return std::make_unique<LiteralExpression>(Value(-v.GetAsFloat()));
+            }
+            return std::make_unique<UnaryExpression>(TokenType::MINUS, std::move(operand));
+        }
+        return ParsePrimary();
     }
 
     std::unique_ptr<Expression> Parser::ParsePrimary()
@@ -323,6 +590,8 @@ namespace sql
         {
         case TokenType::IDENTIFIER:
         {
+            if (current_token_.type == TokenType::LPAREN)
+                return ParseFunctionCall(t.value);
             std::string name = t.value;
             if (current_token_.type == TokenType::DOT)
             {
@@ -340,10 +609,19 @@ namespace sql
             return std::make_unique<LiteralExpression>(Value(true));
         case TokenType::FALSE:
             return std::make_unique<LiteralExpression>(Value(false));
+        case TokenType::NULL_KW:
+            return std::make_unique<LiteralExpression>(Value()); // untyped NULL
         case TokenType::FLOAT_LITERAL:
             return std::make_unique<LiteralExpression>(Value(std::stod(t.value)));
+        case TokenType::EXISTS:
+            Expect(TokenType::LPAREN);
+            return std::make_unique<SubqueryExpression>(SubqueryExpression::Kind::EXISTS, false, nullptr,
+                                                        ParseSubqueryBody());
         case TokenType::LPAREN:
         {
+            if (current_token_.type == TokenType::SELECT)
+                return std::make_unique<SubqueryExpression>(SubqueryExpression::Kind::SCALAR, false, nullptr,
+                                                            ParseSubqueryBody());
             auto expr = ParseExpression();
             Expect(TokenType::RPAREN);
             return expr;
@@ -364,16 +642,51 @@ namespace sql
         }
     }
 
-    std::string Parser::ParseQualifiedColumnName()
+    // name( [DISTINCT] expr ) or COUNT(*); the name is not case-sensitive and
+    // not reserved, so columns may still be called "count"
+    std::unique_ptr<Expression> Parser::ParseFunctionCall(const std::string &name)
     {
-        Token first = Expect(TokenType::IDENTIFIER);
-        std::string name = first.value;
-        if (Match(TokenType::DOT))
+        std::string upper = name;
+        for (char &c : upper)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        AggregateFunction function;
+        if (upper == "COUNT")
+            function = AggregateFunction::COUNT;
+        else if (upper == "SUM")
+            function = AggregateFunction::SUM;
+        else if (upper == "AVG")
+            function = AggregateFunction::AVG;
+        else if (upper == "MIN")
+            function = AggregateFunction::MIN;
+        else if (upper == "MAX")
+            function = AggregateFunction::MAX;
+        else
+            throw std::runtime_error("Unknown function: " + name);
+
+        Expect(TokenType::LPAREN);
+        const bool distinct = Match(TokenType::DISTINCT);
+        if (Match(TokenType::STAR))
         {
-            Token second = Expect(TokenType::IDENTIFIER);
-            name += "." + second.value;
+            if (function != AggregateFunction::COUNT || distinct)
+                throw std::runtime_error(std::string("Only COUNT(*) accepts *, not ") + (distinct ? "DISTINCT *" : upper + "(*)"));
+            Expect(TokenType::RPAREN);
+            return std::make_unique<AggregateExpression>(function, nullptr, false);
         }
-        return name;
+        auto argument = ParseExpression();
+        Expect(TokenType::RPAREN);
+        return std::make_unique<AggregateExpression>(function, std::move(argument), distinct);
+    }
+
+    // table [[AS] alias]
+    TableRef Parser::ParseTableRef()
+    {
+        TableRef ref;
+        ref.table = Expect(TokenType::IDENTIFIER).value;
+        if (Match(TokenType::AS))
+            ref.alias = Expect(TokenType::IDENTIFIER).value;
+        else if (current_token_.type == TokenType::IDENTIFIER)
+            ref.alias = Expect(TokenType::IDENTIFIER).value;
+        return ref;
     }
 
     std::unique_ptr<ExplainStatement> Parser::ParseExplain()

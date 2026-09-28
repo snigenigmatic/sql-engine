@@ -224,14 +224,20 @@ namespace sql
 
     std::string Lexer::ReadString()
     {
-        size_t start = position_ + 1;
+        // 'it''s': a doubled quote inside the string is one quote
+        std::string str;
         ReadChar();
-        while (ch_ != '\'' && ch_ != 0)
+        while (ch_ != 0)
         {
+            if (ch_ == '\'')
+            {
+                if (PeekChar() != '\'')
+                    break;
+                ReadChar();
+            }
+            str += ch_;
             ReadChar();
         }
-
-        std::string str = input_.substr(start, position_ - start);
         if (ch_ == '\'')
         {
             ReadChar();
@@ -270,6 +276,33 @@ namespace sql
              {"JOIN", TokenType::JOIN},
              {"INNER", TokenType::INNER},
              {"EXPLAIN", TokenType::EXPLAIN},
+             {"BEGIN", TokenType::BEGIN},
+             {"COMMIT", TokenType::COMMIT},
+             {"ROLLBACK", TokenType::ROLLBACK},
+             {"TRANSACTION", TokenType::TRANSACTION},
+             {"NULL", TokenType::NULL_KW},
+             {"IS", TokenType::IS},
+             {"PRIMARY", TokenType::PRIMARY},
+             {"UNIQUE", TokenType::UNIQUE},
+             {"DEFAULT", TokenType::DEFAULT},
+             {"AS", TokenType::AS},
+             {"LIKE", TokenType::LIKE},
+             {"IN", TokenType::IN},
+             {"BETWEEN", TokenType::BETWEEN},
+             {"ORDER", TokenType::ORDER},
+             {"BY", TokenType::BY},
+             {"ASC", TokenType::ASC},
+             {"DESC", TokenType::DESC},
+             {"LIMIT", TokenType::LIMIT},
+             {"OFFSET", TokenType::OFFSET},
+             {"DISTINCT", TokenType::DISTINCT},
+             {"GROUP", TokenType::GROUP},
+             {"HAVING", TokenType::HAVING},
+             {"LEFT", TokenType::LEFT},
+             {"OUTER", TokenType::OUTER},
+             {"CROSS", TokenType::CROSS},
+             {"EXISTS", TokenType::EXISTS},
+             {"ANALYZE", TokenType::ANALYZE},
              {"TRUE", TokenType::TRUE},
              {"FALSE", TokenType::FALSE}};
 

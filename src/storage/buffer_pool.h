@@ -67,8 +67,20 @@ namespace sql
 
         bool FlushPage(page_id_t page_id);
 
+        bool HasDirtyPages();
+
+        // Write every dirty page to the pager (into the write-ahead log for
+        // file databases; Pager::Commit makes them durable)
+        bool WriteDirtyPages();
+
+        // Drop every cached page without writing it, e.g. after the pager
+        // rolled back. Clean pages go too: they may hold uncommitted data
+        // read back from the log. Fails if any page is pinned.
+        bool DiscardAll();
+
         // True if the page is cached and currently pinned
         bool IsPinned(page_id_t page_id);
+        // WriteDirtyPages + sync
         bool FlushAll();
 
         // Remove a page from the pool and return it to the Pager free list.

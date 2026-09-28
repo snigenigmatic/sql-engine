@@ -5,7 +5,7 @@ add_library(storage
     page.cpp
     buffer_pool.cpp
     pager.cpp
-    disk_manager.cpp
+    wal.cpp
     btree.cpp
 )
 

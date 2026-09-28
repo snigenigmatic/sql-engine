@@ -385,12 +385,11 @@ namespace sql
         auto select = static_cast<SelectStatement *>(stmt.get());
 
         EXPECT_EQ(select->table, "users");
-        ASSERT_TRUE(select->join_table.has_value());
-        EXPECT_EQ(*select->join_table, "orders");
-        ASSERT_TRUE(select->join_left_column.has_value());
-        ASSERT_TRUE(select->join_right_column.has_value());
-        EXPECT_EQ(*select->join_left_column, "users.id");
-        EXPECT_EQ(*select->join_right_column, "orders.user_id");
+        ASSERT_EQ(select->joins.size(), 1u);
+        EXPECT_EQ(select->joins[0].type, JoinType::INNER);
+        EXPECT_EQ(select->joins[0].right.table, "orders");
+        EXPECT_EQ(select->joins[0].right.alias, "");
+        EXPECT_EQ(ExpressionToSQL(select->joins[0].on.get()), "users.id = orders.user_id");
         ASSERT_EQ(select->columns.size(), 2);
         EXPECT_EQ(select->columns[0], "users.id");
         EXPECT_EQ(select->columns[1], "orders.amount");
@@ -420,40 +419,36 @@ namespace sql
 
         EXPECT_NE(explain.find("Projection(columns=[users.id, orders.amount])"), std::string::npos);
         EXPECT_NE(explain.find("Filter"), std::string::npos);
-        EXPECT_NE(explain.find("NestedLoopJoin(left=users, right=orders, on=users.id = orders.user_id"), std::string::npos);
+        EXPECT_NE(explain.find("NestedLoopJoin(type=INNER, right=orders, on=users.id = orders.user_id)"), std::string::npos)
+            << explain;
     }
 
-    TEST(ParserTest, BuildPhysicalPlanForJoinChoosesSmallerOuter)
+    TEST(ParserTest, BuildPhysicalPlanForHashJoinBuildsOnTheSmallerSide)
     {
         Catalog catalog;
-        ASSERT_TRUE(catalog.CreateTable("users", Schema({
-                                                 Column("id", DataType::INTEGER),
-                                             })));
-        ASSERT_TRUE(catalog.CreateTable("orders", Schema({
-                                                  Column("id", DataType::INTEGER),
-                                                  Column("user_id", DataType::INTEGER),
-                                              })));
+        ASSERT_TRUE(catalog.CreateTable("users", Schema({Column("id", DataType::INTEGER)})));
+        ASSERT_TRUE(catalog.CreateTable("orders", Schema({Column("id", DataType::INTEGER),
+                                                          Column("user_id", DataType::INTEGER)})));
+        for (int i = 1; i <= 20; ++i)
+            catalog.GetTable("users")->Insert(Tuple({Value(i)}));
+        catalog.GetTable("orders")->Insert(Tuple({Value(10), Value(1)}));
 
-        auto *users = catalog.GetTable("users");
-        auto *orders = catalog.GetTable("orders");
-        ASSERT_NE(users, nullptr);
-        ASSERT_NE(orders, nullptr);
-        users->Insert(Tuple({Value(1)}));
-        users->Insert(Tuple({Value(2)}));
-        users->Insert(Tuple({Value(3)}));
-        users->Insert(Tuple({Value(4)}));
-        orders->Insert(Tuple({Value(10), Value(1)}));
-
-        std::string sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id;";
-        Lexer lexer(sql);
-        Parser parser(lexer);
-        auto stmt = parser.ParseStatement();
-
-        Optimizer optimizer;
-        auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
-        auto explain = optimizer.ExplainPhysicalPlan(plan.get());
-
-        EXPECT_NE(explain.find("outer=right"), std::string::npos);
+        auto explain = [&](const std::string &sql)
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            Optimizer optimizer;
+            return optimizer.ExplainPhysicalPlan(optimizer.BuildPhysicalPlan(stmt.get(), &catalog).get());
+        };
+        // orders is smaller: hash it, stream users past it
+        EXPECT_NE(explain("SELECT * FROM users JOIN orders ON users.id = orders.user_id;").find("build=right"),
+                  std::string::npos);
+        EXPECT_NE(explain("SELECT * FROM orders JOIN users ON users.id = orders.user_id;").find("build=left"),
+                  std::string::npos);
+        // A LEFT join always streams its left rows
+        EXPECT_NE(explain("SELECT * FROM orders LEFT JOIN users ON users.id = orders.user_id;").find("build=right"),
+                  std::string::npos);
     }
 
     TEST(ParserTest, BuildPhysicalPlanForJoinChoosesHashJoinForLargerInputs)
@@ -490,7 +485,9 @@ namespace sql
         auto plan = optimizer.BuildPhysicalPlan(stmt.get(), &catalog);
         auto explain = optimizer.ExplainPhysicalPlan(plan.get());
 
-        EXPECT_NE(explain.find("HashJoin(left=users, right=orders, on=users.id = orders.user_id"), std::string::npos);
+        EXPECT_NE(explain.find("HashJoin(type=INNER, right=orders, key=users.id = orders.user_id, build=right)"),
+                  std::string::npos)
+            << explain;
     }
 
     TEST(ParserTest, BuildPhysicalPlanForJoinAddsPushdownFilterOnSingleSidePredicate)
@@ -516,6 +513,363 @@ namespace sql
         EXPECT_NE(explain.find("Filter"), std::string::npos);
         EXPECT_NE(explain.find("NestedLoopJoin("), std::string::npos);
         EXPECT_NE(explain.find("SeqScan(table=orders)"), std::string::npos);
+    }
+
+    TEST(ParserTest, ParseTransactionStatements)
+    {
+        const std::vector<std::pair<std::string, TransactionStatement::Kind>> cases = {
+            {"BEGIN;", TransactionStatement::Kind::BEGIN},
+            {"begin transaction;", TransactionStatement::Kind::BEGIN},
+            {"COMMIT;", TransactionStatement::Kind::COMMIT},
+            {"COMMIT TRANSACTION;", TransactionStatement::Kind::COMMIT},
+            {"ROLLBACK;", TransactionStatement::Kind::ROLLBACK},
+            {"Rollback Transaction;", TransactionStatement::Kind::ROLLBACK},
+        };
+        for (const auto &[sql, kind] : cases)
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            ASSERT_NE(stmt, nullptr) << sql;
+            ASSERT_EQ(stmt->GetType(), StatementType::TRANSACTION_STMT) << sql;
+            EXPECT_EQ(static_cast<TransactionStatement *>(stmt.get())->kind, kind) << sql;
+        }
+    }
+
+    TEST(ParserTest, ParseTransactionRejectsTrailingTokens)
+    {
+        Lexer lexer("BEGIN WORK;");
+        Parser parser(lexer);
+        EXPECT_THROW(parser.ParseStatement(), std::runtime_error);
+    }
+
+    TEST(ParserTest, ParseNullAndIsNull)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a IS NULL OR b IS NOT NULL OR c = NULL;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        ASSERT_NE(select->where, nullptr);
+        // ((a IS NULL OR b IS NOT NULL) OR c = NULL)
+        auto *outer = static_cast<BinaryExpression *>(select->where.get());
+        ASSERT_EQ(outer->op, TokenType::OR);
+        auto *inner = static_cast<BinaryExpression *>(outer->left.get());
+        ASSERT_EQ(inner->left->GetType(), ExpressionType::IS_NULL);
+        EXPECT_FALSE(static_cast<IsNullExpression *>(inner->left.get())->negated);
+        ASSERT_EQ(inner->right->GetType(), ExpressionType::IS_NULL);
+        EXPECT_TRUE(static_cast<IsNullExpression *>(inner->right.get())->negated);
+        auto *eq = static_cast<BinaryExpression *>(outer->right.get());
+        ASSERT_EQ(eq->right->GetType(), ExpressionType::LITERAL);
+        EXPECT_TRUE(static_cast<LiteralExpression *>(eq->right.get())->value.IsNull());
+    }
+
+    TEST(ParserTest, NotBindsTighterThanAnd)
+    {
+        Lexer lexer("SELECT * FROM t WHERE NOT a = 1 AND b = 2;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        // (NOT (a = 1)) AND (b = 2)
+        auto *top = static_cast<BinaryExpression *>(select->where.get());
+        ASSERT_EQ(top->op, TokenType::AND);
+        ASSERT_EQ(top->left->GetType(), ExpressionType::UNARY_OP);
+        auto *not_expr = static_cast<UnaryExpression *>(top->left.get());
+        EXPECT_EQ(not_expr->op, TokenType::NOT);
+        EXPECT_EQ(not_expr->operand->GetType(), ExpressionType::BINARY_OP);
+    }
+
+    TEST(ParserTest, IsRequiresNull)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a IS 5;");
+        Parser parser(lexer);
+        EXPECT_THROW(parser.ParseStatement(), std::runtime_error);
+    }
+
+    TEST(ParserTest, ParseColumnConstraints)
+    {
+        Lexer lexer("CREATE TABLE t (id INTEGER PRIMARY KEY, email VARCHAR(20) NOT NULL UNIQUE, "
+                    "n INTEGER NULL DEFAULT -5, s VARCHAR(5) DEFAULT 'x', key INTEGER);");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *create = static_cast<CreateTableStatement *>(stmt.get());
+        ASSERT_EQ(create->columns.size(), 5u);
+        EXPECT_TRUE(create->columns[0].primary_key);
+        EXPECT_TRUE(create->columns[1].not_null);
+        EXPECT_TRUE(create->columns[1].unique);
+        EXPECT_FALSE(create->columns[2].not_null);
+        ASSERT_TRUE(create->columns[2].default_value.has_value());
+        EXPECT_EQ(create->columns[2].default_value->GetAsInt(), -5);
+        EXPECT_EQ(create->columns[3].default_value->GetAsString(), "x");
+        EXPECT_EQ(create->columns[4].name, "key"); // KEY is not reserved
+    }
+
+    TEST(ParserTest, ParseConstraintErrors)
+    {
+        for (const char *sql : {"CREATE TABLE t (id INTEGER PRIMARY);", "CREATE TABLE t (id INTEGER DEFAULT id);",
+                                "CREATE TABLE t (id INTEGER NOT 5);"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
+    }
+
+    TEST(ParserTest, ParseUniqueIndexAndInsertColumns)
+    {
+        {
+            Lexer lexer("CREATE UNIQUE INDEX idx ON t (c);");
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            ASSERT_EQ(stmt->GetType(), StatementType::CREATE_INDEX);
+            EXPECT_TRUE(static_cast<CreateIndexStatement *>(stmt.get())->unique);
+        }
+        {
+            Lexer lexer("INSERT INTO t (b, a) VALUES (1, 2), (3, 4);");
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            auto *insert = static_cast<InsertStatement *>(stmt.get());
+            EXPECT_EQ(insert->columns, (std::vector<std::string>{"b", "a"}));
+            EXPECT_EQ(insert->rows.size(), 2u);
+        }
+    }
+
+    TEST(ParserTest, ArithmeticPrecedence)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a + b * -c = 1 - 2 - 3;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_EQ(ExpressionToSQL(select->where.get()), "(a + (b * (-c))) = ((1 - 2) - 3)");
+    }
+
+    TEST(ParserTest, NegativeLiteralsAreFolded)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a = -5;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *eq = static_cast<BinaryExpression *>(static_cast<SelectStatement *>(stmt.get())->where.get());
+        ASSERT_EQ(eq->right->GetType(), ExpressionType::LITERAL);
+        EXPECT_EQ(static_cast<LiteralExpression *>(eq->right.get())->value.GetAsInt(), -5);
+    }
+
+    TEST(ParserTest, LikeInBetween)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a NOT LIKE 'x%' AND b IN (1, 2 + 3) AND c NOT BETWEEN 1 AND 2 + 1 OR d BETWEEN 0 AND 9;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_EQ(ExpressionToSQL(select->where.get()),
+                  "(((a NOT LIKE 'x%') AND (b IN (1, 2 + 3))) AND (c NOT BETWEEN 1 AND (2 + 1))) OR (d BETWEEN 0 AND 9)");
+    }
+
+    TEST(ParserTest, NotMustPrecedeLikeInOrBetween)
+    {
+        Lexer lexer("SELECT * FROM t WHERE a NOT = 1;");
+        Parser parser(lexer);
+        EXPECT_THROW(parser.ParseStatement(), std::runtime_error);
+    }
+
+    TEST(ParserTest, SelectItemsWithAliases)
+    {
+        Lexer lexer("SELECT a, b * 2 AS doubled, c total FROM t;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        ASSERT_EQ(select->items.size(), 3u);
+        EXPECT_TRUE(select->HasComputedItems());
+        EXPECT_TRUE(select->columns.empty());
+        EXPECT_EQ(select->items[0].alias, "");
+        EXPECT_EQ(select->items[1].alias, "doubled");
+        EXPECT_EQ(ExpressionToSQL(select->items[1].expr.get()), "b * 2");
+        EXPECT_EQ(select->items[2].alias, "total");
+    }
+
+    TEST(ParserTest, OrderByLimitOffsetDistinct)
+    {
+        Lexer lexer("SELECT DISTINCT a, b FROM t WHERE a > 1 ORDER BY b DESC, a + 1 ASC, 2 LIMIT 10 OFFSET 5;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_TRUE(select->distinct);
+        ASSERT_EQ(select->order_by.size(), 3u);
+        EXPECT_TRUE(select->order_by[0].descending);
+        EXPECT_FALSE(select->order_by[1].descending);
+        EXPECT_EQ(ExpressionToSQL(select->order_by[1].expr.get()), "a + 1");
+        ASSERT_TRUE(select->limit.has_value());
+        EXPECT_EQ(*select->limit, 10);
+        EXPECT_EQ(select->offset, 5);
+    }
+
+    TEST(ParserTest, LimitNeedsAnInteger)
+    {
+        for (const char *sql : {"SELECT * FROM t LIMIT -1;", "SELECT * FROM t LIMIT 'x';", "SELECT * FROM t ORDER a;"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
+    }
+
+    TEST(ParserTest, AggregatesGroupByHaving)
+    {
+        Lexer lexer("SELECT city, count(*), COUNT(DISTINCT age) AS n, Sum(age + 1) FROM p "
+                    "WHERE age > 1 GROUP BY city, age HAVING COUNT(*) > 1 ORDER BY n;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        ASSERT_EQ(select->items.size(), 4u);
+        EXPECT_EQ(ExpressionToSQL(select->items[1].expr.get()), "COUNT(*)");
+        EXPECT_EQ(ExpressionToSQL(select->items[2].expr.get()), "COUNT(DISTINCT age)");
+        EXPECT_EQ(select->items[2].alias, "n");
+        EXPECT_EQ(ExpressionToSQL(select->items[3].expr.get()), "SUM(age + 1)");
+        ASSERT_EQ(select->items[1].expr->GetType(), ExpressionType::AGGREGATE);
+        EXPECT_EQ(static_cast<AggregateExpression *>(select->items[1].expr.get())->argument, nullptr);
+        ASSERT_EQ(select->group_by.size(), 2u);
+        EXPECT_EQ(ExpressionToSQL(select->group_by[1].get()), "age");
+        ASSERT_NE(select->having, nullptr);
+        EXPECT_EQ(ExpressionToSQL(select->having.get()), "COUNT(*) > 1");
+        EXPECT_TRUE(ContainsAggregate(select->having.get()));
+        EXPECT_FALSE(ContainsAggregate(select->where.get()));
+        EXPECT_EQ(select->order_by.size(), 1u);
+    }
+
+    TEST(ParserTest, FunctionNamesAreNotReserved)
+    {
+        Lexer lexer("SELECT count, max FROM t GROUP BY count;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_EQ(select->columns, (std::vector<std::string>{"count", "max"}));
+    }
+
+    TEST(ParserTest, BadFunctionCalls)
+    {
+        for (const char *sql : {"SELECT SUM(*) FROM t;", "SELECT COUNT(DISTINCT *) FROM t;", "SELECT foo(a) FROM t;",
+                                "SELECT COUNT(a FROM t;", "SELECT a FROM t GROUP a;"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
+    }
+
+    TEST(ParserTest, ExpressionsEqualAndRewrite)
+    {
+        Lexer lexer("SELECT SUM(t.a + 1), SUM(a + 1), SUM(a + 1.5), a + 1 FROM t;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        auto strip = [](const std::string &n)
+        { return n.substr(n.find('.') == std::string::npos ? 0 : n.find('.') + 1); };
+        auto same = [&](const std::string &a, const std::string &b)
+        { return strip(a) == strip(b); };
+        const Expression *e0 = select->items[0].expr.get();
+        EXPECT_TRUE(ExpressionsEqual(e0, select->items[1].expr.get(), same));
+        EXPECT_FALSE(ExpressionsEqual(e0, select->items[2].expr.get(), same)); // 1 vs 1.5
+        EXPECT_FALSE(ExpressionsEqual(e0, select->items[3].expr.get(), same));
+
+        // Copy with every column reference renamed
+        auto copy = RewriteExpression(e0, [](const Expression *node) -> std::unique_ptr<Expression>
+                                      {
+            if (node->GetType() == ExpressionType::COLUMN_REF)
+                return std::make_unique<ColumnExpression>("x");
+            return nullptr; });
+        EXPECT_EQ(ExpressionToSQL(copy.get()), "SUM(x + 1)");
+        EXPECT_EQ(ExpressionToSQL(e0), "SUM(t.a + 1)"); // original untouched
+    }
+
+    TEST(ParserTest, LogicalPlanShowsAggregation)
+    {
+        Lexer lexer("SELECT city, COUNT(*) FROM p GROUP BY city HAVING COUNT(*) > 1;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        Optimizer optimizer;
+        auto explain = optimizer.ExplainLogicalPlan(optimizer.BuildLogicalPlan(stmt.get()).get());
+        EXPECT_NE(explain.find("Aggregate(group=[city])"), std::string::npos) << explain;
+        EXPECT_LT(explain.find("Filter"), explain.find("Aggregate")) << explain; // HAVING above
+    }
+
+    TEST(ParserTest, FromListWithAliasesAndJoinKinds)
+    {
+        Lexer lexer("SELECT e.name FROM emp AS e LEFT OUTER JOIN dept d ON e.dept = d.id AND d.open "
+                    "JOIN emp m ON m.id = e.mgr CROSS JOIN t, u x LEFT JOIN v ON TRUE;");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        EXPECT_EQ(select->table, "emp");
+        EXPECT_EQ(select->table_alias, "e");
+        ASSERT_EQ(select->joins.size(), 5u);
+        EXPECT_EQ(select->joins[0].type, JoinType::LEFT);
+        EXPECT_EQ(select->joins[0].right.Name(), "d");
+        EXPECT_EQ(ExpressionToSQL(select->joins[0].on.get()), "(e.dept = d.id) AND d.open");
+        EXPECT_EQ(select->joins[1].type, JoinType::INNER);
+        EXPECT_EQ(select->joins[1].right.table, "emp");
+        EXPECT_EQ(select->joins[1].right.alias, "m");
+        EXPECT_EQ(select->joins[2].type, JoinType::CROSS);
+        EXPECT_EQ(select->joins[2].on, nullptr);
+        EXPECT_EQ(select->joins[3].type, JoinType::CROSS); // comma
+        EXPECT_EQ(select->joins[3].right.Name(), "x");
+        EXPECT_EQ(select->joins[4].type, JoinType::LEFT);
+        EXPECT_EQ(select->joins[4].right.Name(), "v");
+    }
+
+    TEST(ParserTest, BadJoins)
+    {
+        for (const char *sql : {"SELECT * FROM a JOIN b;", "SELECT * FROM a LEFT JOIN b WHERE x = 1;",
+                                "SELECT * FROM a CROSS JOIN b ON a.x = b.x;", "SELECT * FROM a, a;",
+                                "SELECT * FROM a x JOIN b x ON TRUE;", "SELECT * FROM a LEFT b ON TRUE;",
+                                "SELECT * FROM a JOIN a ON TRUE;"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
+        // A table may appear twice under different names
+        Lexer lexer("SELECT * FROM a JOIN a b ON TRUE;");
+        Parser parser(lexer);
+        EXPECT_NO_THROW(parser.ParseStatement());
+    }
+
+    TEST(ParserTest, Subqueries)
+    {
+        Lexer lexer("SELECT name, (SELECT COUNT(*) FROM o WHERE o.cid = c.id) AS n FROM c "
+                    "WHERE id IN (SELECT cid FROM o) AND NOT EXISTS (SELECT 1 FROM b WHERE b.id = c.id) "
+                    "AND id NOT IN (SELECT x FROM y WHERE x IN (SELECT z FROM w));");
+        Parser parser(lexer);
+        auto stmt = parser.ParseStatement();
+        auto *select = static_cast<SelectStatement *>(stmt.get());
+        ASSERT_EQ(select->items[1].expr->GetType(), ExpressionType::SUBQUERY);
+        const auto *scalar = static_cast<const SubqueryExpression *>(select->items[1].expr.get());
+        EXPECT_EQ(scalar->kind, SubqueryExpression::Kind::SCALAR);
+        EXPECT_EQ(scalar->select->table, "o");
+        EXPECT_EQ(ExpressionToSQL(scalar), "(SELECT COUNT(*) FROM o WHERE o.cid = c.id)");
+        EXPECT_EQ(ExpressionToSQL(select->where.get()),
+                  "((id IN (SELECT cid FROM o)) AND (NOT (EXISTS (SELECT 1 FROM b WHERE b.id = c.id)))) AND "
+                  "(id NOT IN (SELECT x FROM y WHERE x IN (SELECT z FROM w)))");
+        // A subquery's body is its own query: its column references are not
+        // the outer query's children
+        EXPECT_TRUE(ExpressionChildren(scalar).empty());
+        EXPECT_FALSE(ContainsAggregate(scalar));
+
+        // Copies are deep, and the replacement reaches nested bodies
+        auto copy = RewriteExpression(select->where.get(), [](const Expression *node) -> std::unique_ptr<Expression>
+                                      {
+            if (node->GetType() == ExpressionType::COLUMN_REF &&
+                static_cast<const ColumnExpression *>(node)->name == "z")
+                return std::make_unique<ColumnExpression>("zz");
+            return nullptr; });
+        EXPECT_NE(ExpressionToSQL(copy.get()).find("IN (SELECT zz FROM w)"), std::string::npos);
+    }
+
+    TEST(ParserTest, BadSubqueries)
+    {
+        for (const char *sql : {"SELECT * FROM t WHERE x IN (SELECT y FROM u;", "SELECT * FROM t WHERE EXISTS SELECT 1;",
+                                "SELECT * FROM t WHERE x = SELECT y FROM u;", "SELECT * FROM t WHERE (SELECT y FROM u;"})
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            EXPECT_THROW(parser.ParseStatement(), std::runtime_error) << sql;
+        }
     }
 
 } // namespace sql

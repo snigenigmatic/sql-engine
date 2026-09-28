@@ -56,16 +56,42 @@ Add these in small PRs, each with parser tests plus `query_test` cases:
 2. **Constraints**: `PRIMARY KEY` (auto-creates a unique index), `NOT NULL`, `UNIQUE`, `DEFAULT`, and `INSERT INTO t(cols) VALUES`.
 3. **Expressions**: arithmetic in SELECT/WHERE/SET, column aliases (`AS`), `SELECT` of expressions, `LIKE`, `IN (...)` and `BETWEEN`. Generalize `SelectStatement::columns` from `vector<string>` to a vector of expressions.
 4. **ORDER BY / LIMIT / OFFSET / DISTINCT**: new `Sort` (external merge sort over temporary pages when the input exceeds the buffer), `Limit` and `Distinct` operators.
-5. **Aggregates**: `COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`, `HAVING` and a `HashAggregate` operator.
-6. **Joins**: `LEFT [OUTER] JOIN`, multi-way joins (more than two tables) and table aliases. Generalize `join_table` from `optional` to a join list.
-7. **Subqueries** (stretch goal): `IN (SELECT …)`, `EXISTS` and scalar subqueries.
+5. **Aggregates** (done): `COUNT/SUM/AVG/MIN/MAX`, `GROUP BY`, `HAVING` and a `HashAggregate` operator.
+   - Grouping is strict, as in PostgreSQL: every selected, HAVING or ORDER BY column must be grouped or aggregated.
+   - `SUM` of integers errors on `INTEGER` overflow, as SQLite does. `AVG` returns `FLOAT`.
+   - Groups and `DISTINCT` follow `=`, so NULLs group together and 1 = 1.0.
+6. **Joins** (done): `LEFT [OUTER] JOIN`, `CROSS JOIN` / comma joins, multi-way joins (more than two tables), arbitrary `ON` conditions and table aliases. `join_table` became a join list.
+   - Tables join left to right, in the order written; each step picks an index, hash or nested-loop join. M8.2 later made inner-join order cost-based.
+   - Single-table `WHERE` conditions are pushed below the joins, except onto the NULL-padded side of a LEFT JOIN or a table probed through its index.
+7. **Subqueries** (done): `IN (SELECT …)`, `EXISTS` and scalar subqueries, correlated or not.
+   - A subquery is planned and run when evaluated: its references to the enclosing row become literals, and results are cached per statement by those outer values.
+   - Not yet supported: correlated subqueries in the SELECT list, HAVING or ORDER BY of a grouped query, and decorrelation into joins.
 
 ## M8 — Usability & hardening
-- CLI: `sqlengine <file.db>`, multi-line input, `.tables` / `.schema` meta-commands and running a `.sql` script from a file or stdin.
-- Pretty table output with row count and timing.
-- `ANALYZE` for basic table stats (row count, distinct count), so the optimizer can choose join order and index vs. scan by cost.
-- CI additions: ASan/UBSan job, a sqllogictest-style golden test runner (`test/sql/*.test`) and a small benchmark.
-- Update `README.md` phases and `docs/design.md` as each milestone lands.
+Split into two PRs.
+
+**M8.1 (done):**
+- CLI:
+  - `sqlengine <file.db>` with multi-line input;
+  - `.tables`, `.schema`, `.read FILE`, `.timer` and `.save` dot commands;
+  - piped scripts (`sqlengine db < script.sql`) run without a banner or prompts.
+- Output:
+  - tables with each column sized to its values, numbers right-aligned, plus a row count and optional timing;
+  - floats printed as the shortest text that reads back as the same value (`0.1`, `2.0`).
+- The lexer accepts `''` inside string literals, so `.schema` output can be run again.
+- Tests:
+  - a sqllogictest-style golden test runner over `test/sql/*.test`;
+  - expected results cross-checked against SQLite, with the intentional differences noted in the files.
+- CI: an ASan/UBSan job and a Release (`-Wall -Wextra`) job, alongside Debug.
+
+**M8.2 (done):**
+- `ANALYZE [t]` records each table's row count and, per column, distinct non-NULL values, NULLs, min and max. The statistics are a `stats` row in the schema table, so they persist, roll back with a transaction and are dropped with the table.
+- The optimizer estimates selectivity and row counts from them (fixed defaults otherwise) and uses the estimates for:
+  - index vs. scan: a unique point lookup always uses its index, any other index only when it keeps at most 25% of the rows;
+  - join order: greedy, for inner/cross joins of three or more tables; a LEFT JOIN fixes the written order;
+  - the hash-join build side.
+- `EXPLAIN` shows `(~N rows)` per node; `.tables` marks analyzed tables.
+- The cost model is described in `docs/design.md` §3.5.
 
 ---
 
