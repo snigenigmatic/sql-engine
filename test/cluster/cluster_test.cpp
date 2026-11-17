@@ -115,7 +115,7 @@ namespace sql::cluster
                     options.shard_count = SHARDS;
                     options.replication_factor = 3;
                     options.heartbeat_ms = 50;
-                    options.election_timeout_ms = 300;
+                    options.election_timeout_ms = 1000; // shorter ones cause needless elections under sanitizers
                     coordinator_options_.push_back(options);
                     coordinator_addresses_.push_back(clients[id]);
                 }
@@ -149,7 +149,7 @@ namespace sql::cluster
                 options.directory = root_ + "/" + options.name;
                 options.coordinators = coordinator_addresses_;
                 options.heartbeat_ms = 50;
-                options.election_timeout_ms = 300;
+                options.election_timeout_ms = 1000; // shorter ones cause needless elections under sanitizers
                 node_options_.push_back(options);
                 nodes_.push_back(std::make_unique<StorageNode>(options));
                 nodes_.back()->Start();

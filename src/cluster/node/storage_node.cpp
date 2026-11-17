@@ -192,8 +192,8 @@ namespace sql::cluster
             ReplicatedShard *replica = Replica(shard);
             if (!replica)
                 return Failure("no replica of shard " + std::to_string(shard) + " here");
-            if (method == "write")
-                return replica->Write(arguments[2]);
+            if (method == "write") // the coordinator's request id makes retries safe
+                return replica->Write(arguments[2], arguments.size() > 3 ? arguments[3] : "");
             if (method == "read")
                 return replica->Read(arguments[2]);
             return Failure("unknown call " + method);

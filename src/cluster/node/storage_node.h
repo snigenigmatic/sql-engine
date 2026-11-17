@@ -18,7 +18,8 @@ namespace sql::cluster
     // protocol's CALLs:
     //
     //   ensure_replica  epoch, shard, members ("id@host:port,...")
-    //   write           epoch, shard, sql   (on the shard's leader)
+    //   write           epoch, shard, sql, request id (on the shard's
+    //                   leader; a retry with the same id applies once)
     //   read            epoch, shard, sql   (linearizable, on the leader)
     //
     // A request carrying an older epoch than one already seen is refused:

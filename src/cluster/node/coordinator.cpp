@@ -248,10 +248,19 @@ namespace sql::cluster
 
     ExecutionResult Coordinator::MetaWrite(const std::string &sql)
     {
-        ExecutionResult result = metadata_->Write(sql);
-        if (!result.success && IsUnavailable(result.message))
-            throw std::runtime_error("metadata unavailable: " + result.message);
-        return result;
+        // An uncertain failure (a leader change cancelled the request) is
+        // retried with the same request id, which applies at most once
+        const std::string id = ReplicatedShard::NewRequestId();
+        const auto deadline = Clock::now() + std::chrono::milliseconds(options_.election_timeout_ms * 6 + 2000);
+        for (;;)
+        {
+            ExecutionResult result = metadata_->Write(sql, id);
+            if (result.success || !IsUnavailable(result.message))
+                return result;
+            if (!IsLeader() || Clock::now() >= deadline)
+                throw std::runtime_error("metadata unavailable: " + result.message);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
 
     ExecutionResult Coordinator::MetaRead(const std::string &sql)
@@ -420,6 +429,9 @@ namespace sql::cluster
     {
         const auto deadline = Clock::now() + std::chrono::milliseconds(options_.election_timeout_ms * 6 + 2000);
         std::string last_error = "no replica of shard " + std::to_string(shard) + " answered";
+        // One id for every attempt: a write retried after an uncertain
+        // failure applies at most once
+        const std::string request_id = method == "write" ? ReplicatedShard::NewRequestId() : "";
         int hint = -1;
         while (Clock::now() < deadline)
         {
@@ -439,7 +451,10 @@ namespace sql::cluster
                 ExecutionResult result;
                 try
                 {
-                    result = connection->Call(method, {std::to_string(view_.epoch), std::to_string(shard), sql});
+                    std::vector<std::string> arguments = {std::to_string(view_.epoch), std::to_string(shard), sql};
+                    if (!request_id.empty())
+                        arguments.push_back(request_id);
+                    result = connection->Call(method, arguments);
                 }
                 catch (const std::exception &e)
                 {

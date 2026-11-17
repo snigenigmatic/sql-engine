@@ -163,6 +163,11 @@ Status: D0–D4 are done; the rest is a proposal. It starts from `master` at 9d6
 - **Exactly-once apply:** the last applied log index is stored in a `__raft_meta` table, committed in the same local transaction as the statement. After a restart, NuRaft replays from `last_applied + 1`.
   - `__raft_meta` is a *system table*, created with `Catalog::CreateTable(…, system=true)`. The executor refuses SQL that would change any table with a reserved `__` name (INSERT, UPDATE, DELETE, DROP, CREATE INDEX), so a client can't corrupt replication; it can still read them.
   - A statement that fails, fails identically on every replica; its index is recorded all the same. `BEGIN`/`COMMIT`/`ROLLBACK` sent to a shard are refused (transactions are D6).
+- **Idempotent writes (request ids):** a write that fails with "not committed" has an *unknown* outcome.
+  - NuRaft cancels in-flight requests when leadership changes, yet the new leader may still commit them.
+  - So every write carries a request id, and the replica records each id with its outcome in the `__raft_requests` system table, in the same local transaction as the write.
+  - A retry with the same id returns the first outcome instead of applying again. The ledger keeps the last 10,000 log entries' ids, so retries must come within that window.
+  - Found when a sanitizer CI run on a loaded runner had a write cancelled by a needless election.
 - **Snapshots:**
   - Created with `Database::Checkpoint()` at exactly the snapshot's index, then copying `shard.db` to `snapshots/<index>.db` (plus NuRaft's metadata in `<index>.meta`).
   - Shipped in chunks (1 MiB by default) through NuRaft's snapshot API (`read_logical_snp_obj` / `save_logical_snp_obj`).
