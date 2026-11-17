@@ -13,7 +13,11 @@ if(SQLENGINE_DISTRIBUTED)
         raft/memory_log_store.cpp
         raft/memory_state_manager.cpp
         raft/raft_logger.cpp
+        shard/file_log_store.cpp
+        shard/file_state_manager.cpp
+        shard/shard_state_machine.cpp
+        shard/replicated_shard.cpp
     )
 
-    target_link_libraries(cluster PUBLIC nuraft ring common)
+    target_link_libraries(cluster PUBLIC nuraft ring net session catalog parser lexer common)
 endif()

@@ -171,6 +171,32 @@ namespace sql
         if (!stmt)
             return {false, "Null statement", {}, {}};
 
+        // Tables with reserved names belong to the engine (e.g. a shard's
+        // __raft_meta): SQL may read them, not change them
+        const std::string *target = nullptr;
+        switch (stmt->GetType())
+        {
+        case StatementType::INSERT:
+            target = &static_cast<InsertStatement *>(stmt)->table;
+            break;
+        case StatementType::DELETE_STMT:
+            target = &static_cast<DeleteStatement *>(stmt)->table;
+            break;
+        case StatementType::UPDATE_STMT:
+            target = &static_cast<UpdateStatement *>(stmt)->table;
+            break;
+        case StatementType::CREATE_INDEX:
+            target = &static_cast<CreateIndexStatement *>(stmt)->table;
+            break;
+        case StatementType::DROP_TABLE:
+            target = &static_cast<DropTableStatement *>(stmt)->table;
+            break;
+        default:
+            break;
+        }
+        if (target && target->rfind(Catalog::RESERVED_PREFIX, 0) == 0)
+            return {false, "Table '" + *target + "' belongs to the engine and cannot be changed", {}, {}};
+
         switch (stmt->GetType())
         {
         case StatementType::SELECT:

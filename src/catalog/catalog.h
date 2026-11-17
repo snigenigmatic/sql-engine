@@ -64,7 +64,9 @@ namespace sql
         // Create a new table in the catalog, with a unique index for each
         // PRIMARY KEY / UNIQUE column. Returns false if it already exists;
         // throws std::invalid_argument for a reserved name.
-        bool CreateTable(const std::string &name, const Schema &schema);
+        // `system` allows a reserved name (RESERVED_PREFIX): a table the
+        // engine keeps for itself, which SQL can read but not change
+        bool CreateTable(const std::string &name, const Schema &schema, bool system = false);
 
         // Drop a table from the catalog
         bool DropTable(const std::string &name);

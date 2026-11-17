@@ -612,9 +612,9 @@ namespace sql
         return true;
     }
 
-    bool Catalog::CreateTable(const std::string &name, const Schema &schema)
+    bool Catalog::CreateTable(const std::string &name, const Schema &schema, bool system)
     {
-        if (name.rfind(RESERVED_PREFIX, 0) == 0)
+        if (!system && name.rfind(RESERVED_PREFIX, 0) == 0)
         {
             throw std::invalid_argument("Table name '" + name + "' is reserved (names may not start with '" +
                                         RESERVED_PREFIX + "')");

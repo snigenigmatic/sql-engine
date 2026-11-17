@@ -1,6 +1,6 @@
 # Distributed sql-engine — design and build plan
 
-Status: D0–D2 are done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
+Status: D0–D3 are done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
 
 **Decisions already made**
 - **Raft:** use the NuRaft library rather than writing our own.
@@ -121,20 +121,32 @@ Status: D0–D2 are done; the rest is a proposal. It starts from `master` at 9d6
 ### 4.5 `src/cluster/shard`: a replicated shard on NuRaft
 - **One NuRaft `raft_server` per shard replica.**
   - Ports: `20000 + shard_id` on each pod. NuRaft listens per server, so a pod opens about 16 ports, which is fine at this scale.
-  - Log store: a file-backed `log_store` under `/data/raft/shard-N/`.
+  - Log store (D3, `FileLogStore`): one file, `<replica dir>/log`. It holds a header with the start index, then `u32 size | u32 crc32 | entry` records.
+    - It is fsynced at the end of each append batch, which is before NuRaft acknowledges entries.
+    - Any change of start index (compaction, or restarting at an index it doesn't hold) rewrites the file under a temporary name and renames it into place, so the start index and the entries can't disagree after a crash.
+    - On open, a torn or corrupt tail is cut off.
+  - Vote, term and membership: `FileStateManager` keeps them in `state` and `config`, each replaced atomically.
+  - Bootstrap: every replica of a shard starts with the same member list and they elect a leader among themselves (`ReplicatedShard`).
 - **State machine (`ShardStateMachine::commit`):** each log entry is one shard-local command.
-  - `Exec{sql}` runs a single-shard write.
+  - `Exec{sql}` runs a single-shard write (D3). A `Barrier` entry applies nothing (see Reads).
   - `Prepare{txid, [sql…]}`, `Commit{txid}` and `Abort{txid}` carry 2PC.
   - `Ddl{sql, schema_version}` applies a schema change.
 - **Statement-based replication:**
   - The coordinator rewrites each statement into shard-local SQL whose literals are fully bound, using the existing subquery binding in `BindOuterReferences` (`src/optimizer/optimizer.h`).
   - Each replica runs the statement through its own `Session` on `shard-N.db`, in log order. Because the engine is deterministic, all replicas reach the same state.
 - **Exactly-once apply:** the last applied log index is stored in a `__raft_meta` table, committed in the same local transaction as the statement. After a restart, NuRaft replays from `last_applied + 1`.
+  - `__raft_meta` is a *system table*, created with `Catalog::CreateTable(…, system=true)`. The executor refuses SQL that would change any table with a reserved `__` name (INSERT, UPDATE, DELETE, DROP, CREATE INDEX), so a client can't corrupt replication; it can still read them.
+  - A statement that fails, fails identically on every replica; its index is recorded all the same. `BEGIN`/`COMMIT`/`ROLLBACK` sent to a shard are refused (transactions are D6).
 - **Snapshots:**
-  - Created with `Database::Checkpoint()`, then shipping the `.db` file in chunks through NuRaft's snapshot API (`read_logical_snp_obj` / `save_logical_snp_obj`).
-  - Used for catching up a new replica and for compacting the log.
-- **Reads:**
-  - They run on the leader only, inside its lease (NuRaft's `leadership_expiry`), under the shard mutex.
+  - Created with `Database::Checkpoint()` at exactly the snapshot's index, then copying `shard.db` to `snapshots/<index>.db` (plus NuRaft's metadata in `<index>.meta`).
+  - Shipped in chunks (1 MiB by default) through NuRaft's snapshot API (`read_logical_snp_obj` / `save_logical_snp_obj`).
+  - The first chunk carries the file's size and CRC32. The receiver installs only an intact copy; otherwise the install fails and the leader sends it again. This was added after a test showed that a truncated transfer crashed the replica on open.
+  - Used for catching up a new or wiped replica and for compacting the log.
+- **Reads (D3):** they run on the leader only, after a **read barrier**. The leader commits a no-op `Barrier` entry through the log, then reads its own data.
+  - The barrier committing proves the leader still led after the read arrived, so the read sees every earlier commit (linearizable). It is the idea behind Raft's ReadIndex, and needs no clocks.
+  - A leader lease (NuRaft's `leadership_expiry`) was the first idea. But NuRaft only checks it on its heartbeat timer, which bounds staleness by timing rather than ruling it out.
+  - A leader cut off from its quorum refuses reads.
+  - The barrier costs one replication round per read. A lease could be added later as an optimization for reads that can tolerate the timing assumption.
   - The engine allows one connection per file. So applying log entries and serving reads share one `Session`, taking turns under a mutex; reads never see half-applied state.
   - A non-leader answers `NotLeader{hint}`.
 
@@ -242,7 +254,7 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 | D0 ✅ | **Dependencies and layout.** Pull NuRaft and standalone asio in via CMake `FetchContent`, add the `src/cluster` module (`src/net` and `src/distributed` arrive with their first code in D1 and D5) | Builds on CI, single-node tests unchanged |
 | D1 ✅ | **Server mode.** The wire protocol, a single-node `sqlnode` with one `Session` per connection (serialized), and the CLI's `--connect` | The golden runner passes against a server over TCP |
 | D2 ✅ | **Rings and placement.** The `ring` library, the metadata model, and the `SHARD BY` / `REPLICATED` syntax | Unit tests for spread, minimal movement and placement |
-| D3 | **One replicated shard.** The NuRaft state machine on `Database`, the log store, snapshots and exactly-once apply | An in-process 3-replica test: kill the leader, keep writing, restart, catch up, install a snapshot, same `.db` contents on every replica |
+| D3 ✅ | **One replicated shard.** The NuRaft state machine on `Database`, the log store, snapshots and exactly-once apply | An in-process 3-replica test: kill the leader, keep writing, restart, catch up, install a snapshot, same `.db` contents on every replica |
 | D4 | **The metadata group and cluster.** The coordinators' Raft group, node join, shard bootstrap, DDL fan-out, epochs | An in-process cluster of 3 coordinators and 3 nodes boots, then `CREATE TABLE`/`INSERT`/`SELECT` work |
 | D5 | **Distributed queries.** Pruning, scatter-gather, pushdown, partial aggregates, co-located and broadcast joins, gathering, distributed `EXPLAIN` | Every `test/sql/*.test` gives the same rows on the cluster; `EXPLAIN` tests show pruning and pushdown |
 | D6 | **2PC.** Prepare, decide and commit over Raft, the transaction table, recovery, shard locks with no-wait retry | A bank-transfer test keeps total money constant while leaders and coordinators are killed |

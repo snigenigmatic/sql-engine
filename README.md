@@ -241,7 +241,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
   - [x] D0: NuRaft and asio in the build; Raft replication, leader failover and several Raft groups per process verified
   - [x] D1: Server mode and wire protocol (`sqlnode`, `sqlengine --connect`)
   - [x] D2: Hash rings and replica placement; `SHARD BY HASH(col)` / `REPLICATED` syntax
-  - [ ] D3: A Raft-replicated shard
+  - [x] D3: A Raft-replicated shard (durable Raft log, exactly-once apply, snapshots, linearizable reads)
   - [ ] D4: Metadata Raft group and cluster bootstrap
   - [ ] D5: Distributed queries
   - [ ] D6: Two-phase commit across shards
