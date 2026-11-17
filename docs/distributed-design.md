@@ -138,9 +138,9 @@ Status: D0–D5 are done; the rest is a proposal. It starts from `master` at 9d6
 - **UPDATE and DELETE** go to every shard, and the row counts are summed. Changing a hash table's shard key is refused; subqueries in them wait for D5.
 - **SELECT and EXPLAIN:** the tables the statement names are gathered from the shards into an in-memory database with the full schema, which runs the statement. That is correct for every query but moves whole tables; D5 adds pruning and pushdown.
 - **Known limits until later milestones:**
-  - a write that spans shards is not atomic: rows already sent stay if a later shard fails (D6, 2PC);
+  - ~~a write that spans shards is not atomic~~ (D6: it is);
   - `UNIQUE` on a column other than the shard key is enforced per shard only;
-  - `BEGIN`/`COMMIT` are refused (D6);
+  - ~~`BEGIN`/`COMMIT` are refused~~ (D6: distributed transactions, §4.7);
   - nodes that join after formation get no replicas (D8);
   - coordinator operations run one at a time.
 
@@ -162,7 +162,7 @@ Status: D0–D5 are done; the rest is a proposal. It starts from `master` at 9d6
   - Each replica runs the statement through its own `Session` on `shard-N.db`, in log order. Because the engine is deterministic, all replicas reach the same state.
 - **Exactly-once apply:** the last applied log index is stored in a `__raft_meta` table, committed in the same local transaction as the statement. After a restart, NuRaft replays from `last_applied + 1`.
   - `__raft_meta` is a *system table*, created with `Catalog::CreateTable(…, system=true)`. The executor refuses SQL that would change any table with a reserved `__` name (INSERT, UPDATE, DELETE, DROP, CREATE INDEX), so a client can't corrupt replication; it can still read them.
-  - A statement that fails, fails identically on every replica; its index is recorded all the same. `BEGIN`/`COMMIT`/`ROLLBACK` sent to a shard are refused (transactions are D6).
+  - A statement that fails, fails identically on every replica; its index is recorded all the same. `BEGIN`/`COMMIT`/`ROLLBACK` sent to a shard are refused: transactions are log entries of their own (§4.7).
 - **Idempotent writes (request ids):** a write that fails with "not committed" has an *unknown* outcome.
   - NuRaft cancels in-flight requests when leadership changes, yet the new leader may still commit them.
   - So every write carries a request id, and the replica records each id with its outcome in the `__raft_requests` system table, in the same local transaction as the write.
@@ -214,7 +214,7 @@ Status: D0–D5 are done; the rest is a proposal. It starts from `master` at 9d6
   - `EXISTS` becomes `TRUE`/`FALSE`.
   - `IN (SELECT …)` becomes an `IN` list, and over no rows `FALSE` (`NOT IN`: `TRUE`).
   - The statement then goes to every shard. Subqueries that refer to the row being changed are refused.
-- **The golden SQL files also run on an in-process cluster** (`sql_logic_test`, `Cluster` mode) and give the single-node rows, except `transactions.test`, which is skipped until D6.
+- **The golden SQL files also run on an in-process cluster** (`sql_logic_test`, `Cluster` mode) and give the single-node rows; since D6 that includes `transactions.test`.
 - **Not done (yet):**
   - projection pushdown;
   - `GROUP BY` pushdown (grouping by the shard key could run per shard);
@@ -222,7 +222,21 @@ Status: D0–D5 are done; the rest is a proposal. It starts from `master` at 9d6
   - float sums can differ from a single node in the last digits, because the cluster adds in a different order;
   - a single shard's partial integer `SUM` can overflow even when the total would not.
 
-### 4.7 `src/distributed/txn`: two-phase commit over Raft groups
+### 4.7 Two-phase commit over Raft groups
+
+**As built (D6).** It differs from the plan below where noted; the code is in `ShardStateMachine` (the participant) and `Coordinator` (the coordinator).
+- **Interactive, not buffered:** each statement of a transaction runs on its shards at once, as a `Txn{exec, txid, sql}` log entry. The replica keeps its own database transaction open across entries, so the transaction **reads its own writes** (its reads carry the txid), and statements fail at once with single-node errors (`UNIQUE`, `NOT NULL`, …).
+  - A statement that fails on one shard is undone on the others (`Txn{undo}` rolls back to a savepoint taken before the statement), so statements stay atomic inside a transaction and the transaction stays open, as on a single node.
+- **Shard locks:** while a transaction is open on a shard, every other write and every read outside that transaction is refused with "locked by another transaction". The coordinator undoes the statement, waits (backing off, with the operation lock released) and retries, up to `lock_timeout_ms` (5 s). A timed-out statement fails; an explicit transaction stays open, and the client decides. Two transactions waiting on each other both time out (no deadlock detection yet).
+  - Reads in a transaction lock nothing, so isolation is *read committed* for shards the transaction has not written, and serializable for those it has.
+  - An `UPDATE`/`DELETE` that changed no row on a shard lets go of that shard at once, so a transaction only locks the shards it really wrote.
+- **Statements outside `BEGIN`:** one shard → a plain write. More than one (multi-row `INSERT`, `UPDATE`, `DELETE`, DDL, `ANALYZE`) → an implicit transaction committed with 2PC, so **every statement is atomic across shards**.
+- **DDL** runs on every shard inside the transaction; the metadata (`tables`, `ddl`, `shard_ddl`) changes with the commit decision. Inside `BEGIN`, a new table is visible to the transaction only, and `ROLLBACK` takes it away.
+- **COMMIT:** one participant → `Txn{commit}` is the decision. Several → `Txn{prepare}` on each (a prepared shard takes no more statements), then the decision is one all-or-nothing metadata batch (`INSERT INTO txns (id, 'committed')` plus any schema changes), then `Txn{commit}` on each, then the `txns` row is deleted.
+- **Recovery (presumed abort):** a new leader asks every shard which transaction it has open (`txn_status`). One that no client session owns is looked up in `txns`: committed → commit it; otherwise it inserts `(id, 'aborted')` first (the primary key makes a late commit from the old leader lose) and aborts it. Shards a leader could not reach or settle are retried every second. A client that disconnects mid-transaction is rolled back at once.
+- **Replica restarts:** an open transaction is never committed locally, so `__raft_meta` still points before it. Replaying the log reopens it, prepared or not, exactly as it was. Snapshots are refused while a transaction is open (the database file would not contain it).
+
+**The original plan:**
 - **Statements:** an auto-commit statement that touches 1 shard → a single `Exec` entry, with no 2PC.
 - **Transactions:** in `BEGIN … COMMIT`, the coordinator buffers each shard's rewritten writes.
   - Reads inside the transaction run against committed data.
@@ -312,7 +326,7 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 | D3 ✅ | **One replicated shard.** The NuRaft state machine on `Database`, the log store, snapshots and exactly-once apply | An in-process 3-replica test: kill the leader, keep writing, restart, catch up, install a snapshot, same `.db` contents on every replica |
 | D4 ✅ | **The metadata group and cluster.** The coordinators' Raft group, node join, shard bootstrap, DDL fan-out, epochs | An in-process cluster of 3 coordinators and 3 nodes boots, then `CREATE TABLE`/`INSERT`/`SELECT` work |
 | D5 ✅ | **Distributed queries.** Pruning, scatter-gather, pushdown, partial aggregates, co-located and broadcast joins, gathering, distributed `EXPLAIN` | Every `test/sql/*.test` gives the same rows on the cluster; `EXPLAIN` tests show pruning and pushdown |
-| D6 | **2PC.** Prepare, decide and commit over Raft, the transaction table, recovery, shard locks with no-wait retry | A bank-transfer test keeps total money constant while leaders and coordinators are killed |
+| D6 ✅ | **2PC.** Prepare, decide and commit over Raft, the transaction table, recovery, shard locks with no-wait retry | A bank-transfer test keeps total money constant while leaders and coordinators are killed |
 | D7 | **Kubernetes.** The `Dockerfile`, the manifests, `up.sh`/`chaos.sh`, probes | On minikube: golden tests pass, and pass again under the `chaos.sh` loop |
 | D8 | **Rebalancing.** Join, decommission, re-replication after `down`; `SHOW CLUSTER`/`SHOW SHARDS` | Adding a 4th node moves about 1/4 of the replicas with no errors, and killing a node permanently restores the replication factor to 3 |
 

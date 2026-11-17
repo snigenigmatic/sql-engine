@@ -10,6 +10,7 @@
 #include "session/session.h"
 #include <algorithm>
 #include <chrono>
+#include <random>
 #include <set>
 
 namespace sql::cluster
@@ -74,6 +75,14 @@ namespace sql::cluster
             return false;
         }
 
+        // A shard refused: another transaction holds it (wait and retry)
+        bool IsBusy(const ExecutionResult &result)
+        {
+            return !result.success && result.message.find("locked by another transaction") != std::string::npos;
+        }
+
+        const char *const KEPT_OPEN = " (statement rolled back; transaction still open)";
+
         std::unique_ptr<Statement> ParseOne(const std::string &sql, std::string *error)
         {
             try
@@ -103,22 +112,60 @@ namespace sql::cluster
         {
         public:
             explicit ClusterConnection(Coordinator *coordinator) : coordinator_(coordinator) {}
+            ~ClusterConnection() override { coordinator_->Abandon(&txn_); }
 
             ExecutionResult Execute(const std::string &sql) override
             {
-                if (coordinator_->IsLeader())
-                    return coordinator_->Execute(sql);
-                try
+                // During an election there is no leader for a moment: wait
+                // for the next one rather than fail at once
+                const auto deadline = Clock::now() + std::chrono::milliseconds(coordinator_->ElectionWaitMs());
+                for (;;)
                 {
-                    if (auto *leader = Leader())
-                        return leader->Execute(sql);
+                    // A transaction lives on one leader; never let a later
+                    // statement of it run elsewhere as a statement of its own
+                    if (forward_ && forward_->InTransaction() &&
+                        (coordinator_->IsLeader() || coordinator_->LeaderAddress() != forward_address_))
+                    {
+                        forward_.reset();
+                        return Failure("the transaction was rolled back: the leading coordinator changed");
+                    }
+                    if (coordinator_->IsLeader())
+                        return coordinator_->Execute(sql, &txn_);
+                    if (txn_.Open())
+                    {
+                        // Its shards are rolled back by the next leader
+                        txn_ = Coordinator::Transaction();
+                        return Failure("the transaction was rolled back: the coordinator lost the leadership");
+                    }
+                    net::RemoteConnection *leader = nullptr;
+                    try
+                    {
+                        leader = Leader();
+                    }
+                    catch (const std::exception &)
+                    {
+                        forward_.reset(); // not reached: nothing was sent
+                    }
+                    if (leader)
+                    {
+                        const bool in_transaction = leader->InTransaction();
+                        try
+                        {
+                            return leader->Execute(sql);
+                        }
+                        catch (const std::exception &e)
+                        {
+                            forward_.reset();
+                            return Failure(std::string("lost the leading coordinator (the statement's outcome is "
+                                                       "unknown") +
+                                           (in_transaction ? "; the transaction was rolled back" : "") +
+                                           "): " + e.what());
+                        }
+                    }
+                    if (Clock::now() >= deadline)
+                        return Failure("no coordinator is leading right now; try again shortly");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
-                catch (const std::exception &e)
-                {
-                    forward_.reset();
-                    return Failure(std::string("lost the leading coordinator: ") + e.what());
-                }
-                return Failure("no coordinator is leading right now; try again shortly");
             }
 
             std::vector<ExecutionResult> ExecuteScript(const std::string &sql, bool stop_on_error) override
@@ -133,7 +180,12 @@ namespace sql::cluster
                 return results;
             }
 
-            bool InTransaction() override { return false; }
+            bool InTransaction() override
+            {
+                if (txn_.Open())
+                    return true;
+                return !coordinator_->IsLeader() && forward_ && forward_->InTransaction();
+            }
 
             std::string Command(const std::string &name, const std::string &argument) override
             {
@@ -176,6 +228,7 @@ namespace sql::cluster
             Coordinator *coordinator_;
             std::unique_ptr<net::RemoteConnection> forward_;
             std::string forward_address_;
+            Coordinator::Transaction txn_;
         };
     } // namespace
 
@@ -246,7 +299,7 @@ namespace sql::cluster
         }
     }
 
-    ExecutionResult Coordinator::MetaWrite(const std::string &sql)
+    ExecutionResult Coordinator::MetaWrite(const std::string &sql, bool batch)
     {
         // An uncertain failure (a leader change cancelled the request) is
         // retried with the same request id, which applies at most once
@@ -254,7 +307,7 @@ namespace sql::cluster
         const auto deadline = Clock::now() + std::chrono::milliseconds(options_.election_timeout_ms * 6 + 2000);
         for (;;)
         {
-            ExecutionResult result = metadata_->Write(sql, id);
+            ExecutionResult result = batch ? metadata_->WriteBatch(sql, id) : metadata_->Write(sql, id);
             if (result.success || !IsUnavailable(result.message))
                 return result;
             if (!IsLeader() || Clock::now() >= deadline)
@@ -288,6 +341,8 @@ namespace sql::cluster
                  })
                 MetaWrite(ddl);
         }
+        if (!MetaRead("SELECT COUNT(*) FROM txns;").success)
+            MetaWrite("CREATE TABLE txns (id VARCHAR(300) PRIMARY KEY, state VARCHAR(20));");
         if (MetaRead("SELECT COUNT(*) FROM cluster;").tuples.at(0).GetValue(0).GetAsInt() == 0)
             MetaWrite("INSERT INTO cluster VALUES (" + std::to_string(options_.shard_count) + ", " +
                       std::to_string(options_.replication_factor) + ", 0, FALSE);");
@@ -297,6 +352,13 @@ namespace sql::cluster
         shard_leaders_.clear();
         ensured_.clear();
         last_full_ensure_ = {};
+        // Whatever an earlier term left open on the shards is settled anew
+        active_txns_.clear();
+        waits_for_.clear();
+        unsettled_.clear();
+        for (uint32_t s = 0; s < options_.shard_count; ++s)
+            unsettled_.insert(s);
+        last_recover_ = {};
         Load();
         was_leader_ = true;
     }
@@ -340,6 +402,11 @@ namespace sql::cluster
         if (force)
             last_full_ensure_ = Clock::now();
         CatchUpDdl();
+        if (!unsettled_.empty() && Clock::now() - last_recover_ > std::chrono::seconds(1))
+        {
+            last_recover_ = Clock::now();
+            Recover();
+        }
     }
 
     void Coordinator::Form()
@@ -425,15 +492,31 @@ namespace sql::cluster
         }
     }
 
-    ExecutionResult Coordinator::ShardCall(uint32_t shard, const std::string &method, const std::string &sql)
+    ExecutionResult Coordinator::ShardCall(uint32_t shard, const std::string &method, const std::string &sql,
+                                           const std::string &op, const std::string &txid, int timeout_ms)
     {
         if (method == "read")
             ++shard_reads_;
-        const auto deadline = Clock::now() + std::chrono::milliseconds(options_.election_timeout_ms * 6 + 2000);
+        const auto deadline = Clock::now() + std::chrono::milliseconds(
+                                                 timeout_ms > 0 ? timeout_ms : options_.election_timeout_ms * 6 + 2000);
         std::string last_error = "no replica of shard " + std::to_string(shard) + " answered";
         // One id for every attempt: a write retried after an uncertain
         // failure applies at most once
-        const std::string request_id = method == "write" ? ReplicatedShard::NewRequestId() : "";
+        const std::string request_id =
+            method == "write" || method == "txn" ? ReplicatedShard::NewRequestId() : "";
+        std::vector<std::string> call = {std::to_string(shard)};
+        if (method == "txn")
+            call.insert(call.end(), {op, txid, sql, request_id});
+        else if (method == "txn_status")
+            call.push_back("-");
+        else
+        {
+            call.push_back(sql);
+            if (method == "write")
+                call.push_back(request_id);
+            else if (txn_ && txn_->Open())
+                call.push_back(txn_->id); // a read sees its transaction's changes
+        }
         int hint = -1;
         while (Clock::now() < deadline)
         {
@@ -453,9 +536,8 @@ namespace sql::cluster
                 ExecutionResult result;
                 try
                 {
-                    std::vector<std::string> arguments = {std::to_string(view_.epoch), std::to_string(shard), sql};
-                    if (!request_id.empty())
-                        arguments.push_back(request_id);
+                    std::vector<std::string> arguments = {std::to_string(view_.epoch)};
+                    arguments.insert(arguments.end(), call.begin(), call.end());
                     result = connection->Call(method, arguments);
                 }
                 catch (const std::exception &e)
@@ -519,7 +601,51 @@ namespace sql::cluster
         Session session(db.get());
         for (const auto &[seq, statement] : view_.ddl)
             session.Execute(statement);
+        if (txn_)
+            for (const auto &statement : txn_->ddl)
+                session.Execute(statement);
         return db;
+    }
+
+    Coordinator::TableInfo Coordinator::DescribeTable(const std::string &sql, const CreateTableStatement &create)
+    {
+        std::string kind = "row", column;
+        if (create.distribution == TableDistribution::REPLICATED)
+            kind = "replicated";
+        else if (create.distribution == TableDistribution::HASH)
+            kind = "hash", column = create.shard_column;
+        else
+        {
+            for (const auto &col : create.columns)
+                if (col.primary_key)
+                    kind = "hash", column = col.name;
+        }
+        return TableInfo{create.table, sql, kind, column};
+    }
+
+    const std::map<std::string, Coordinator::TableInfo> &Coordinator::Tables()
+    {
+        if (!txn_ || txn_->ddl.empty())
+            return view_.tables;
+        // Built once per change, so references into it stay valid
+        const std::string key = txn_->id + "#" + std::to_string(txn_->ddl.size()) + "#" + std::to_string(view_.ddl.size());
+        if (key == overlay_key_)
+            return overlay_tables_;
+        overlay_key_ = key;
+        overlay_tables_ = view_.tables;
+        for (const auto &statement : txn_->ddl)
+        {
+            std::string error;
+            auto stmt = ParseOne(statement, &error);
+            if (stmt && stmt->GetType() == StatementType::CREATE_TABLE)
+            {
+                const auto *create = static_cast<const CreateTableStatement *>(stmt.get());
+                overlay_tables_[create->table] = DescribeTable(statement, *create);
+            }
+            else if (stmt && stmt->GetType() == StatementType::DROP_TABLE)
+                overlay_tables_.erase(static_cast<const DropTableStatement *>(stmt.get())->table);
+        }
+        return overlay_tables_;
     }
 
     bool Coordinator::Formed()
@@ -588,85 +714,537 @@ namespace sql::cluster
         return Success(std::to_string(id));
     }
 
-    ExecutionResult Coordinator::Execute(const std::string &sql)
+    namespace
     {
+        // The AND-ed parts of a condition
+        void Conjuncts(const Expression *expr, std::vector<const Expression *> *out)
+        {
+            if (!expr)
+                return;
+            if (expr->GetType() == ExpressionType::BINARY_OP &&
+                static_cast<const BinaryExpression *>(expr)->op == TokenType::AND)
+            {
+                Conjuncts(static_cast<const BinaryExpression *>(expr)->left.get(), out);
+                Conjuncts(static_cast<const BinaryExpression *>(expr)->right.get(), out);
+                return;
+            }
+            out->push_back(expr);
+        }
+
+        void ColumnNames(const Expression *expr, std::vector<std::string> *out)
+        {
+            if (!expr)
+                return;
+            if (expr->GetType() == ExpressionType::COLUMN_REF)
+                out->push_back(static_cast<const ColumnExpression *>(expr)->name);
+            for (const Expression *child : ExpressionChildren(expr))
+                ColumnNames(child, out);
+        }
+
+        // The shards a condition on a hash table can match, from conjuncts
+        // "key = literal" and "key IN (literals)"; nullopt if it can match
+        // rows on any shard
+        std::optional<std::set<uint32_t>> KeyShards(const std::vector<const Expression *> &conjuncts,
+                                                    const std::string &shard_column, const Placement &keys)
+        {
+            auto bare = [](const std::string &name)
+            {
+                const size_t dot = name.find('.');
+                return dot == std::string::npos ? name : name.substr(dot + 1);
+            };
+            auto is_key = [&](const Expression *e)
+            {
+                return e->GetType() == ExpressionType::COLUMN_REF &&
+                       bare(static_cast<const ColumnExpression *>(e)->name) == shard_column;
+            };
+            std::optional<std::set<uint32_t>> result;
+            for (const Expression *c : conjuncts)
+            {
+                std::vector<Value> keys_seen;
+                bool prunes = false;
+                if (c->GetType() == ExpressionType::BINARY_OP)
+                {
+                    const auto *b = static_cast<const BinaryExpression *>(c);
+                    if (b->op == TokenType::EQ)
+                    {
+                        if (is_key(b->left.get()) && b->right->GetType() == ExpressionType::LITERAL)
+                            keys_seen.push_back(static_cast<const LiteralExpression *>(b->right.get())->value), prunes = true;
+                        else if (is_key(b->right.get()) && b->left->GetType() == ExpressionType::LITERAL)
+                            keys_seen.push_back(static_cast<const LiteralExpression *>(b->left.get())->value), prunes = true;
+                    }
+                }
+                else if (c->GetType() == ExpressionType::IN_LIST)
+                {
+                    const auto *in = static_cast<const InListExpression *>(c);
+                    prunes = !in->negated && is_key(in->operand.get()) &&
+                             std::all_of(in->list.begin(), in->list.end(),
+                                         [](const auto &e) { return e->GetType() == ExpressionType::LITERAL; });
+                    if (prunes)
+                        for (const auto &e : in->list)
+                            keys_seen.push_back(static_cast<const LiteralExpression *>(e.get())->value);
+                }
+                if (!prunes)
+                    continue;
+                std::set<uint32_t> allowed;
+                for (const Value &key : keys_seen)
+                    if (!key.IsNull()) // key = NULL matches no row
+                        allowed.insert(keys.ShardFor(key));
+                if (!result)
+                    result = allowed;
+                else
+                {
+                    std::set<uint32_t> both;
+                    for (uint32_t s : allowed)
+                        if (result->count(s))
+                            both.insert(s);
+                    result = both;
+                }
+            }
+            return result;
+        }
+
+        std::string List(const std::vector<uint32_t> &shards)
+        {
+            std::string text;
+            for (uint32_t s : shards)
+                text += (text.empty() ? "" : ",") + std::to_string(s);
+            return "[" + text + "]";
+        }
+    } // namespace
+
+    ExecutionResult Coordinator::Execute(const std::string &sql, Transaction *txn)
+    {
+        // A statement that finds a shard locked by another transaction is
+        // undone and tried again (letting that transaction finish) until
+        // the lock timeout
+        const auto deadline = Clock::now() + std::chrono::milliseconds(options_.lock_timeout_ms);
+        auto pause = std::chrono::milliseconds(5);
+        static thread_local std::mt19937 random(std::random_device{}());
+        for (;;)
+        {
+            ExecutionResult result;
+            {
+                std::lock_guard<std::mutex> lock(op_mutex_);
+                result = ExecuteLocked(sql, txn);
+            }
+            if (!IsBusy(result))
+                return result;
+            if (Clock::now() >= deadline)
+            {
+                if (txn && txn->Open())
+                {
+                    std::lock_guard<std::mutex> lock(op_mutex_);
+                    waits_for_.erase(txn->id);
+                }
+                result.message = "lock wait timed out: " + result.message;
+                if (txn && txn->Open())
+                    result.message += KEPT_OPEN;
+                return result;
+            }
+            std::this_thread::sleep_for(pause + std::chrono::milliseconds(random() % 10));
+            pause = std::min(pause * 2, std::chrono::milliseconds(100));
+        }
+    }
+
+    void Coordinator::Abandon(Transaction *txn)
+    {
+        if (!txn || !txn->Open())
+            return;
         std::lock_guard<std::mutex> lock(op_mutex_);
+        try
+        {
+            if (IsLeader() && was_leader_ && txn->epoch == view_.epoch)
+                Abort(txn);
+        }
+        catch (const std::exception &)
+        {
+            // the next leader settles it
+        }
+        *txn = Transaction();
+    }
+
+    ExecutionResult Coordinator::ExecuteLocked(const std::string &sql, Transaction *txn)
+    {
         if (!IsLeader())
             return Failure("not the leader (leader: " + std::to_string(metadata_ ? metadata_->LeaderId() : -1) + ")");
+        struct Reset
+        {
+            Transaction *&slot;
+            ~Reset() { slot = nullptr; }
+        } reset{txn_};
         try
         {
             if (!was_leader_)
                 BecomeLeader();
             std::string error;
             auto stmt = ParseOne(sql, &error);
+            if (txn && txn->Open() && txn->epoch != view_.epoch)
+            {
+                // A new term settled (rolled back) everything left open
+                *txn = Transaction();
+                if (stmt && stmt->GetType() == StatementType::TRANSACTION_STMT &&
+                    static_cast<const struct TransactionStatement *>(stmt.get())->kind ==
+                        TransactionStatement::Kind::ROLLBACK)
+                    return Success("Transaction rolled back.");
+                return Failure("the transaction was rolled back: the coordinator lost the leadership");
+            }
             if (!stmt)
                 return Failure(error);
+            if (stmt->GetType() == StatementType::TRANSACTION_STMT)
+                return RunTransactionStatement(*static_cast<const struct TransactionStatement *>(stmt.get()), txn);
+            if (txn && txn->Open())
+                txn_ = txn;
+            const bool in_transaction = txn_ != nullptr;
+            ExecutionResult result;
             switch (stmt->GetType())
             {
             case StatementType::CREATE_TABLE:
             case StatementType::DROP_TABLE:
             case StatementType::CREATE_INDEX:
-                return Ddl(sql);
-            case StatementType::TRANSACTION_STMT:
-                return Failure("transactions across the cluster are not supported yet");
-            default:
+                result = Ddl(sql);
                 break;
-            }
-            if (!view_.formed)
-                return Failure("the cluster is still forming: " + std::to_string(view_.nodes.size()) + " of " +
-                               std::to_string(view_.rf) + " storage nodes have joined");
-            switch (stmt->GetType())
-            {
-            case StatementType::INSERT:
-                return Insert(sql);
-            case StatementType::UPDATE_STMT:
-            {
-                const auto *update = static_cast<const UpdateStatement *>(stmt.get());
-                auto table = view_.tables.find(update->table);
-                bool subqueries = ContainsSubquery(update->where.get());
-                for (const auto &[column, expr] : update->assignments)
+            default:
+                if (!view_.formed)
+                    return Failure("the cluster is still forming: " + std::to_string(view_.nodes.size()) + " of " +
+                                   std::to_string(view_.rf) + " storage nodes have joined");
+                switch (stmt->GetType())
                 {
-                    subqueries = subqueries || ContainsSubquery(expr.get());
-                    if (table != view_.tables.end() && table->second.kind == "hash" &&
-                        column == table->second.shard_column)
-                        return Failure("cannot change the shard key " + column + " of " + update->table);
-                }
-                if (!subqueries)
-                    return Broadcast(sql, update->table);
-                std::string error;
-                const std::string bound = BoundUpdate(*update, &error);
-                return error.empty() ? Broadcast(bound, update->table) : Failure(error);
-            }
-            case StatementType::DELETE_STMT:
-            {
-                const auto *del = static_cast<const DeleteStatement *>(stmt.get());
-                if (!ContainsSubquery(del->where.get()))
-                    return Broadcast(sql, del->table);
-                std::string error;
-                const std::string bound = BoundDelete(*del, &error);
-                return error.empty() ? Broadcast(bound, del->table) : Failure(error);
-            }
-            case StatementType::ANALYZE_STMT:
-            {
-                ExecutionResult first;
-                for (uint32_t shard : AllShards())
+                case StatementType::INSERT:
+                    result = Insert(sql);
+                    break;
+                case StatementType::UPDATE_STMT:
                 {
-                    ExecutionResult result = ShardCall(shard, "write", sql);
-                    if (!result.success)
-                        return result;
-                    if (shard == 0)
-                        first = result;
+                    const auto *update = static_cast<const UpdateStatement *>(stmt.get());
+                    const auto &tables = Tables();
+                    auto table = tables.find(update->table);
+                    bool subqueries = ContainsSubquery(update->where.get());
+                    for (const auto &[column, expr] : update->assignments)
+                    {
+                        subqueries = subqueries || ContainsSubquery(expr.get());
+                        if (table != tables.end() && table->second.kind == "hash" &&
+                            column == table->second.shard_column)
+                            return Failure("cannot change the shard key " + column + " of " + update->table);
+                    }
+                    std::string error;
+                    const std::string bound = subqueries ? BoundUpdate(*update, &error) : sql;
+                    result = error.empty() ? Broadcast(bound, update->table) : Failure(error);
+                    break;
                 }
-                return first;
+                case StatementType::DELETE_STMT:
+                {
+                    const auto *del = static_cast<const DeleteStatement *>(stmt.get());
+                    std::string error;
+                    const std::string bound = ContainsSubquery(del->where.get()) ? BoundDelete(*del, &error) : sql;
+                    result = error.empty() ? Broadcast(bound, del->table) : Failure(error);
+                    break;
+                }
+                case StatementType::ANALYZE_STMT:
+                {
+                    std::map<uint32_t, std::string> statements;
+                    for (uint32_t shard : AllShards())
+                        statements[shard] = sql;
+                    std::map<uint32_t, ExecutionResult> results;
+                    result = Atomically([&] { return WriteShards(statements, false, &results); });
+                    if (result.success && results.count(0))
+                        result = results[0];
+                    break;
+                }
+                default: // SELECT, EXPLAIN
+                    result = Select(sql);
+                    break;
+                }
             }
-            default: // SELECT, EXPLAIN
-                return Select(sql);
+            if (in_transaction && txn->Open())
+            {
+                if (!IsBusy(result))
+                    waits_for_.erase(txn->id);
+                else if (!txn->shards.empty())
+                {
+                    // It holds shards and waits for one: a deadlock if the
+                    // holder (transitively) waits for it
+                    const size_t open = result.message.rfind('('), close = result.message.rfind(')');
+                    std::string holder = open != std::string::npos && close > open
+                                             ? result.message.substr(open + 1, close - open - 1)
+                                             : "";
+                    waits_for_[txn->id] = holder;
+                    for (size_t hops = 0; !holder.empty() && hops <= waits_for_.size(); ++hops)
+                    {
+                        if (holder == txn->id)
+                        {
+                            Abort(txn);
+                            return Failure("Deadlock detected: the transaction was rolled back; retry it");
+                        }
+                        auto next = waits_for_.find(holder);
+                        holder = next == waits_for_.end() ? "" : next->second;
+                    }
+                }
             }
+            // As a single node reports a failed statement inside BEGIN
+            if (in_transaction && !result.success && !IsBusy(result) && txn->Open() &&
+                result.message.find(KEPT_OPEN) == std::string::npos)
+                result.message += KEPT_OPEN;
+            return result;
         }
         catch (const std::exception &e)
         {
             was_leader_ = false;
             return Failure(e.what());
+        }
+    }
+
+    ExecutionResult Coordinator::RunTransactionStatement(const struct TransactionStatement &stmt, Transaction *txn)
+    {
+        switch (stmt.kind)
+        {
+        case TransactionStatement::Kind::BEGIN:
+            if (!txn)
+                return Failure("transactions need a client connection");
+            if (txn->Open())
+                return Failure("A transaction is already in progress.");
+            if (!view_.formed)
+                return Failure("the cluster is still forming: " + std::to_string(view_.nodes.size()) + " of " +
+                               std::to_string(view_.rf) + " storage nodes have joined");
+            *txn = Transaction();
+            txn->id = "c" + std::to_string(options_.id) + "-" + ReplicatedShard::NewRequestId();
+            txn->epoch = view_.epoch;
+            active_txns_.insert(txn->id);
+            return Success("Transaction started.");
+        case TransactionStatement::Kind::COMMIT:
+            if (!txn || !txn->Open())
+                return Failure("No transaction is in progress.");
+            return Commit(txn);
+        case TransactionStatement::Kind::ROLLBACK:
+            if (!txn || !txn->Open())
+                return Failure("No transaction is in progress.");
+            Abort(txn);
+            return Success("Transaction rolled back.");
+        }
+        return Failure("unknown transaction statement");
+    }
+
+    ExecutionResult Coordinator::Atomically(const std::function<ExecutionResult()> &body)
+    {
+        if (txn_)
+            return body();
+        Transaction implicit;
+        implicit.id = "c" + std::to_string(options_.id) + "-" + ReplicatedShard::NewRequestId();
+        implicit.epoch = view_.epoch;
+        implicit.implicit = true;
+        active_txns_.insert(implicit.id);
+        txn_ = &implicit;
+        ExecutionResult result;
+        try
+        {
+            result = body();
+        }
+        catch (...)
+        {
+            txn_ = nullptr;
+            unsettled_.insert(implicit.shards.begin(), implicit.shards.end());
+            active_txns_.erase(implicit.id);
+            throw;
+        }
+        txn_ = nullptr;
+        if (!result.success)
+        {
+            Abort(&implicit);
+            return result;
+        }
+        ExecutionResult committed = Commit(&implicit);
+        return committed.success ? result : committed;
+    }
+
+    ExecutionResult Coordinator::WriteShards(const std::map<uint32_t, std::string> &statements, bool release_untouched,
+                                             std::map<uint32_t, ExecutionResult> *results)
+    {
+        if (!txn_)
+        {
+            if (statements.size() != 1)
+                throw std::logic_error("a write to several shards needs a transaction");
+            const auto &[shard, sql] = *statements.begin();
+            ExecutionResult result = ShardCall(shard, "write", sql);
+            (*results)[shard] = result;
+            return result;
+        }
+        Transaction &t = *txn_;
+        const std::set<uint32_t> before = t.shards;
+        std::vector<uint32_t> ran; // where the statement succeeded
+        ExecutionResult failure;
+        bool failed = false, uncertain = false;
+        for (const auto &[shard, sql] : statements)
+        {
+            ExecutionResult result = ShardCall(shard, "txn", sql, "exec", t.id);
+            if (!IsBusy(result))
+                t.shards.insert(shard); // the shard has the transaction open (or may have)
+            if (!result.success)
+            {
+                failure = result;
+                failed = true;
+                uncertain = IsUnavailable(result.message);
+                break;
+            }
+            ran.push_back(shard);
+            (*results)[shard] = result;
+        }
+        if (failed)
+        {
+            if (t.implicit)
+                return failure; // all of it is rolled back
+            // Undo the statement where it ran; let go of shards it opened
+            bool clean = !uncertain;
+            for (uint32_t shard : ran)
+                clean = ShardCall(shard, "txn", "", "undo", t.id).success && clean;
+            if (!clean)
+            {
+                Abort(&t);
+                failure.message += " (the transaction was rolled back)";
+                return failure;
+            }
+            for (uint32_t shard : std::set<uint32_t>(t.shards))
+                if (!before.count(shard) && ShardCall(shard, "txn", "", "abort", t.id).success)
+                    t.shards.erase(shard);
+            return failure;
+        }
+        if (release_untouched)
+            for (uint32_t shard : ran)
+                if (!before.count(shard) && Count((*results)[shard].message) == 0 &&
+                    ShardCall(shard, "txn", "", "abort", t.id).success)
+                    t.shards.erase(shard); // changed nothing there
+        return Success("");
+    }
+
+    ExecutionResult Coordinator::Commit(Transaction *txn)
+    {
+        Transaction t = *txn;
+        *txn = Transaction();
+        active_txns_.erase(t.id);
+        waits_for_.erase(t.id);
+        if (t.shards.empty() && t.ddl.empty())
+            return Success("Transaction committed.");
+        if (t.shards.size() == 1 && t.ddl.empty())
+        {
+            // One participant: its commit is the decision
+            const uint32_t shard = *t.shards.begin();
+            ExecutionResult result = ShardCall(shard, "txn", "", "commit", t.id);
+            if (result.success)
+                return Success("Transaction committed.");
+            if (IsUnavailable(result.message))
+            {
+                unsettled_.insert(shard);
+                return Failure("the commit's outcome is unknown: " + result.message);
+            }
+            ShardCall(shard, "txn", "", "abort", t.id);
+            return Failure("Commit failed; the transaction was rolled back (" + result.message + ")");
+        }
+        // Phase one: every participant votes
+        for (uint32_t shard : t.shards)
+        {
+            ExecutionResult vote = ShardCall(shard, "txn", "", "prepare", t.id);
+            if (!vote.success)
+            {
+                Abort(&t);
+                return Failure("Commit failed; the transaction was rolled back (shard " + std::to_string(shard) +
+                               ": " + vote.message + ")");
+            }
+        }
+        // The decision, with the transaction's schema changes: the commit point
+        std::string decision = "INSERT INTO txns VALUES (" + Quote(t.id) + ", 'committed');\n";
+        int64_t seq = view_.ddl.empty() ? 0 : view_.ddl.back().first;
+        for (const auto &statement : t.ddl)
+        {
+            std::string error;
+            auto stmt = ParseOne(statement, &error);
+            if (stmt->GetType() == StatementType::CREATE_TABLE)
+            {
+                const TableInfo info =
+                    DescribeTable(statement, *static_cast<const CreateTableStatement *>(stmt.get()));
+                decision += "DELETE FROM tables WHERE name = " + Quote(info.name) + ";\n";
+                decision += "INSERT INTO tables VALUES (" + Quote(info.name) + ", " + Quote(statement) + ", " +
+                            Quote(info.kind) + ", " + Quote(info.shard_column) + ");\n";
+            }
+            else if (stmt->GetType() == StatementType::DROP_TABLE)
+                decision += "DELETE FROM tables WHERE name = " +
+                            Quote(static_cast<const DropTableStatement *>(stmt.get())->table) + ";\n";
+            ++seq;
+            decision += "INSERT INTO ddl VALUES (" + std::to_string(seq) + ", " + Quote(statement) + ");\n";
+        }
+        if (!t.ddl.empty())
+            decision += "UPDATE shard_ddl SET applied = " + std::to_string(seq) + ";\n";
+        ExecutionResult decided;
+        try
+        {
+            decided = MetaWrite(decision, true);
+        }
+        catch (const std::exception &e)
+        {
+            // Maybe written: the next leader looks it up
+            unsettled_.insert(t.shards.begin(), t.shards.end());
+            throw std::runtime_error(std::string("the commit's outcome is unknown: ") + e.what());
+        }
+        if (!decided.success)
+        {
+            // e.g. a recovering leader already decided to roll it back
+            Abort(&t);
+            return Failure("Commit failed; the transaction was rolled back (" + decided.message + ")");
+        }
+        ++two_phase_commits_;
+        // Phase two
+        bool everywhere = true;
+        for (uint32_t shard : t.shards)
+        {
+            ExecutionResult done = ShardCall(shard, "txn", "", "commit", t.id);
+            if (!done.success)
+            {
+                everywhere = false; // recovery finishes it
+                unsettled_.insert(shard);
+            }
+        }
+        if (everywhere)
+            MetaWrite("DELETE FROM txns WHERE id = " + Quote(t.id) + ";");
+        if (!t.ddl.empty())
+            Load();
+        return Success("Transaction committed.");
+    }
+
+    void Coordinator::Abort(Transaction *txn)
+    {
+        Transaction t = *txn;
+        *txn = Transaction();
+        active_txns_.erase(t.id);
+        waits_for_.erase(t.id);
+        for (uint32_t shard : t.shards)
+            if (!ShardCall(shard, "txn", "", "abort", t.id).success)
+                unsettled_.insert(shard); // recovery rolls it back
+    }
+
+    void Coordinator::Recover()
+    {
+        for (uint32_t shard : std::set<uint32_t>(unsettled_))
+        {
+            const ExecutionResult status = ShardCall(shard, "txn_status", "", "", "", 1000);
+            if (!status.success)
+                continue; // still unreachable: next round
+            const std::string txid = status.message;
+            if (txid.empty() || active_txns_.count(txid))
+            {
+                unsettled_.erase(shard);
+                continue;
+            }
+            // Presumed abort: without a commit decision it is rolled back. The
+            // abort is recorded first, so a late commit from an earlier
+            // leader cannot win as well.
+            const std::string lookup = "SELECT state FROM txns WHERE id = " + Quote(txid) + ";";
+            ExecutionResult decision = MetaRead(lookup);
+            if (decision.tuples.empty())
+            {
+                MetaWrite("INSERT INTO txns VALUES (" + Quote(txid) + ", 'aborted');");
+                decision = MetaRead(lookup);
+            }
+            const bool committed =
+                !decision.tuples.empty() && decision.tuples[0].GetValue(0).ToString() == "committed";
+            const ExecutionResult done = ShardCall(shard, "txn", "", committed ? "commit" : "abort", txid, 1000);
+            if (done.success)
+                unsettled_.erase(shard);
         }
     }
 
@@ -679,36 +1257,49 @@ namespace sql::cluster
         ExecutionResult result = check.Execute(sql);
         if (!result.success)
             return result;
-        std::string error;
-        auto stmt = ParseOne(sql, &error);
         if (sql.size() > 1900)
             return Failure("statement too long for the cluster's schema log");
-        const int64_t seq = view_.ddl.empty() ? 1 : view_.ddl.back().first + 1;
-        if (stmt->GetType() == StatementType::CREATE_TABLE)
+        if (!view_.formed)
         {
-            const auto *create = static_cast<const CreateTableStatement *>(stmt.get());
-            std::string kind = "row", column;
-            if (create->distribution == TableDistribution::REPLICATED)
-                kind = "replicated";
-            else if (create->distribution == TableDistribution::HASH)
-                kind = "hash", column = create->shard_column;
-            else
+            // No shards yet: they get the schema log when they are created
+            std::string error;
+            auto stmt = ParseOne(sql, &error);
+            const int64_t seq = view_.ddl.empty() ? 1 : view_.ddl.back().first + 1;
+            if (stmt->GetType() == StatementType::CREATE_TABLE)
             {
-                for (const auto &col : create->columns)
-                    if (col.primary_key)
-                        kind = "hash", column = col.name;
+                const TableInfo info = DescribeTable(sql, *static_cast<const CreateTableStatement *>(stmt.get()));
+                MetaWrite("INSERT INTO tables VALUES (" + Quote(info.name) + ", " + Quote(sql) + ", " +
+                          Quote(info.kind) + ", " + Quote(info.shard_column) + ");");
             }
-            MetaWrite("INSERT INTO tables VALUES (" + Quote(create->table) + ", " + Quote(sql) + ", " + Quote(kind) +
-                      ", " + Quote(column) + ");");
+            else if (stmt->GetType() == StatementType::DROP_TABLE)
+                MetaWrite("DELETE FROM tables WHERE name = " +
+                          Quote(static_cast<const DropTableStatement *>(stmt.get())->table) + ";");
+            MetaWrite("INSERT INTO ddl VALUES (" + std::to_string(seq) + ", " + Quote(sql) + ");");
+            Load();
+            return result;
         }
-        else if (stmt->GetType() == StatementType::DROP_TABLE)
-            MetaWrite("DELETE FROM tables WHERE name = " +
-                      Quote(static_cast<const DropTableStatement *>(stmt.get())->table) + ";");
-        MetaWrite("INSERT INTO ddl VALUES (" + std::to_string(seq) + ", " + Quote(sql) + ");");
-        Load();
-        if (view_.formed)
-            CatchUpDdl();
-        return result;
+        // Every shard changes its schema in one distributed transaction (the
+        // metadata changes with the commit decision), after any earlier
+        // schema change has reached it
+        CatchUpDdl();
+        const int64_t last = view_.ddl.empty() ? 0 : view_.ddl.back().first;
+        for (uint32_t shard : AllShards())
+            if (view_.shard_ddl[shard] < last)
+                return Failure("shard " + std::to_string(shard) +
+                               " is still applying an earlier schema change (locked by another transaction)");
+        std::map<uint32_t, std::string> statements;
+        for (uint32_t shard : AllShards())
+            statements[shard] = sql;
+        std::map<uint32_t, ExecutionResult> results;
+        ExecutionResult ran = Atomically(
+            [&]
+            {
+                ExecutionResult written = WriteShards(statements, false, &results);
+                if (written.success)
+                    txn_->ddl.push_back(sql);
+                return written;
+            });
+        return ran.success ? result : ran;
     }
 
     ExecutionResult Coordinator::Insert(const std::string &sql)
@@ -716,8 +1307,9 @@ namespace sql::cluster
         std::string error;
         auto stmt = ParseOne(sql, &error);
         const auto *insert = static_cast<const InsertStatement *>(stmt.get());
-        auto table = view_.tables.find(insert->table);
-        if (table == view_.tables.end())
+        const auto &tables = Tables();
+        auto table = tables.find(insert->table);
+        if (table == tables.end())
             return Failure("Table not found: " + insert->table);
         // Run it against an empty copy of the table: the same errors as a
         // single node, and every row's final values (defaults, expressions)
@@ -764,78 +1356,76 @@ namespace sql::cluster
             for (uint32_t shard : targets)
                 per_shard[shard] += (per_shard[shard].empty() ? "" : ", ") + ("(" + values + ")");
         }
-        long long inserted = 0;
+        const bool replicated = table->second.kind == "replicated";
+        const std::string table_name = insert->table;
+        std::map<uint32_t, std::string> statements;
         for (const auto &[shard, rows] : per_shard)
-        {
-            ExecutionResult result =
-                ShardCall(shard, "write", "INSERT INTO " + insert->table + " (" + column_list + ") VALUES " + rows + ";");
-            if (!result.success)
-                return result; // rows sent to other shards stay: no cross-shard atomicity before 2PC (D6)
-            if (table->second.kind != "replicated" || shard == per_shard.begin()->first)
+            statements[shard] = "INSERT INTO " + table_name + " (" + column_list + ") VALUES " + rows + ";";
+        if (statements.empty())
+            return Success("0 row(s) inserted.");
+        std::map<uint32_t, ExecutionResult> results;
+        ExecutionResult written = statements.size() == 1 ? WriteShards(statements, false, &results)
+                                                         : Atomically([&] { return WriteShards(statements, false, &results); });
+        if (!written.success)
+            return written;
+        long long inserted = 0;
+        for (const auto &[shard, result] : results)
+            if (!replicated || shard == results.begin()->first)
                 inserted += Count(result.message);
-        }
         return Success(std::to_string(inserted) + " row(s) inserted.");
     }
 
     ExecutionResult Coordinator::Broadcast(const std::string &sql, const std::string &table_name)
     {
-        auto table = view_.tables.find(table_name);
-        if (table == view_.tables.end())
+        const auto &tables = Tables();
+        auto table = tables.find(table_name);
+        if (table == tables.end())
             return Failure("Table not found: " + table_name);
+        const bool replicated = table->second.kind == "replicated";
         auto schema = SchemaDatabase();
         Session check(schema.get());
         ExecutionResult checked = check.Execute(sql); // errors as on a single node
         if (!checked.success)
             return checked;
+        // Only the shards its WHERE can match: key = literal, key IN (...)
+        std::vector<uint32_t> targets = AllShards();
+        if (table->second.kind == "hash")
+        {
+            std::string error;
+            auto stmt = ParseOne(sql, &error);
+            const Expression *where = nullptr;
+            if (stmt && stmt->GetType() == StatementType::UPDATE_STMT)
+                where = static_cast<const UpdateStatement *>(stmt.get())->where.get();
+            else if (stmt && stmt->GetType() == StatementType::DELETE_STMT)
+                where = static_cast<const DeleteStatement *>(stmt.get())->where.get();
+            std::vector<const Expression *> conjuncts;
+            Conjuncts(where, &conjuncts);
+            if (auto allowed = KeyShards(conjuncts, table->second.shard_column, Placement(view_.shards, view_.rf)))
+                targets.assign(allowed->begin(), allowed->end());
+        }
+        if (targets.empty())
+            return checked; // no shard can hold a matching row: "0 row(s) ..."
+        std::map<uint32_t, std::string> statements;
+        for (uint32_t shard : targets)
+            statements[shard] = sql;
+        std::map<uint32_t, ExecutionResult> results;
+        // A replicated table changes on every shard; otherwise a shard the
+        // statement changed nothing on need not stay in the transaction
+        ExecutionResult written = statements.size() == 1 ? WriteShards(statements, !replicated, &results)
+                                                         : Atomically([&] { return WriteShards(statements, !replicated, &results); });
+        if (!written.success)
+            return written;
         long long count = 0;
         std::string verb;
-        for (uint32_t shard : AllShards())
+        for (const auto &[shard, result] : results)
         {
-            ExecutionResult result = ShardCall(shard, "write", sql);
-            if (!result.success)
-                return result;
-            if (table->second.kind != "replicated" || shard == 0)
+            if (!replicated || shard == 0)
                 count += Count(result.message);
             verb = result.message.substr(result.message.find(' ') + 1);
         }
         return Success(std::to_string(count) + " " + verb);
     }
 
-    namespace
-    {
-        // The AND-ed parts of a condition
-        void Conjuncts(const Expression *expr, std::vector<const Expression *> *out)
-        {
-            if (!expr)
-                return;
-            if (expr->GetType() == ExpressionType::BINARY_OP &&
-                static_cast<const BinaryExpression *>(expr)->op == TokenType::AND)
-            {
-                Conjuncts(static_cast<const BinaryExpression *>(expr)->left.get(), out);
-                Conjuncts(static_cast<const BinaryExpression *>(expr)->right.get(), out);
-                return;
-            }
-            out->push_back(expr);
-        }
-
-        void ColumnNames(const Expression *expr, std::vector<std::string> *out)
-        {
-            if (!expr)
-                return;
-            if (expr->GetType() == ExpressionType::COLUMN_REF)
-                out->push_back(static_cast<const ColumnExpression *>(expr)->name);
-            for (const Expression *child : ExpressionChildren(expr))
-                ColumnNames(child, out);
-        }
-
-        std::string List(const std::vector<uint32_t> &shards)
-        {
-            std::string text;
-            for (uint32_t s : shards)
-                text += (text.empty() ? "" : ",") + std::to_string(s);
-            return "[" + text + "]";
-        }
-    } // namespace
 
     Coordinator::SelectPlan Coordinator::PlanSelect(const SelectStatement &select, const std::string &sql,
                                                     Database &schema)
@@ -865,7 +1455,7 @@ namespace sql::cluster
         std::map<std::string, int> mentions;
         Lexer lexer(sql);
         for (Token token = lexer.NextToken(); token.type != TokenType::END_OF_FILE; token = lexer.NextToken())
-            if (token.type == TokenType::IDENTIFIER && view_.tables.count(token.value))
+            if (token.type == TokenType::IDENTIFIER && Tables().count(token.value))
                 ++mentions[token.value];
 
         bool subqueries = ContainsSubquery(select.where.get()) || ContainsSubquery(select.having.get());
@@ -920,8 +1510,8 @@ namespace sql::cluster
         for (size_t i = 0; i < relations.size(); ++i)
         {
             Relation &r = relations[i];
-            auto info = view_.tables.find(r.table);
-            if (info == view_.tables.end())
+            auto info = Tables().find(r.table);
+            if (info == Tables().end())
                 continue; // unknown: the local run reports it
             r.pushdown = !r.null_supplying && as_relation[r.table] == 1 && mentions[r.table] == 1;
             r.shards = info->second.kind == "replicated" ? std::vector<uint32_t>{0} : AllShards();
@@ -940,43 +1530,12 @@ namespace sql::cluster
                 if (info->second.kind != "hash")
                     continue;
                 // Pruning: key = literal, key IN (literals)
-                std::vector<Value> keys_seen;
-                bool prunes = false;
-                auto is_key = [&](const Expression *e)
-                {
-                    return e->GetType() == ExpressionType::COLUMN_REF &&
-                           bare(static_cast<const ColumnExpression *>(e)->name) == info->second.shard_column;
-                };
-                if (c->GetType() == ExpressionType::BINARY_OP)
-                {
-                    const auto *b = static_cast<const BinaryExpression *>(c);
-                    if (b->op == TokenType::EQ)
-                    {
-                        if (is_key(b->left.get()) && b->right->GetType() == ExpressionType::LITERAL)
-                            keys_seen.push_back(static_cast<const LiteralExpression *>(b->right.get())->value), prunes = true;
-                        else if (is_key(b->right.get()) && b->left->GetType() == ExpressionType::LITERAL)
-                            keys_seen.push_back(static_cast<const LiteralExpression *>(b->left.get())->value), prunes = true;
-                    }
-                }
-                else if (c->GetType() == ExpressionType::IN_LIST)
-                {
-                    const auto *in = static_cast<const InListExpression *>(c);
-                    prunes = !in->negated && is_key(in->operand.get()) &&
-                             std::all_of(in->list.begin(), in->list.end(),
-                                         [](const auto &e) { return e->GetType() == ExpressionType::LITERAL; });
-                    if (prunes)
-                        for (const auto &e : in->list)
-                            keys_seen.push_back(static_cast<const LiteralExpression *>(e.get())->value);
-                }
-                if (!prunes)
+                const auto allowed = KeyShards({c}, info->second.shard_column, keys);
+                if (!allowed)
                     continue;
-                std::set<uint32_t> allowed;
-                for (const Value &key : keys_seen)
-                    if (!key.IsNull()) // key = NULL matches no row
-                        allowed.insert(keys.ShardFor(key));
                 std::vector<uint32_t> kept;
                 for (uint32_t s : r.shards)
-                    if (allowed.count(s))
+                    if (allowed->count(s))
                         kept.push_back(s);
                 r.shards = kept;
             }
@@ -989,7 +1548,7 @@ namespace sql::cluster
             int shard = -1;
             for (const auto &[table, count] : mentions)
             {
-                const TableInfo &info = view_.tables.at(table);
+                const TableInfo &info = Tables().at(table);
                 if (info.kind == "replicated")
                     continue;
                 auto r = std::find_if(relations.begin(), relations.end(),
@@ -1011,8 +1570,8 @@ namespace sql::cluster
         }
         // 2. Aggregates over one table, no grouping: per shard, combined here
         const Relation &first = relations.front();
-        const bool one_table = relations.size() == 1 && view_.tables.count(first.table) &&
-                               view_.tables.at(first.table).kind != "replicated" && first.pushdown && !subqueries;
+        const bool one_table = relations.size() == 1 && Tables().count(first.table) &&
+                               Tables().at(first.table).kind != "replicated" && first.pushdown && !subqueries;
         bool partial = one_table && select.group_by.empty() && !select.having && select.order_by.empty() &&
                        !select.distinct && !select.limit && select.offset == 0 && !select.select_star &&
                        !select.items.empty();
@@ -1078,7 +1637,7 @@ namespace sql::cluster
         std::set<std::string> fetched;
         for (const auto &r : relations)
         {
-            if (!view_.tables.count(r.table) || !fetched.insert(r.table).second)
+            if (!Tables().count(r.table) || !fetched.insert(r.table).second)
                 continue;
             TableFetch fetch{r.table, r.shards, ""};
             if (r.pushdown)
@@ -1094,7 +1653,7 @@ namespace sql::cluster
             }
             else
             {
-                fetch.shards = view_.tables.at(r.table).kind == "replicated" ? std::vector<uint32_t>{0} : AllShards();
+                fetch.shards = Tables().at(r.table).kind == "replicated" ? std::vector<uint32_t>{0} : AllShards();
                 fetch.query = "SELECT * FROM " + r.table + ";";
             }
             plan.fetches.push_back(fetch);
@@ -1103,7 +1662,7 @@ namespace sql::cluster
         for (const auto &[table, count] : mentions)
             if (fetched.insert(table).second)
                 plan.fetches.push_back({table,
-                                        view_.tables.at(table).kind == "replicated" ? std::vector<uint32_t>{0}
+                                        Tables().at(table).kind == "replicated" ? std::vector<uint32_t>{0}
                                                                                     : AllShards(),
                                         "SELECT * FROM " + table + ";"});
         return plan;
@@ -1364,11 +1923,11 @@ namespace sql::cluster
                        (view_.formed ? "" : " (forming)") + "\n";
             if (name == "tables")
             {
-                if (view_.tables.empty())
+                if (Tables().empty())
                     return "No tables.\n";
                 auto schema = SchemaDatabase();
                 std::string out;
-                for (const auto &[table_name, info] : view_.tables)
+                for (const auto &[table_name, info] : Tables())
                 {
                     out += table_name + " [" +
                            (info.kind == "hash"         ? "by " + info.shard_column
@@ -1386,9 +1945,9 @@ namespace sql::cluster
             if (name == "schema")
             {
                 std::string out;
-                if (!argument.empty() && !view_.tables.count(argument))
+                if (!argument.empty() && !Tables().count(argument))
                     return "Error: no table named " + argument + "\n";
-                for (const auto &[table_name, info] : view_.tables)
+                for (const auto &[table_name, info] : Tables())
                     if (argument.empty() || argument == table_name)
                         out += info.definition + "\n";
                 return out;

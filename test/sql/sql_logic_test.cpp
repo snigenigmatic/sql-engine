@@ -186,8 +186,6 @@ namespace sql
 #ifdef SQLENGINE_DISTRIBUTED
         TEST_P(SqlLogicTest, Cluster)
         {
-            if (GetParam() == "transactions.test")
-                GTEST_SKIP() << "BEGIN/COMMIT across shards arrive with two-phase commit (milestone D6)";
             cluster::testing::Cluster cluster;
             ASSERT_TRUE(cluster.WaitFormed());
             auto connection = cluster.Client(0);

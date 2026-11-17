@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <tuple>
 #include "cli/local_connection.h"
 #include "cluster/node/script.h"
 #include "test_cluster.h"
@@ -163,9 +164,21 @@ namespace sql::cluster
         EXPECT_FALSE(duplicate.success);
         RunAll(local, "INSERT INTO t VALUES (1, 'a');");
         EXPECT_EQ(duplicate.message, local.Execute("INSERT INTO t VALUES (1, 'b');").message);
-        // The shard key cannot change; transactions are not distributed yet
+        // The shard key cannot change
         EXPECT_FALSE(client->Execute("UPDATE t SET id = 2 WHERE id = 1;").success);
-        EXPECT_FALSE(client->Execute("BEGIN;").success);
+        // Transactions answer as a single node (on a file) does
+        for (const auto &[sql, ok, message] : std::vector<std::tuple<std::string, bool, std::string>>{
+                 {"COMMIT;", false, "No transaction is in progress."},
+                 {"ROLLBACK;", false, "No transaction is in progress."},
+                 {"BEGIN;", true, "Transaction started."},
+                 {"BEGIN;", false, "A transaction is already in progress."},
+                 {"ROLLBACK;", true, "Transaction rolled back."},
+             })
+        {
+            const auto result = client->Execute(sql);
+            EXPECT_EQ(result.success, ok) << sql;
+            EXPECT_EQ(result.message, message) << sql;
+        }
     }
 
     TEST(ClusterTest, TableKinds)

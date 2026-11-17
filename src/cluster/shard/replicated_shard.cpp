@@ -88,12 +88,33 @@ namespace sql::cluster
         return Replicate(ShardStateMachine::EncodeWrite(sql, request_id.empty() ? NewRequestId() : request_id));
     }
 
-    ExecutionResult ReplicatedShard::Read(const std::string &sql)
+    ExecutionResult ReplicatedShard::WriteBatch(const std::string &script, const std::string &request_id)
+    {
+        return Replicate(ShardStateMachine::EncodeBatch(script, request_id.empty() ? NewRequestId() : request_id));
+    }
+
+    ExecutionResult ReplicatedShard::Transaction(ShardStateMachine::TxnOp op, const std::string &txid,
+                                                 const std::string &sql, const std::string &request_id)
+    {
+        return Replicate(
+            ShardStateMachine::EncodeTxn(op, txid, sql, request_id.empty() ? NewRequestId() : request_id));
+    }
+
+    ExecutionResult ReplicatedShard::OpenTransaction()
     {
         ExecutionResult barrier = Replicate(ShardStateMachine::EncodeBarrier());
         if (!barrier.success)
             return barrier;
-        return machine_->Query(sql);
+        barrier.message = machine_->OpenTransaction();
+        return barrier;
+    }
+
+    ExecutionResult ReplicatedShard::Read(const std::string &sql, const std::string &txid)
+    {
+        ExecutionResult barrier = Replicate(ShardStateMachine::EncodeBarrier());
+        if (!barrier.success)
+            return barrier;
+        return machine_->Query(sql, txid);
     }
 
 } // namespace sql::cluster

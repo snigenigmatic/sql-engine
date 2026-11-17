@@ -60,13 +60,28 @@ namespace sql::cluster
         // applying again. Without an id, a fresh one is used.
         ExecutionResult Write(const std::string &sql, const std::string &request_id = "");
 
+        // Several statements, applied all or nothing (see
+        // ShardStateMachine::EncodeBatch); retried like Write
+        ExecutionResult WriteBatch(const std::string &script, const std::string &request_id = "");
+
+        // A step of distributed transaction `txid` (see ShardStateMachine::
+        // EncodeTxn); retried like Write
+        ExecutionResult Transaction(ShardStateMachine::TxnOp op, const std::string &txid, const std::string &sql,
+                                    const std::string &request_id = "");
+
+        // The transaction open on the shard as of now (linearizable, on the
+        // leader), "" if none; a failure if this replica cannot tell
+        ExecutionResult OpenTransaction();
+
         // A new random request id
         static std::string NewRequestId();
 
         // A SELECT/EXPLAIN that sees every write committed before it began
         // (linearizable): the leader commits a no-op through the log first,
         // proving it still leads, then reads its own data. No clocks.
-        ExecutionResult Read(const std::string &sql);
+        // Inside transaction `txid` (if not empty) it sees that
+        // transaction's uncommitted changes.
+        ExecutionResult Read(const std::string &sql, const std::string &txid = "");
 
         bool IsLeader() const;
         int LeaderId() const; // -1 if unknown

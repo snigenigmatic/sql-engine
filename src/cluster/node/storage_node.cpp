@@ -194,8 +194,17 @@ namespace sql::cluster
                 return Failure("no replica of shard " + std::to_string(shard) + " here");
             if (method == "write") // the coordinator's request id makes retries safe
                 return replica->Write(arguments[2], arguments.size() > 3 ? arguments[3] : "");
-            if (method == "read")
-                return replica->Read(arguments[2]);
+            if (method == "read") // optional txid: inside that transaction
+                return replica->Read(arguments[2], arguments.size() > 3 ? arguments[3] : "");
+            if (method == "txn") // op, txid, sql, request id
+            {
+                ShardStateMachine::TxnOp op;
+                if (arguments.size() != 6 || !ShardStateMachine::ParseTxnOp(arguments[2], &op))
+                    return Failure("bad call txn");
+                return replica->Transaction(op, arguments[3], arguments[4], arguments[5]);
+            }
+            if (method == "txn_status")
+                return replica->OpenTransaction();
             return Failure("unknown call " + method);
         }
         catch (const std::exception &e)
