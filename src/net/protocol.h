@@ -21,6 +21,8 @@ namespace sql::net
         // client → server
         EXECUTE = 1, // u8 mode (ExecuteMode), string sql
         COMMAND = 2, // string name, string argument
+        CALL = 6,    // string method, u32 count, then each argument: an
+                     // internal request between cluster processes
         // server → client
         RESULTS = 3, // u8 in_transaction, u32 count, then each result
         TEXT = 4,    // u8 in_transaction, string text
@@ -86,6 +88,12 @@ namespace sql::net
         std::string argument;
     };
 
+    struct CallRequest
+    {
+        std::string method;
+        std::vector<std::string> arguments;
+    };
+
     struct ResultsResponse
     {
         bool in_transaction = false;
@@ -100,6 +108,7 @@ namespace sql::net
 
     Frame Encode(const ExecuteRequest &request);
     Frame Encode(const CommandRequest &request);
+    Frame Encode(const CallRequest &request);
     Frame Encode(const ResultsResponse &response);
     Frame Encode(const TextResponse &response);
     Frame EncodeError(const std::string &message);
@@ -108,6 +117,7 @@ namespace sql::net
     // another type or malformed (truncated, trailing bytes, bad row)
     std::optional<ExecuteRequest> DecodeExecute(const Frame &frame);
     std::optional<CommandRequest> DecodeCommand(const Frame &frame);
+    std::optional<CallRequest> DecodeCall(const Frame &frame);
     std::optional<ResultsResponse> DecodeResults(const Frame &frame);
     std::optional<TextResponse> DecodeText(const Frame &frame);
     std::optional<std::string> DecodeError(const Frame &frame);

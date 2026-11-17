@@ -154,6 +154,20 @@ SELECT * FROM users WHERE id > 1;   -- uses index range scan
 
 Every client gets its own session, and the results are the same as in-process. The engine has one writer at a time, so clients take turns. A client inside `BEGIN … COMMIT` has the database to itself until it commits, rolls back or disconnects; a disconnect rolls its transaction back. The protocol is in `src/net/protocol.h`.
 
+### Cluster (in progress)
+
+Three coordinators (a Raft group holding the cluster's metadata) and three or more storage nodes (each holding Raft-replicated shards). Any coordinator takes clients:
+
+```bash
+SPEC=1=127.0.0.1:31101:31201,2=127.0.0.1:31102:31202,3=127.0.0.1:31103:31203   # id=host:raft_port:client_port
+for i in 1 2 3; do ./build/src/server/sqlnode --role coordinator --id $i --coordinators $SPEC --dir c$i & done
+for i in 0 1 2; do ./build/src/server/sqlnode --role storage --name node-$i --coordinators $SPEC \
+                     --dir n$i --raft-base $((32000 + 100 * i)) & done
+./build/src/sqlengine --connect 127.0.0.1:31201
+```
+
+Tables are spread over shards by `SHARD BY HASH(col)`, the primary key, or the whole row; `REPLICATED` tables are copied to every shard. See [docs/distributed-design.md](docs/distributed-design.md) for what works so far and what doesn't yet (no cross-shard transactions until D6).
+
 ### REPL Commands
 
 | Command | Description |
@@ -242,7 +256,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
   - [x] D1: Server mode and wire protocol (`sqlnode`, `sqlengine --connect`)
   - [x] D2: Hash rings and replica placement; `SHARD BY HASH(col)` / `REPLICATED` syntax
   - [x] D3: A Raft-replicated shard (durable Raft log, exactly-once apply, snapshots, linearizable reads)
-  - [ ] D4: Metadata Raft group and cluster bootstrap
+  - [x] D4: Metadata Raft group and cluster bootstrap (`sqlnode --role coordinator|storage`)
   - [ ] D5: Distributed queries
   - [ ] D6: Two-phase commit across shards
   - [ ] D7: Kubernetes (minikube)

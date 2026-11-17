@@ -55,6 +55,15 @@ namespace sql::net
         return Run(stop_on_error ? ExecuteMode::SCRIPT_STOP_ON_ERROR : ExecuteMode::SCRIPT, sql);
     }
 
+    ExecutionResult RemoteConnection::Call(const std::string &method, const std::vector<std::string> &arguments)
+    {
+        auto response = DecodeResults(RoundTrip(Encode(CallRequest{method, arguments})));
+        if (!response || response->results.size() != 1)
+            throw std::runtime_error("malformed response from " + address_);
+        in_transaction_ = response->in_transaction;
+        return std::move(response->results.front());
+    }
+
     std::string RemoteConnection::Command(const std::string &name, const std::string &argument)
     {
         auto response = DecodeText(RoundTrip(Encode(CommandRequest{name, argument})));

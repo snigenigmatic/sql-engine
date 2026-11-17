@@ -57,6 +57,8 @@ if(SQLENGINE_DISTRIBUTED)
     target_link_libraries(file_log_store_test PRIVATE cluster)
     add_sqlengine_test(replicated_shard_test cluster/replicated_shard_test.cpp)
     target_link_libraries(replicated_shard_test PRIVATE cluster)
+    add_sqlengine_test(cluster_test cluster/cluster_test.cpp)
+    target_link_libraries(cluster_test PRIVATE cluster)
 endif()
 
 # Golden SQL scripts (test/sql/*.test)

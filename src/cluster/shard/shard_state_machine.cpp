@@ -179,6 +179,12 @@ namespace sql::cluster
         // A failing statement is rolled back on its own; the transaction
         // stays open for the applied index
         ExecutionResult result = Run(*session_, sql);
+        // The wrapping transaction is ours, not the client's: report the
+        // error as a single node would
+        const std::string suffix = " (statement rolled back; transaction still open)";
+        if (!result.success && result.message.size() >= suffix.size() &&
+            result.message.compare(result.message.size() - suffix.size(), suffix.size(), suffix) == 0)
+            result.message.erase(result.message.size() - suffix.size());
         RecordApplied(index); // inside the same transaction
         Must(session_->Execute("COMMIT;"), "commit");
         return result;

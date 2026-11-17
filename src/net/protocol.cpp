@@ -68,6 +68,16 @@ namespace sql::net
         return {MessageType::COMMAND, w.Take()};
     }
 
+    Frame Encode(const CallRequest &request)
+    {
+        Writer w;
+        w.String(request.method);
+        w.U32(static_cast<uint32_t>(request.arguments.size()));
+        for (const auto &argument : request.arguments)
+            w.String(argument);
+        return {MessageType::CALL, w.Take()};
+    }
+
     // Each result: u8 success, string message, u32 column count, the column
     // names, u32 row count, each row as a string of Tuple bytes
     Frame Encode(const ResultsResponse &response)
@@ -129,6 +139,27 @@ namespace sql::net
         Reader r(frame.payload);
         CommandRequest request;
         if (!r.String(&request.name) || !r.String(&request.argument) || !r.AtEnd())
+            return std::nullopt;
+        return request;
+    }
+
+    std::optional<CallRequest> DecodeCall(const Frame &frame)
+    {
+        if (frame.type != MessageType::CALL)
+            return std::nullopt;
+        Reader r(frame.payload);
+        CallRequest request;
+        uint32_t count = 0;
+        if (!r.String(&request.method) || !r.U32(&count))
+            return std::nullopt;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            std::string argument;
+            if (!r.String(&argument))
+                return std::nullopt;
+            request.arguments.push_back(std::move(argument));
+        }
+        if (!r.AtEnd())
             return std::nullopt;
         return request;
     }

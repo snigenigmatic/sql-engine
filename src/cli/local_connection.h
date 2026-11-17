@@ -13,6 +13,11 @@ namespace sql
     public:
         LocalConnection(Database *db, Session *session) : db_(db), session_(session) {}
 
+    protected:
+        void SetSession(Session *session) { session_ = session; }
+
+    public:
+
         ExecutionResult Execute(const std::string &sql) override { return session_->Execute(sql); }
         std::vector<ExecutionResult> ExecuteScript(const std::string &sql, bool stop_on_error = false) override
         {

@@ -9,6 +9,30 @@
 namespace sql
 {
 
+    namespace
+    {
+        // A client's own session on a shared database
+        class SessionConnection : public LocalConnection
+        {
+        public:
+            explicit SessionConnection(Database *db)
+                : LocalConnection(db, nullptr), session_(std::make_unique<Session>(db))
+            {
+                SetSession(session_.get());
+            }
+
+        private:
+            std::unique_ptr<Session> session_;
+        };
+    } // namespace
+
+    Server::Server(Database *db)
+        : factory_([db] { return std::make_unique<SessionConnection>(db); }), exclusive_(true)
+    {
+    }
+
+    Server::Server(ConnectionFactory factory, bool exclusive) : factory_(std::move(factory)), exclusive_(exclusive) {}
+
     void Server::Start(const std::string &host, uint16_t port)
     {
         listener_ = net::Listen(host, port, &port_);
@@ -45,18 +69,28 @@ namespace sql
 
     void Server::Serve(Client *client)
     {
-        // Declared before the session, so the database stays locked while
-        // the session closes and rolls back an open transaction
-        std::unique_lock<std::mutex> hold(db_mutex_, std::defer_lock);
+        // Declared before the connection, so with `exclusive` the turn is
+        // still held while the connection closes and rolls back an open
+        // transaction
+        std::unique_lock<std::mutex> hold(turn_mutex_, std::defer_lock);
         {
-            Session session(db_);
-            LocalConnection connection(db_, &session);
+            std::unique_ptr<Connection> owned;
+            try
+            {
+                owned = factory_();
+            }
+            catch (const std::exception &)
+            {
+                client->done = true;
+                return;
+            }
+            Connection &connection = *owned;
             try
             {
                 net::Frame request;
                 while (net::ReadFrame(client->socket, &request))
                 {
-                    if (!hold.owns_lock())
+                    if (exclusive_ && !hold.owns_lock())
                         hold.lock();
                     // A client that waited for its turn while the server was
                     // stopping (the turn freed up because Stop() disconnected
@@ -87,6 +121,13 @@ namespace sql
                         else if (auto command = net::DecodeCommand(request))
                             response = net::Encode(net::TextResponse{
                                 connection.InTransaction(), connection.Command(command->name, command->argument)});
+                        else if (auto call = net::DecodeCall(request))
+                        {
+                            net::ResultsResponse results;
+                            results.results.push_back(connection.Call(call->method, call->arguments));
+                            results.in_transaction = connection.InTransaction();
+                            response = net::Encode(results);
+                        }
                         else
                             response = net::EncodeError("malformed request");
                     }
@@ -95,7 +136,7 @@ namespace sql
                         response = net::EncodeError(e.what());
                     }
                     // Between transactions the database is free for others
-                    if (!session.InTransaction())
+                    if (hold.owns_lock() && !connection.InTransaction())
                         hold.unlock();
                     net::WriteFrame(client->socket, response);
                 }
@@ -104,8 +145,8 @@ namespace sql
             {
                 // A broken connection ends the session like a disconnect
             }
-            if (session.InTransaction() && !hold.owns_lock())
-                hold.lock(); // cannot happen: a transaction keeps the lock
+            if (exclusive_ && connection.InTransaction() && !hold.owns_lock())
+                hold.lock(); // cannot happen: a transaction keeps the turn
         }
         client->done = true;
     }

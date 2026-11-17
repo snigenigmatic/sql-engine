@@ -22,6 +22,7 @@ namespace sql::net
         // As of the last response: no round trip
         bool InTransaction() override { return in_transaction_; }
         std::string Command(const std::string &name, const std::string &argument) override;
+        ExecutionResult Call(const std::string &method, const std::vector<std::string> &arguments) override;
 
     private:
         std::vector<ExecutionResult> Run(ExecuteMode mode, const std::string &sql);

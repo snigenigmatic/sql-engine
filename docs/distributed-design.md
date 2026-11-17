@@ -1,6 +1,6 @@
 # Distributed sql-engine — design and build plan
 
-Status: D0–D3 are done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
+Status: D0–D4 are done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
 
 **Decisions already made**
 - **Raft:** use the NuRaft library rather than writing our own.
@@ -117,6 +117,32 @@ Status: D0–D3 are done; the rest is a proposal. It starts from `master` at 9d6
   - Commands are applied as SQL against tables named `__nodes`, `__shards` and so on, in the NuRaft `commit()` callback.
   - Each command bumps `epoch`.
 - **Clients of the metadata:** storage nodes and follower coordinators cache it and subscribe to epoch changes. Any shard RPC carries the epoch. A node with an older epoch answers `StaleEpoch`, and the caller refreshes its cache and retries.
+
+**As built in D4** (`src/cluster/node/coordinator.{h,cpp}`):
+- **Storage:** the metadata group is a D3 `ReplicatedShard` whose members are the coordinators. Its tables are plain SQL tables (the cluster is the only client, so they don't need reserved names):
+  - `cluster(shards, rf, epoch, formed)`;
+  - `nodes(id, name, host, port, raft_base)`;
+  - `replicas(shard, position, node)`: fixed when the cluster forms (rebalancing is D8);
+  - `tables(name, definition, kind, shard_column)`, where `kind` is `hash`, `row` or `replicated`;
+  - `ddl(seq, statement)`: every schema change, in order;
+  - `shard_ddl(shard, applied)`: how far each shard has got through `ddl`.
+- **Leadership:** the leader of the metadata group is the coordinator. On becoming leader it bumps `epoch`.
+  - Every call to a storage node carries the epoch, and nodes refuse anything older than the newest they have seen. A deposed leader therefore cannot change data.
+  - Followers forward clients' statements to the leader.
+- **Formation:** storage nodes `join` (and keep re-announcing) until the leader accepts them. Once `rf` nodes have joined, the leader records `Placement`'s assignment in `replicas` and asks each replica's node to create its Raft group (`ensure_replica`). That request is idempotent and is repeated every 5 s, so a restarted node gets its replicas back.
+- **Schema changes:** each DDL statement is first run against an empty copy of the schema, so errors match a single node. It is then appended to `ddl` and applied to every shard from where that shard left off.
+  - A shard's progress is recorded after each statement, so after a crash at most the last statement repeats. Its harmless errors ("already exists", "not found") count as done.
+  - Tables created before the cluster forms reach the shards when they form.
+- **Distribution:** `SHARD BY HASH(col)`, else the primary key, else the hash of the whole row. `REPLICATED` tables get every write on every shard.
+- **INSERT:** the statement first runs against an empty copy of its table. That gives single-node error messages and each row's final values (defaults, expressions), which are then hashed to pick shards.
+- **UPDATE and DELETE** go to every shard, and the row counts are summed. Changing a hash table's shard key is refused; subqueries in them wait for D5.
+- **SELECT and EXPLAIN:** the tables the statement names are gathered from the shards into an in-memory database with the full schema, which runs the statement. That is correct for every query but moves whole tables; D5 adds pruning and pushdown.
+- **Known limits until later milestones:**
+  - a write that spans shards is not atomic: rows already sent stay if a later shard fails (D6, 2PC);
+  - `UNIQUE` on a column other than the shard key is enforced per shard only;
+  - `BEGIN`/`COMMIT` are refused (D6);
+  - nodes that join after formation get no replicas (D8);
+  - coordinator operations run one at a time.
 
 ### 4.5 `src/cluster/shard`: a replicated shard on NuRaft
 - **One NuRaft `raft_server` per shard replica.**
@@ -255,7 +281,7 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 | D1 ✅ | **Server mode.** The wire protocol, a single-node `sqlnode` with one `Session` per connection (serialized), and the CLI's `--connect` | The golden runner passes against a server over TCP |
 | D2 ✅ | **Rings and placement.** The `ring` library, the metadata model, and the `SHARD BY` / `REPLICATED` syntax | Unit tests for spread, minimal movement and placement |
 | D3 ✅ | **One replicated shard.** The NuRaft state machine on `Database`, the log store, snapshots and exactly-once apply | An in-process 3-replica test: kill the leader, keep writing, restart, catch up, install a snapshot, same `.db` contents on every replica |
-| D4 | **The metadata group and cluster.** The coordinators' Raft group, node join, shard bootstrap, DDL fan-out, epochs | An in-process cluster of 3 coordinators and 3 nodes boots, then `CREATE TABLE`/`INSERT`/`SELECT` work |
+| D4 ✅ | **The metadata group and cluster.** The coordinators' Raft group, node join, shard bootstrap, DDL fan-out, epochs | An in-process cluster of 3 coordinators and 3 nodes boots, then `CREATE TABLE`/`INSERT`/`SELECT` work |
 | D5 | **Distributed queries.** Pruning, scatter-gather, pushdown, partial aggregates, co-located and broadcast joins, gathering, distributed `EXPLAIN` | Every `test/sql/*.test` gives the same rows on the cluster; `EXPLAIN` tests show pruning and pushdown |
 | D6 | **2PC.** Prepare, decide and commit over Raft, the transaction table, recovery, shard locks with no-wait retry | A bank-transfer test keeps total money constant while leaders and coordinators are killed |
 | D7 | **Kubernetes.** The `Dockerfile`, the manifests, `up.sh`/`chaos.sh`, probes | On minikube: golden tests pass, and pass again under the `chaos.sh` loop |
