@@ -90,7 +90,12 @@ sql-engine/
 │   ├── catalog/   # Catalog (schema table), Database, legacy snapshot importer
 │   ├── execution/ # Operators: SeqScan, Filter, Projection, IndexScan, Executor
 │   ├── storage/   # Pager, BufferPool, TablePage/TableHeap, Table, BTree
-│   └── optimizer/ # (stub, planned)
+│   ├── optimizer/ # Planner, cost estimates
+│   ├── session/   # Session (transactions), Connection interface
+│   ├── cli/       # Shell, LocalConnection
+│   ├── net/       # Wire protocol, sockets, RemoteConnection
+│   ├── server/    # Server and the sqlnode binary
+│   └── cluster/   # Raft (NuRaft) building blocks for the distributed engine
 ├── test/
 │   ├── integration/  # End-to-end SQL tests
 │   └── parser/       # Parser unit tests
@@ -136,6 +141,18 @@ CREATE INDEX idx_id ON users (id);
 SELECT * FROM users WHERE id = 1;    -- uses index point lookup
 SELECT * FROM users WHERE id > 1;   -- uses index range scan
 ```
+
+### Client/server
+
+`sqlnode` serves a database file over TCP. `sqlengine --connect` is the same shell, talking to it:
+
+```bash
+./build/src/server/sqlnode --database mydb.db --port 7480    # Ctrl-C / SIGTERM stops it cleanly
+./build/src/sqlengine --connect 127.0.0.1:7480
+./build/src/sqlengine --connect 127.0.0.1:7480 < script.sql
+```
+
+Every client gets its own session, and the results are the same as in-process. The engine has one writer at a time, so clients take turns. A client inside `BEGIN … COMMIT` has the database to itself until it commits, rolls back or disconnects; a disconnect rolls its transaction back. The protocol is in `src/net/protocol.h`.
 
 ### REPL Commands
 
@@ -222,7 +239,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
 ### Extra Goal
 - [ ] **Distributed Query Processing** (design: [docs/distributed-design.md](docs/distributed-design.md))
   - [x] D0: NuRaft and asio in the build; Raft replication, leader failover and several Raft groups per process verified
-  - [ ] D1: Server mode and wire protocol
+  - [x] D1: Server mode and wire protocol (`sqlnode`, `sqlengine --connect`)
   - [ ] D2: Hash rings and replica placement
   - [ ] D3: A Raft-replicated shard
   - [ ] D4: Metadata Raft group and cluster bootstrap

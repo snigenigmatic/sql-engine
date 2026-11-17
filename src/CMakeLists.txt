@@ -8,6 +8,8 @@ add_subdirectory(storage)
 add_subdirectory(catalog)
 add_subdirectory(session)
 add_subdirectory(cli)
+add_subdirectory(net)
+add_subdirectory(server)
 if(SQLENGINE_DISTRIBUTED)
     add_subdirectory(cluster)
 endif()
@@ -27,6 +29,7 @@ target_link_libraries(sqlengine
         catalog
         session
         cli
+        net
 )
 
 # Install target

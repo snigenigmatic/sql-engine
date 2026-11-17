@@ -1,6 +1,6 @@
 # Distributed sql-engine — design and build plan
 
-Status: D0 is done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
+Status: D0 and D1 are done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
 
 **Decisions already made**
 - **Raft:** use the NuRaft library rather than writing our own.
@@ -75,18 +75,20 @@ Status: D0 is done; the rest is a proposal. It starts from `master` at 9d67d5b, 
 ## 4. Components
 
 ### 4.1 `src/net`: transport and wire protocol
-- **Transport:** asio, the same library NuRaft already brings in. Each frame is `u32 length | u8 type | payload`.
+- **Transport:** plain POSIX TCP sockets with blocking I/O, one thread per connection (built in D1). Each frame is `u32 length | u8 type | payload`.
+  - asio was the first idea, but blocking sockets suffice for request/response, `shutdown()` cleanly wakes a blocked thread when a server stops, and the client/server pieces then build without the NuRaft/asio download.
 - **Message types:**
-  - client side: `Query`, `Result`, `Error`;
+  - client side (D1): `EXECUTE` (one statement, or a script with or without stopping at the first error), `COMMAND` (`.tables`, `.schema`, `.save`), `RESULTS`, `TEXT`, `ERROR`;
   - shard side: `Fragment`, `RowBatch`, `Prepare`, `Vote`, `Decide`;
   - control: `Heartbeat`, `Join`, `NotLeader{hint}`.
 - **Rows** are encoded with the existing `Tuple::SerializeTo`, so there is no new row format.
-- **Streaming:** results come back in batches of about 1,000 rows with backpressure, so a large scan never has to be fully materialized on the shard.
+- **Streaming:** results come back in batches of about 1,000 rows with backpressure, so a large scan never has to be fully materialized on the shard. D1 still sends each result in one frame (up to 256 MiB); batching arrives with shard fragments in D5.
 
 ### 4.2 `src/server`: the `sqlnode` binary
 - **Roles:** `--role=coordinator` or `--role=storage`.
 - **Pod identity:** comes from the StatefulSet hostname, e.g. `node-1.node.default.svc`.
-- **Client mode:** the CLI's `Shell` gets `--connect host:port`. It sends statements over the network instead of to a local `Session`. Dot commands still work, with `.tables` and `.schema` answered from the metadata.
+- **Client mode (D1):** `Shell` talks to a `Connection` (`src/session/connection.h`). `LocalConnection` wraps an in-process `Session`; `RemoteConnection` sends the same calls over TCP. `sqlengine --connect host:port` uses the latter. Dot commands still work; in the cluster, `.tables` and `.schema` will be answered from the metadata.
+- **Single-node server (D1):** `sqlnode --database FILE --port N` serves one database. Clients take turns on it, and an open transaction keeps it to itself, so clients are serializable. The golden runner runs every `test/sql/*.test` file both in-process and through a server.
 
 ### 4.3 `src/cluster/ring`: consistent hashing
 - **Hash:** 64-bit MurmurHash3 over the canonical key from `AppendGroupKey` (`src/execution/evaluator.h`). The canonical key is used so that `1` and `1.0` (and the NULL cases) hash the same way they compare.
@@ -230,7 +232,7 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 | # | Milestone | Done when |
 |---|---|---|
 | D0 ✅ | **Dependencies and layout.** Pull NuRaft and standalone asio in via CMake `FetchContent`, add the `src/cluster` module (`src/net` and `src/distributed` arrive with their first code in D1 and D5) | Builds on CI, single-node tests unchanged |
-| D1 | **Server mode.** The wire protocol, a single-node `sqlnode` with one `Session` per connection (serialized), and the CLI's `--connect` | The golden runner passes against a server over TCP |
+| D1 ✅ | **Server mode.** The wire protocol, a single-node `sqlnode` with one `Session` per connection (serialized), and the CLI's `--connect` | The golden runner passes against a server over TCP |
 | D2 | **Rings and placement.** The `ring` library, the metadata model, and the `SHARD BY` / `REPLICATED` syntax | Unit tests for spread, minimal movement and placement |
 | D3 | **One replicated shard.** The NuRaft state machine on `Database`, the log store, snapshots and exactly-once apply | An in-process 3-replica test: kill the leader, keep writing, restart, catch up, install a snapshot, same `.db` contents on every replica |
 | D4 | **The metadata group and cluster.** The coordinators' Raft group, node join, shard bootstrap, DDL fan-out, epochs | An in-process cluster of 3 coordinators and 3 nodes boots, then `CREATE TABLE`/`INSERT`/`SELECT` work |

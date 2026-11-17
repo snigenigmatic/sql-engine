@@ -34,6 +34,12 @@ add_sqlengine_test(query_test integration/query_test.cpp)
 # Planner cost estimates
 add_sqlengine_test(estimator_test optimizer/estimator_test.cpp)
 
+# Client/server
+add_sqlengine_test(protocol_test net/protocol_test.cpp)
+target_link_libraries(protocol_test PRIVATE net)
+add_sqlengine_test(server_test server/server_test.cpp)
+target_link_libraries(server_test PRIVATE server net)
+
 # REPL shell
 add_sqlengine_test(cli_test cli/cli_test.cpp)
 
@@ -48,6 +54,7 @@ endif()
 # Golden SQL scripts (test/sql/*.test)
 add_sqlengine_test(sql_logic_test sql/sql_logic_test.cpp)
 target_compile_definitions(sql_logic_test PRIVATE SQL_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sql")
+target_link_libraries(sql_logic_test PRIVATE server net)
 # Storage tests
 add_sqlengine_test(buffer_pool_test storage/buffer_pool_test.cpp)
 add_sqlengine_test(table_heap_test storage/table_heap_test.cpp)
