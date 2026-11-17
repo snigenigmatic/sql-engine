@@ -202,7 +202,16 @@ namespace sql
         const auto start = std::chrono::steady_clock::now();
         remote.server->Stop();
         EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
-        EXPECT_THROW(waiting.get(), std::runtime_error);
+        try
+        {
+            const auto unexpected = waiting.get();
+            ADD_FAILURE() << "the waiting client's request ran: success=" << unexpected.success
+                          << " rows=" << unexpected.tuples.size();
+        }
+        catch (const std::runtime_error &)
+        {
+            // disconnected, as it should be
+        }
         EXPECT_THROW(idle->Execute("SELECT COUNT(*) FROM t;"), std::runtime_error);
         EXPECT_TRUE(in_transaction->InTransaction()); // as last reported, until it tries again
         EXPECT_THROW(in_transaction->Execute("COMMIT;"), std::runtime_error);

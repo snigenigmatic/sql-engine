@@ -58,6 +58,11 @@ namespace sql
                 {
                     if (!hold.owns_lock())
                         hold.lock();
+                    // A client that waited for its turn while the server was
+                    // stopping (the turn freed up because Stop() disconnected
+                    // the client holding it) runs nothing
+                    if (stopping_)
+                        break;
                     net::Frame response;
                     try
                     {
