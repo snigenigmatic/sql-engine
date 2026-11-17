@@ -93,18 +93,32 @@ namespace sql::cluster
         ASSERT_TRUE(client->Execute(orders + ";").success);
         RunAll(local, users + ";" + orders + ";");
 
-        // Every node holds some of the rows: they were spread over shards
+        // Every node holds some of the rows: they were spread over shards.
+        // A follower applies the commit a heartbeat after its leader, and
+        // refuses reads while it still has the transaction open.
+        auto count = [&](size_t n, uint32_t s) -> long long
+        {
+            auto *replica = cluster.Node(n).Replica(s);
+            const auto rows = replica ? replica->Machine().Query("SELECT COUNT(*) FROM users;") : ExecutionResult{};
+            return rows.success && !rows.tuples.empty() ? rows.tuples[0].GetValue(0).GetAsInt() : -1;
+        };
         for (size_t n = 0; n < 3; ++n)
         {
             long long held = 0;
-            for (uint32_t s = 0; s < SHARDS; ++s)
-                if (auto *replica = cluster.Node(n).Replica(s))
-                    held += replica->Machine().Query("SELECT COUNT(*) FROM users;").tuples.at(0).GetValue(0).GetAsInt();
+            WaitFor(
+                [&]
+                {
+                    held = 0;
+                    for (uint32_t s = 0; s < SHARDS; ++s)
+                        held += count(n, s);
+                    return held == 40;
+                },
+                10s);
             EXPECT_EQ(held, 40) << "node " << n; // rf 3 of 3 nodes: every node has every shard
         }
         size_t shards_with_rows = 0;
         for (uint32_t s = 0; s < SHARDS; ++s)
-            if (cluster.Node(0).Replica(s)->Machine().Query("SELECT COUNT(*) FROM users;").tuples.at(0).GetValue(0).GetAsInt() > 0)
+            if (count(0, s) > 0)
                 ++shards_with_rows;
         EXPECT_GT(shards_with_rows, 1u);
 
@@ -193,18 +207,25 @@ namespace sql::cluster
                      "INSERT INTO events VALUES ('in', 'a'), ('in', 'b'), ('fr', 'c'), ('in', 'd');"
                      "INSERT INTO log VALUES ('x'), ('x'), ('y');");
         // A replicated table is whole on every shard; counted once
+        // (a follower may apply the commit a heartbeat later)
         for (uint32_t s = 0; s < SHARDS; ++s)
-            EXPECT_EQ(Rows(cluster.Node(0).Replica(s)->Machine().Query("SELECT COUNT(*) FROM countries;")),
-                      (std::vector<std::string>{"2"}));
+            EXPECT_TRUE(WaitFor([&] {
+                return Rows(cluster.ReplicaOf(0, s).Machine().Query("SELECT COUNT(*) FROM countries;")) ==
+                       std::vector<std::string>{"2"};
+            })) << s;
         EXPECT_EQ(Rows(client->Execute("SELECT COUNT(*) FROM countries;")), (std::vector<std::string>{"2"}));
         EXPECT_EQ(client->Execute("UPDATE countries SET name = 'Bharat' WHERE code = 'in';").message,
                   "1 row(s) updated.");
         // Rows with the same shard key share a shard
         size_t shards_with_in = 0;
-        for (uint32_t s = 0; s < SHARDS; ++s)
-            if (Rows(cluster.Node(0).Replica(s)->Machine().Query("SELECT COUNT(*) FROM events WHERE country = 'in';")) !=
-                std::vector<std::string>{"0"})
-                ++shards_with_in;
+        WaitFor([&] {
+            shards_with_in = 0;
+            for (uint32_t s = 0; s < SHARDS; ++s)
+                if (Rows(cluster.ReplicaOf(0, s).Machine().Query(
+                        "SELECT COUNT(*) FROM events WHERE country = 'in';")) == std::vector<std::string>{"3"})
+                    ++shards_with_in;
+            return shards_with_in == 1;
+        });
         EXPECT_EQ(shards_with_in, 1u);
         EXPECT_EQ(Rows(client->Execute("SELECT c.name, COUNT(*) FROM events e JOIN countries c ON c.code = e.country "
                                        "GROUP BY c.name ORDER BY c.name;")),

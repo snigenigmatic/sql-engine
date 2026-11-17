@@ -237,7 +237,8 @@ namespace sql::cluster
         EXPECT_NE(duplicate.message.find("UNIQUE constraint failed"), std::string::npos) << duplicate.message;
         EXPECT_EQ(Rows(client->Execute("SELECT COUNT(*) FROM t;")), (std::vector<std::string>{"1"}));
         for (uint32_t s = 0; s < SHARDS; ++s)
-            EXPECT_EQ(cluster.Node(0).Replica(s)->Machine().OpenTransaction(), "") << s;
+            EXPECT_TRUE(WaitFor([&] { return cluster.ReplicaOf(0, s).Machine().OpenTransaction().empty(); }))
+                << s; // followers apply the end a heartbeat later
 
         ASSERT_TRUE(client->Execute("INSERT INTO t VALUES " + rows.substr(rows.find("), ") + 3) + ";").success);
         EXPECT_EQ(Rows(client->Execute("SELECT COUNT(*), SUM(v) FROM t;")), (std::vector<std::string>{"40|8200"}));
@@ -288,7 +289,8 @@ namespace sql::cluster
         RunAll(*client, "ROLLBACK;");
         EXPECT_EQ(Rows(other->Execute("SELECT COUNT(*), SUM(v) FROM t;")), (std::vector<std::string>{"12|375"}));
         for (uint32_t s = 0; s < SHARDS; ++s)
-            EXPECT_EQ(cluster.Node(1).Replica(s)->Machine().OpenTransaction(), "") << s;
+            EXPECT_TRUE(WaitFor([&] { return cluster.ReplicaOf(1, s).Machine().OpenTransaction().empty(); }))
+                << s; // followers apply the end a heartbeat later
     }
 
     TEST(ClusterTransactionTest, SchemaChangesInsideATransaction)
@@ -413,7 +415,8 @@ namespace sql::cluster
         // concerned: the shard placement of a raw write is not checked
         EXPECT_EQ(Rows(rows), (std::vector<std::string>{"1", "200", "300"}));
         for (uint32_t s = 0; s < SHARDS; ++s)
-            EXPECT_EQ(cluster.Node(0).Replica(s)->Machine().OpenTransaction(), "") << s;
+            EXPECT_TRUE(WaitFor([&] { return cluster.ReplicaOf(0, s).Machine().OpenTransaction().empty(); }))
+                << s; // followers apply the end a heartbeat later
         EXPECT_TRUE(survivor->Execute("INSERT INTO t VALUES (2);").success);
     }
 
@@ -554,7 +557,7 @@ namespace sql::cluster
             << committed.load() << " committed, " << failed.load() << " failed";
         // Nothing stays locked
         for (uint32_t s = 0; s < SHARDS; ++s)
-            EXPECT_TRUE(WaitFor([&] { return cluster.Node(0).Replica(s)->Machine().OpenTransaction().empty(); })) << s;
+            EXPECT_TRUE(WaitFor([&] { return cluster.ReplicaOf(0, s).Machine().OpenTransaction().empty(); })) << s;
     }
 
 } // namespace sql::cluster

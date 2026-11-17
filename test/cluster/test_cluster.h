@@ -139,6 +139,17 @@ namespace sql::cluster::testing
             return *nodes_.back();
         }
         void StopNode(size_t i) { nodes_[i].reset(); }
+        // Node i's replica of shard s, once it has one: a shard serves
+        // writes with 2 of its 3 replicas while the third is still being
+        // created (the coordinator retries that every few seconds)
+        ReplicatedShard &ReplicaOf(size_t i, uint32_t s)
+        {
+            ReplicatedShard *replica = nullptr;
+            WaitFor([&] { return (replica = nodes_[i]->Replica(s)) != nullptr; });
+            if (!replica)
+                throw std::runtime_error("node " + std::to_string(i) + " has no replica of shard " + std::to_string(s));
+            return *replica;
+        }
         StorageNode &Node(size_t i) { return *nodes_[i]; }
 
         Coordinator *Leader()
