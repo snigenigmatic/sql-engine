@@ -1,6 +1,6 @@
 # Distributed sql-engine — design and build plan
 
-Status: D0–D4 are done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
+Status: D0–D5 are done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
 
 **Decisions already made**
 - **Raft:** use the NuRaft library rather than writing our own.
@@ -198,6 +198,30 @@ Status: D0–D4 are done; the rest is a proposal. It starts from `master` at 9d6
   - Large results are a risk because the engine only sorts in memory. Mitigation: `LIMIT` pushdown and streaming merges.
 - **`EXPLAIN`** prints the fragments, which shards each one goes to, and the coordinator's local plan.
 
+**As built in D5** (`Coordinator::PlanSelect`): every `SELECT` still ends with the coordinator running the statement itself over the rows it fetched, so pushing work to shards can only shrink the data moved, never change the answer. In order of preference:
+1. **The whole statement on one shard.** Every table the statement names is either `REPLICATED` or a hash table whose own `WHERE` conditions pin its key to one shard, the same one for all of them (`key = literal`, `key IN (literals)`). The shard's answer is the answer. This covers key lookups and joins of rows sharing a key or with replicated tables.
+2. **Partial aggregates.** One table, no `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`DISTINCT`, and only `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` (not `DISTINCT`) in the select list.
+   - Each shard returns its partials, with `AVG` sent as `SUM` plus `COUNT`.
+   - The coordinator combines them with the engine's own rules: a 64-bit integer sum, float sums kept apart, and "Integer overflow" outside 32 bits.
+   - Column names and type checks come from running the statement on the empty schema.
+3. **Gather.** Each table is fetched from the shards its conditions allow, with the `WHERE` conjuncts that mention only that table applied on the shards.
+   - Not pushed for the NULL side of a `LEFT JOIN`, nor for a table named more than once (self-join, or also inside a subquery), since those need the rows the conditions would drop.
+   - Single-table `ORDER BY col… LIMIT n OFFSET m` also sends `ORDER BY … LIMIT n+m` to the shards (plain table columns only, not positions or aliases).
+   - The coordinator then runs the statement over what it fetched.
+- **`EXPLAIN`** on a cluster starts with the distributed plan: the strategy, the shards and each query sent, followed by the shard's or the coordinator's own plan.
+- **`UPDATE`/`DELETE` with subqueries:** each uncorrelated subquery runs once on the cluster beforehand and is replaced by literals.
+  - A scalar subquery becomes its value, or `NULL` when it returns no rows, with the single-node error if there are several rows.
+  - `EXISTS` becomes `TRUE`/`FALSE`.
+  - `IN (SELECT …)` becomes an `IN` list, and over no rows `FALSE` (`NOT IN`: `TRUE`).
+  - The statement then goes to every shard. Subqueries that refer to the row being changed are refused.
+- **The golden SQL files also run on an in-process cluster** (`sql_logic_test`, `Cluster` mode) and give the single-node rows, except `transactions.test`, which is skipped until D6.
+- **Not done (yet):**
+  - projection pushdown;
+  - `GROUP BY` pushdown (grouping by the shard key could run per shard);
+  - shuffle joins, and joins that are co-located on the key but not pinned to one shard;
+  - float sums can differ from a single node in the last digits, because the cluster adds in a different order;
+  - a single shard's partial integer `SUM` can overflow even when the total would not.
+
 ### 4.7 `src/distributed/txn`: two-phase commit over Raft groups
 - **Statements:** an auto-commit statement that touches 1 shard → a single `Exec` entry, with no 2PC.
 - **Transactions:** in `BEGIN … COMMIT`, the coordinator buffers each shard's rewritten writes.
@@ -287,7 +311,7 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 | D2 ✅ | **Rings and placement.** The `ring` library, the metadata model, and the `SHARD BY` / `REPLICATED` syntax | Unit tests for spread, minimal movement and placement |
 | D3 ✅ | **One replicated shard.** The NuRaft state machine on `Database`, the log store, snapshots and exactly-once apply | An in-process 3-replica test: kill the leader, keep writing, restart, catch up, install a snapshot, same `.db` contents on every replica |
 | D4 ✅ | **The metadata group and cluster.** The coordinators' Raft group, node join, shard bootstrap, DDL fan-out, epochs | An in-process cluster of 3 coordinators and 3 nodes boots, then `CREATE TABLE`/`INSERT`/`SELECT` work |
-| D5 | **Distributed queries.** Pruning, scatter-gather, pushdown, partial aggregates, co-located and broadcast joins, gathering, distributed `EXPLAIN` | Every `test/sql/*.test` gives the same rows on the cluster; `EXPLAIN` tests show pruning and pushdown |
+| D5 ✅ | **Distributed queries.** Pruning, scatter-gather, pushdown, partial aggregates, co-located and broadcast joins, gathering, distributed `EXPLAIN` | Every `test/sql/*.test` gives the same rows on the cluster; `EXPLAIN` tests show pruning and pushdown |
 | D6 | **2PC.** Prepare, decide and commit over Raft, the transaction table, recovery, shard locks with no-wait retry | A bank-transfer test keeps total money constant while leaders and coordinators are killed |
 | D7 | **Kubernetes.** The `Dockerfile`, the manifests, `up.sh`/`chaos.sh`, probes | On minikube: golden tests pass, and pass again under the `chaos.sh` loop |
 | D8 | **Rebalancing.** Join, decommission, re-replication after `down`; `SHOW CLUSTER`/`SHOW SHARDS` | Adding a 4th node moves about 1/4 of the replicas with no errors, and killing a node permanently restores the replication factor to 3 |

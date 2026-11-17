@@ -11,14 +11,18 @@
 //
 // Each file runs in a fresh temporary database, statement by statement,
 // through a Session (so BEGIN / COMMIT / ROLLBACK work). Every file runs
-// twice: in this process (Local) and through a server over TCP (Remote),
-// which must give the same answers.
+// in this process (Local), through a server over TCP (Remote) and on an
+// in-process cluster of coordinators and storage nodes (Cluster), which
+// must all give the same answers.
 
 #include <gtest/gtest.h>
 #include "cli/local_connection.h"
 #include "net/remote_connection.h"
 #include "server/server.h"
 #include "session/session.h"
+#ifdef SQLENGINE_DISTRIBUTED
+#include "../cluster/test_cluster.h"
+#endif
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -178,6 +182,18 @@ namespace sql
             net::RemoteConnection connection("127.0.0.1", server.Port());
             RunScript(connection);
         }
+
+#ifdef SQLENGINE_DISTRIBUTED
+        TEST_P(SqlLogicTest, Cluster)
+        {
+            if (GetParam() == "transactions.test")
+                GTEST_SKIP() << "BEGIN/COMMIT across shards arrive with two-phase commit (milestone D6)";
+            cluster::testing::Cluster cluster;
+            ASSERT_TRUE(cluster.WaitFormed());
+            auto connection = cluster.Client(0);
+            RunScript(*connection);
+        }
+#endif
 
         INSTANTIATE_TEST_SUITE_P(Golden, SqlLogicTest, ::testing::ValuesIn(TestFiles()),
                                  [](const ::testing::TestParamInfo<std::string> &info)

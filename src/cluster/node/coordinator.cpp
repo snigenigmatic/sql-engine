@@ -427,6 +427,8 @@ namespace sql::cluster
 
     ExecutionResult Coordinator::ShardCall(uint32_t shard, const std::string &method, const std::string &sql)
     {
+        if (method == "read")
+            ++shard_reads_;
         const auto deadline = Clock::now() + std::chrono::milliseconds(options_.election_timeout_ms * 6 + 2000);
         std::string last_error = "no replica of shard " + std::to_string(shard) + " answered";
         // One id for every attempt: a write retried after an uncertain
@@ -621,24 +623,28 @@ namespace sql::cluster
             {
                 const auto *update = static_cast<const UpdateStatement *>(stmt.get());
                 auto table = view_.tables.find(update->table);
+                bool subqueries = ContainsSubquery(update->where.get());
                 for (const auto &[column, expr] : update->assignments)
                 {
-                    if (ContainsSubquery(expr.get()))
-                        return Failure("subqueries in UPDATE are not supported in a cluster yet");
+                    subqueries = subqueries || ContainsSubquery(expr.get());
                     if (table != view_.tables.end() && table->second.kind == "hash" &&
                         column == table->second.shard_column)
                         return Failure("cannot change the shard key " + column + " of " + update->table);
                 }
-                if (ContainsSubquery(update->where.get()))
-                    return Failure("subqueries in UPDATE are not supported in a cluster yet");
-                return Broadcast(sql, update->table);
+                if (!subqueries)
+                    return Broadcast(sql, update->table);
+                std::string error;
+                const std::string bound = BoundUpdate(*update, &error);
+                return error.empty() ? Broadcast(bound, update->table) : Failure(error);
             }
             case StatementType::DELETE_STMT:
             {
                 const auto *del = static_cast<const DeleteStatement *>(stmt.get());
-                if (ContainsSubquery(del->where.get()))
-                    return Failure("subqueries in DELETE are not supported in a cluster yet");
-                return Broadcast(sql, del->table);
+                if (!ContainsSubquery(del->where.get()))
+                    return Broadcast(sql, del->table);
+                std::string error;
+                const std::string bound = BoundDelete(*del, &error);
+                return error.empty() ? Broadcast(bound, del->table) : Failure(error);
             }
             case StatementType::ANALYZE_STMT:
             {
@@ -795,25 +801,461 @@ namespace sql::cluster
         return Success(std::to_string(count) + " " + verb);
     }
 
-    ExecutionResult Coordinator::Select(const std::string &sql)
+    namespace
     {
-        auto data = SchemaDatabase();
-        // Every table the statement names (any identifier that is one)
-        std::set<std::string> names;
+        // The AND-ed parts of a condition
+        void Conjuncts(const Expression *expr, std::vector<const Expression *> *out)
+        {
+            if (!expr)
+                return;
+            if (expr->GetType() == ExpressionType::BINARY_OP &&
+                static_cast<const BinaryExpression *>(expr)->op == TokenType::AND)
+            {
+                Conjuncts(static_cast<const BinaryExpression *>(expr)->left.get(), out);
+                Conjuncts(static_cast<const BinaryExpression *>(expr)->right.get(), out);
+                return;
+            }
+            out->push_back(expr);
+        }
+
+        void ColumnNames(const Expression *expr, std::vector<std::string> *out)
+        {
+            if (!expr)
+                return;
+            if (expr->GetType() == ExpressionType::COLUMN_REF)
+                out->push_back(static_cast<const ColumnExpression *>(expr)->name);
+            for (const Expression *child : ExpressionChildren(expr))
+                ColumnNames(child, out);
+        }
+
+        std::string List(const std::vector<uint32_t> &shards)
+        {
+            std::string text;
+            for (uint32_t s : shards)
+                text += (text.empty() ? "" : ",") + std::to_string(s);
+            return "[" + text + "]";
+        }
+    } // namespace
+
+    Coordinator::SelectPlan Coordinator::PlanSelect(const SelectStatement &select, const std::string &sql,
+                                                    Database &schema)
+    {
+        struct Relation
+        {
+            std::string table, name;
+            bool null_supplying = false; // the right side of a LEFT JOIN
+            bool pushdown = false;       // its own conditions may go to its shards
+            std::vector<const Expression *> conditions;
+            std::vector<uint32_t> shards;
+        };
+        std::vector<Relation> relations;
+        auto add = [&](const std::string &table, const std::string &name, bool null_supplying)
+        {
+            Relation r;
+            r.table = table;
+            r.name = name;
+            r.null_supplying = null_supplying;
+            relations.push_back(std::move(r));
+        };
+        add(select.table, select.table_alias.empty() ? select.table : select.table_alias, false);
+        for (const auto &join : select.joins)
+            add(join.right.table, join.right.Name(), join.type == JoinType::LEFT);
+
+        // Every table the statement names, and how often its name appears
+        std::map<std::string, int> mentions;
         Lexer lexer(sql);
         for (Token token = lexer.NextToken(); token.type != TokenType::END_OF_FILE; token = lexer.NextToken())
             if (token.type == TokenType::IDENTIFIER && view_.tables.count(token.value))
-                names.insert(token.value);
-        Catalog &catalog = data->GetCatalog();
-        for (const auto &name : names)
+                ++mentions[token.value];
+
+        bool subqueries = ContainsSubquery(select.where.get()) || ContainsSubquery(select.having.get());
+        for (const auto &item : select.items)
+            subqueries = subqueries || ContainsSubquery(item.expr.get());
+        for (const auto &join : select.joins)
+            subqueries = subqueries || ContainsSubquery(join.on.get());
+
+        // A table's own conditions go to its shards only when it appears
+        // once, as a relation: a second appearance (self-join, subquery)
+        // needs rows those conditions would drop
+        std::map<std::string, int> as_relation;
+        for (const auto &r : relations)
+            ++as_relation[r.table];
+        auto columns_of = [&](const std::string &table)
         {
-            const TableInfo &info = view_.tables.at(name);
-            Table *table = catalog.GetTable(name);
-            const std::vector<uint32_t> sources =
-                info.kind == "replicated" ? std::vector<uint32_t>{0} : AllShards();
-            for (uint32_t shard : sources)
+            std::set<std::string> names;
+            if (const Table *t = schema.GetCatalog().GetTable(table))
+                for (const auto &col : t->GetSchema().GetColumns())
+                    names.insert(col.name);
+            return names;
+        };
+        // The relation a column name belongs to, or -1 if unknown/ambiguous
+        auto owner = [&](const std::string &name) -> int
+        {
+            const size_t dot = name.find('.');
+            int found = -1;
+            for (size_t i = 0; i < relations.size(); ++i)
             {
-                ExecutionResult rows = ShardCall(shard, "read", "SELECT * FROM " + name + ";");
+                const auto cols = columns_of(relations[i].table);
+                const bool match = dot == std::string::npos
+                                       ? cols.count(name) > 0
+                                       : name.substr(0, dot) == relations[i].name && cols.count(name.substr(dot + 1));
+                if (match)
+                {
+                    if (found >= 0)
+                        return -1;
+                    found = static_cast<int>(i);
+                }
+            }
+            return found;
+        };
+        auto bare = [](const std::string &name)
+        {
+            const size_t dot = name.find('.');
+            return dot == std::string::npos ? name : name.substr(dot + 1);
+        };
+
+        std::vector<const Expression *> conjuncts;
+        Conjuncts(select.where.get(), &conjuncts);
+        Placement keys(view_.shards, view_.rf);
+        for (size_t i = 0; i < relations.size(); ++i)
+        {
+            Relation &r = relations[i];
+            auto info = view_.tables.find(r.table);
+            if (info == view_.tables.end())
+                continue; // unknown: the local run reports it
+            r.pushdown = !r.null_supplying && as_relation[r.table] == 1 && mentions[r.table] == 1;
+            r.shards = info->second.kind == "replicated" ? std::vector<uint32_t>{0} : AllShards();
+            if (!r.pushdown)
+                continue;
+            for (const Expression *c : conjuncts)
+            {
+                if (ContainsSubquery(c) || ContainsAggregate(c))
+                    continue;
+                std::vector<std::string> names;
+                ColumnNames(c, &names);
+                if (names.empty() || !std::all_of(names.begin(), names.end(),
+                                                  [&](const std::string &n) { return owner(n) == static_cast<int>(i); }))
+                    continue;
+                r.conditions.push_back(c);
+                if (info->second.kind != "hash")
+                    continue;
+                // Pruning: key = literal, key IN (literals)
+                std::vector<Value> keys_seen;
+                bool prunes = false;
+                auto is_key = [&](const Expression *e)
+                {
+                    return e->GetType() == ExpressionType::COLUMN_REF &&
+                           bare(static_cast<const ColumnExpression *>(e)->name) == info->second.shard_column;
+                };
+                if (c->GetType() == ExpressionType::BINARY_OP)
+                {
+                    const auto *b = static_cast<const BinaryExpression *>(c);
+                    if (b->op == TokenType::EQ)
+                    {
+                        if (is_key(b->left.get()) && b->right->GetType() == ExpressionType::LITERAL)
+                            keys_seen.push_back(static_cast<const LiteralExpression *>(b->right.get())->value), prunes = true;
+                        else if (is_key(b->right.get()) && b->left->GetType() == ExpressionType::LITERAL)
+                            keys_seen.push_back(static_cast<const LiteralExpression *>(b->left.get())->value), prunes = true;
+                    }
+                }
+                else if (c->GetType() == ExpressionType::IN_LIST)
+                {
+                    const auto *in = static_cast<const InListExpression *>(c);
+                    prunes = !in->negated && is_key(in->operand.get()) &&
+                             std::all_of(in->list.begin(), in->list.end(),
+                                         [](const auto &e) { return e->GetType() == ExpressionType::LITERAL; });
+                    if (prunes)
+                        for (const auto &e : in->list)
+                            keys_seen.push_back(static_cast<const LiteralExpression *>(e.get())->value);
+                }
+                if (!prunes)
+                    continue;
+                std::set<uint32_t> allowed;
+                for (const Value &key : keys_seen)
+                    if (!key.IsNull()) // key = NULL matches no row
+                        allowed.insert(keys.ShardFor(key));
+                std::vector<uint32_t> kept;
+                for (uint32_t s : r.shards)
+                    if (allowed.count(s))
+                        kept.push_back(s);
+                r.shards = kept;
+            }
+        }
+
+        SelectPlan plan;
+        // 1. Every table on one shard: run the whole statement there
+        {
+            bool single = !mentions.empty();
+            int shard = -1;
+            for (const auto &[table, count] : mentions)
+            {
+                const TableInfo &info = view_.tables.at(table);
+                if (info.kind == "replicated")
+                    continue;
+                auto r = std::find_if(relations.begin(), relations.end(),
+                                      [&](const Relation &rel) { return rel.table == table; });
+                if (r == relations.end() || !r->pushdown || r->shards.size() != 1 ||
+                    (shard >= 0 && static_cast<uint32_t>(shard) != r->shards[0]))
+                {
+                    single = false;
+                    break;
+                }
+                shard = static_cast<int>(r->shards[0]);
+            }
+            if (single)
+            {
+                plan.kind = SelectPlan::Kind::SINGLE_SHARD;
+                plan.shard = shard < 0 ? 0 : static_cast<uint32_t>(shard);
+                return plan;
+            }
+        }
+        // 2. Aggregates over one table, no grouping: per shard, combined here
+        const Relation &first = relations.front();
+        const bool one_table = relations.size() == 1 && view_.tables.count(first.table) &&
+                               view_.tables.at(first.table).kind != "replicated" && first.pushdown && !subqueries;
+        bool partial = one_table && select.group_by.empty() && !select.having && select.order_by.empty() &&
+                       !select.distinct && !select.limit && select.offset == 0 && !select.select_star &&
+                       !select.items.empty();
+        std::string parts;
+        for (const auto &item : select.items)
+        {
+            if (!partial)
+                break;
+            if (item.expr->GetType() != ExpressionType::AGGREGATE)
+            {
+                partial = false;
+                break;
+            }
+            const auto *agg = static_cast<const AggregateExpression *>(item.expr.get());
+            if (agg->distinct || (agg->argument && ContainsAggregate(agg->argument.get())))
+            {
+                partial = false;
+                break;
+            }
+            const std::string arg = agg->argument ? ExpressionToSQL(agg->argument.get()) : "*";
+            const char *name = agg->function == AggregateFunction::COUNT ? "COUNT"
+                               : agg->function == AggregateFunction::MIN ? "MIN"
+                               : agg->function == AggregateFunction::MAX ? "MAX"
+                                                                         : "SUM";
+            parts += std::string(parts.empty() ? "" : ", ") + name + "(" + arg + ")";
+            if (agg->function == AggregateFunction::AVG)
+                parts += ", COUNT(" + arg + ")";
+            plan.functions.push_back(agg->function);
+        }
+        const std::string from = " FROM " + first.table + (first.name != first.table ? " " + first.name : "");
+        if (partial)
+        {
+            plan.kind = SelectPlan::Kind::PARTIAL_AGGREGATE;
+            plan.shards = first.shards;
+            plan.shard_query = "SELECT " + parts + from +
+                               (select.where ? " WHERE " + ExpressionToSQL(select.where.get()) : "") + ";";
+            return plan;
+        }
+        plan.functions.clear();
+
+        // 3. Fetch each table's rows (its own conditions applied on its
+        // shards; top-N for ORDER BY ... LIMIT over one table), finish here
+        bool top_n = one_table && select.group_by.empty() && !select.having && !select.distinct && select.limit &&
+                     !select.order_by.empty();
+        for (const auto &item : select.items)
+            top_n = top_n && !ContainsAggregate(item.expr.get());
+        std::string order;
+        for (const auto &o : select.order_by)
+        {
+            if (!top_n)
+                break;
+            // Only plain columns of the table (not positions or SELECT aliases)
+            if (o.expr->GetType() != ExpressionType::COLUMN_REF || owner(static_cast<const ColumnExpression *>(o.expr.get())->name) != 0)
+            {
+                top_n = false;
+                break;
+            }
+            const std::string &name = static_cast<const ColumnExpression *>(o.expr.get())->name;
+            for (const auto &item : select.items)
+                top_n = top_n && item.alias != bare(name);
+            order += (order.empty() ? "" : ", ") + name + (o.descending ? " DESC" : "");
+        }
+        std::set<std::string> fetched;
+        for (const auto &r : relations)
+        {
+            if (!view_.tables.count(r.table) || !fetched.insert(r.table).second)
+                continue;
+            TableFetch fetch{r.table, r.shards, ""};
+            if (r.pushdown)
+            {
+                std::string where;
+                for (const Expression *c : r.conditions)
+                    where += (where.empty() ? "" : " AND ") + ("(" + ExpressionToSQL(c) + ")");
+                fetch.query = "SELECT *" + (r.name != r.table ? " FROM " + r.table + " " + r.name : " FROM " + r.table) +
+                              (where.empty() ? "" : " WHERE " + where);
+                if (top_n)
+                    fetch.query += " ORDER BY " + order + " LIMIT " + std::to_string(*select.limit + select.offset);
+                fetch.query += ";";
+            }
+            else
+            {
+                fetch.shards = view_.tables.at(r.table).kind == "replicated" ? std::vector<uint32_t>{0} : AllShards();
+                fetch.query = "SELECT * FROM " + r.table + ";";
+            }
+            plan.fetches.push_back(fetch);
+        }
+        // Tables named only inside subqueries: all of their rows
+        for (const auto &[table, count] : mentions)
+            if (fetched.insert(table).second)
+                plan.fetches.push_back({table,
+                                        view_.tables.at(table).kind == "replicated" ? std::vector<uint32_t>{0}
+                                                                                    : AllShards(),
+                                        "SELECT * FROM " + table + ";"});
+        return plan;
+    }
+
+    std::string Coordinator::Describe(const SelectPlan &plan) const
+    {
+        switch (plan.kind)
+        {
+        case SelectPlan::Kind::SINGLE_SHARD:
+            return "Distributed: the whole statement on shard " + std::to_string(plan.shard) + "\n";
+        case SelectPlan::Kind::PARTIAL_AGGREGATE:
+            return "Distributed: partial aggregates on shards " + List(plan.shards) + ": " + plan.shard_query +
+                   " (combined by the coordinator)\n";
+        case SelectPlan::Kind::GATHER:
+            break;
+        }
+        std::string text = "Distributed: rows gathered to the coordinator\n";
+        for (const auto &fetch : plan.fetches)
+            text += "  " + fetch.table + " from shards " + List(fetch.shards) + ": " + fetch.query + "\n";
+        return text + "Coordinator:\n";
+    }
+
+    ExecutionResult Coordinator::RunPartialAggregate(const SelectPlan &plan, const SelectStatement &select,
+                                                     Database &schema)
+    {
+        // Column names (and checks) from the statement over the empty schema
+        Session session(&schema);
+        ExecutionResult result = session.Execute(SelectToSQL(select) + ";");
+        if (!result.success)
+            return result;
+        struct Total
+        {
+            int64_t count = 0, int_sum = 0;
+            double float_sum = 0;
+            bool has_float = false, any = false;
+            std::optional<Value> best;
+        };
+        std::vector<Total> totals(plan.functions.size());
+        for (uint32_t shard : plan.shards)
+        {
+            ExecutionResult part = ShardCall(shard, "read", plan.shard_query);
+            if (!part.success)
+                return part;
+            const Tuple &row = part.tuples.at(0);
+            size_t column = 0;
+            for (size_t i = 0; i < plan.functions.size(); ++i)
+            {
+                Total &t = totals[i];
+                const Value &v = row.GetValue(column++);
+                switch (plan.functions[i])
+                {
+                case AggregateFunction::COUNT:
+                    t.count += v.GetAsInt();
+                    break;
+                case AggregateFunction::SUM:
+                case AggregateFunction::AVG:
+                    if (!v.IsNull())
+                    {
+                        t.any = true;
+                        if (v.GetType() == DataType::FLOAT)
+                            t.float_sum += v.GetAsFloat(), t.has_float = true;
+                        else if (__builtin_add_overflow(t.int_sum, static_cast<int64_t>(v.GetAsInt()), &t.int_sum))
+                            return Failure("Integer overflow");
+                    }
+                    if (plan.functions[i] == AggregateFunction::AVG)
+                        t.count += row.GetValue(column++).GetAsInt();
+                    break;
+                case AggregateFunction::MIN:
+                case AggregateFunction::MAX:
+                    if (!v.IsNull() &&
+                        (!t.best || (plan.functions[i] == AggregateFunction::MIN ? CompareForSort(v, *t.best) < 0
+                                                                                 : CompareForSort(v, *t.best) > 0)))
+                        t.best = v;
+                    break;
+                }
+            }
+        }
+        std::vector<Value> values;
+        for (size_t i = 0; i < plan.functions.size(); ++i)
+        {
+            const Total &t = totals[i];
+            switch (plan.functions[i])
+            {
+            case AggregateFunction::COUNT:
+                if (t.count > INT32_MAX)
+                    return Failure("Integer overflow");
+                values.push_back(Value(static_cast<int32_t>(t.count)));
+                break;
+            case AggregateFunction::SUM:
+                if (!t.any)
+                    values.push_back(Value(DataType::INTEGER));
+                else if (t.has_float)
+                    values.push_back(Value(static_cast<double>(t.int_sum) + t.float_sum));
+                else if (t.int_sum < INT32_MIN || t.int_sum > INT32_MAX)
+                    return Failure("Integer overflow");
+                else
+                    values.push_back(Value(static_cast<int32_t>(t.int_sum)));
+                break;
+            case AggregateFunction::AVG:
+                values.push_back(t.count == 0 ? Value(DataType::FLOAT)
+                                              : Value((static_cast<double>(t.int_sum) + t.float_sum) /
+                                                      static_cast<double>(t.count)));
+                break;
+            case AggregateFunction::MIN:
+            case AggregateFunction::MAX:
+                values.push_back(t.best ? *t.best : Value());
+                break;
+            }
+        }
+        result.tuples = {Tuple(values)};
+        return result;
+    }
+
+    ExecutionResult Coordinator::Select(const std::string &sql)
+    {
+        auto data = SchemaDatabase();
+        std::string error;
+        auto stmt = ParseOne(sql, &error);
+        const SelectStatement *select = nullptr;
+        if (stmt && stmt->GetType() == StatementType::SELECT)
+            select = static_cast<const SelectStatement *>(stmt.get());
+        else if (stmt && stmt->GetType() == StatementType::EXPLAIN_STMT)
+            select = static_cast<const ExplainStatement *>(stmt.get())->select.get();
+        if (!select)
+        {
+            Session session(data.get()); // reports the error as a single node does
+            return session.Execute(sql);
+        }
+        const bool explain = stmt->GetType() == StatementType::EXPLAIN_STMT;
+        const SelectPlan plan = PlanSelect(*select, sql, *data);
+
+        if (plan.kind == SelectPlan::Kind::SINGLE_SHARD)
+        {
+            ExecutionResult result = ShardCall(plan.shard, "read", sql);
+            if (explain && result.success)
+                result.message = Describe(plan) + result.message;
+            return result;
+        }
+        if (plan.kind == SelectPlan::Kind::PARTIAL_AGGREGATE)
+        {
+            if (explain)
+                return Success(Describe(plan));
+            return RunPartialAggregate(plan, *select, *data);
+        }
+        Catalog &catalog = data->GetCatalog();
+        for (const auto &fetch : plan.fetches)
+        {
+            Table *table = catalog.GetTable(fetch.table);
+            for (uint32_t shard : explain ? std::vector<uint32_t>{} : fetch.shards)
+            {
+                ExecutionResult rows = ShardCall(shard, "read", fetch.query);
                 if (!rows.success)
                     return rows;
                 for (const auto &tuple : rows.tuples)
@@ -824,13 +1266,86 @@ namespace sql::cluster
                     }
                     catch (const std::exception &e)
                     {
-                        return Failure("rows of " + name + " on different shards conflict: " + e.what());
+                        return Failure("rows of " + fetch.table + " on different shards conflict: " + e.what());
                     }
                 }
             }
         }
         Session session(data.get());
-        return session.Execute(sql);
+        ExecutionResult result = session.Execute(sql);
+        if (explain && result.success)
+            result.message = Describe(plan) + result.message;
+        return result;
+    }
+
+    std::unique_ptr<Expression> Coordinator::BindSubqueries(const Expression *expr, std::string *error)
+    {
+        if (!expr)
+            return nullptr;
+        return RewriteExpression(
+            expr,
+            [&](const Expression *node) -> std::unique_ptr<Expression>
+            {
+                if (node->GetType() != ExpressionType::SUBQUERY || !error->empty())
+                    return nullptr;
+                const auto *sub = static_cast<const SubqueryExpression *>(node);
+                // Run on the whole cluster, against the data as it is before
+                // the statement (as a single node evaluates it). A subquery
+                // that refers to the outer row does not run on its own.
+                ExecutionResult rows = Select(SelectToSQL(*sub->select) + ";");
+                if (!rows.success)
+                {
+                    // It names something only the outer statement has
+                    const bool correlated = rows.message.find("Unknown column") != std::string::npos ||
+                                            rows.message.find("Unknown table qualifier") != std::string::npos;
+                    *error = correlated
+                                 ? "correlated subqueries in UPDATE and DELETE are not supported in a cluster (" +
+                                       rows.message + ")"
+                                 : rows.message;
+                    return std::make_unique<LiteralExpression>(Value(DataType::INTEGER));
+                }
+                switch (sub->kind)
+                {
+                case SubqueryExpression::Kind::SCALAR:
+                    if (rows.tuples.size() > 1)
+                        *error = "Scalar subquery returned more than one row";
+                    return std::make_unique<LiteralExpression>(rows.tuples.empty() ? Value(DataType::INTEGER)
+                                                                                    : rows.tuples[0].GetValue(0));
+                case SubqueryExpression::Kind::EXISTS:
+                    return std::make_unique<LiteralExpression>(Value(rows.tuples.empty() == sub->negated));
+                case SubqueryExpression::Kind::IN:
+                {
+                    // x IN (no rows) is FALSE, even for a NULL x; NOT IN, TRUE
+                    if (rows.tuples.empty())
+                        return std::make_unique<LiteralExpression>(Value(sub->negated));
+                    std::vector<std::unique_ptr<Expression>> list;
+                    for (const auto &tuple : rows.tuples)
+                        list.push_back(std::make_unique<LiteralExpression>(tuple.GetValue(0)));
+                    return std::make_unique<InListExpression>(BindSubqueries(sub->operand.get(), error),
+                                                              std::move(list), sub->negated);
+                }
+                }
+                return nullptr;
+            });
+    }
+
+    std::string Coordinator::BoundUpdate(const UpdateStatement &update, std::string *error)
+    {
+        std::string sql = "UPDATE " + update.table + " SET ";
+        for (size_t i = 0; i < update.assignments.size(); ++i)
+            sql += (i ? ", " : "") + update.assignments[i].first + " = " +
+                   ExpressionToSQL(BindSubqueries(update.assignments[i].second.get(), error).get());
+        if (update.where)
+            sql += " WHERE " + ExpressionToSQL(BindSubqueries(update.where.get(), error).get());
+        return sql + ";";
+    }
+
+    std::string Coordinator::BoundDelete(const DeleteStatement &del, std::string *error)
+    {
+        std::string sql = "DELETE FROM " + del.table;
+        if (del.where)
+            sql += " WHERE " + ExpressionToSQL(BindSubqueries(del.where.get(), error).get());
+        return sql + ";";
     }
 
     std::string Coordinator::Command(const std::string &name, const std::string &argument)

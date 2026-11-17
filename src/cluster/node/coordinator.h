@@ -1,6 +1,7 @@
 #pragma once
 
 #include "catalog/database.h"
+#include "parser/ast.h"
 #include "cluster/shard/replicated_shard.h"
 #include "net/remote_connection.h"
 #include "server/server.h"
@@ -75,6 +76,9 @@ namespace sql::cluster
         std::string Command(const std::string &name, const std::string &argument);
         ExecutionResult Call(const std::string &method, const std::vector<std::string> &arguments);
 
+        // For tests: shard reads sent so far
+        uint64_t ShardReads() const { return shard_reads_; }
+
         // For tests and status: as last loaded by the leader
         bool Formed();
         size_t NodeCount();
@@ -122,6 +126,38 @@ namespace sql::cluster
         ExecutionResult Insert(const std::string &sql);
         ExecutionResult Broadcast(const std::string &sql, const std::string &table);
         ExecutionResult Select(const std::string &sql);
+
+        // How a SELECT runs on the cluster (D5)
+        struct TableFetch
+        {
+            std::string table;
+            std::vector<uint32_t> shards; // empty: no shard can hold a matching row
+            std::string query;            // sent to each of them
+        };
+        struct SelectPlan
+        {
+            enum class Kind
+            {
+                SINGLE_SHARD,      // the whole statement on one shard
+                PARTIAL_AGGREGATE, // aggregates per shard, combined here
+                GATHER,            // fetch (filtered) rows, finish here
+            } kind = Kind::GATHER;
+            uint32_t shard = 0;                 // SINGLE_SHARD
+            std::vector<uint32_t> shards;       // PARTIAL_AGGREGATE
+            std::string shard_query;            // PARTIAL_AGGREGATE
+            std::vector<AggregateFunction> functions; // PARTIAL_AGGREGATE, one per output column
+            std::vector<TableFetch> fetches;    // GATHER
+        };
+        SelectPlan PlanSelect(const SelectStatement &select, const std::string &sql, Database &schema);
+        std::string Describe(const SelectPlan &plan) const;
+        ExecutionResult RunPartialAggregate(const SelectPlan &plan, const SelectStatement &select, Database &schema);
+        // A copy of the expression with every (uncorrelated) subquery run on
+        // the cluster and replaced by its result as literals; sets *error
+        // if one fails
+        std::unique_ptr<Expression> BindSubqueries(const Expression *expr, std::string *error);
+        // UPDATE / DELETE with subqueries bound, as SQL
+        std::string BoundUpdate(const UpdateStatement &update, std::string *error);
+        std::string BoundDelete(const DeleteStatement &del, std::string *error);
         ExecutionResult Join(const std::vector<std::string> &arguments);
         std::vector<uint32_t> AllShards() const;
 
@@ -130,6 +166,7 @@ namespace sql::cluster
         std::unique_ptr<Server> server_;
         std::thread loop_;
         std::atomic<bool> stopping_{false};
+        std::atomic<uint64_t> shard_reads_{0};
 
         std::mutex op_mutex_; // one cluster operation at a time
         bool was_leader_ = false;
