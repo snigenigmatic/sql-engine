@@ -7,6 +7,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace sql::cluster
@@ -34,8 +35,11 @@ namespace sql::cluster
         explicit ShardStateMachine(const std::string &directory, size_t snapshot_chunk = 1 << 20);
         ~ShardStateMachine() override;
 
-        // Log entry payloads
-        static nuraft::ptr<nuraft::buffer> EncodeWrite(const std::string &sql);
+        // Log entry payloads. `request_id` (1-255 characters) makes a write
+        // idempotent: a retry with the same id after an uncertain failure
+        // (e.g. a leader change cancelled the request, but it committed)
+        // returns the first outcome instead of applying again
+        static nuraft::ptr<nuraft::buffer> EncodeWrite(const std::string &sql, const std::string &request_id);
         static nuraft::ptr<nuraft::buffer> EncodeBarrier(); // applies nothing
         // The result an entry's commit returned (an error if malformed)
         static ExecutionResult DecodeResult(nuraft::buffer *result);
@@ -66,11 +70,18 @@ namespace sql::cluster
         // Caller holds mutex_
         void OpenDatabase();
         void CloseDatabase();
-        ExecutionResult Apply(nuraft::ulong index, const std::string &sql);
+        ExecutionResult Apply(nuraft::ulong index, const std::string &sql, const std::string &request_id);
+        // The outcome recorded for a request id, if it was applied
+        std::optional<ExecutionResult> Recorded(const std::string &request_id);
+        void Record(nuraft::ulong index, const std::string &request_id, const ExecutionResult &result);
         // Sets __raft_meta to the index, in the open transaction if any
         void RecordApplied(nuraft::ulong index);
 
         static constexpr const char *META_TABLE = "__raft_meta";
+        // Outcomes of recent writes by request id; entries older than
+        // REQUEST_WINDOW log entries are pruned
+        static constexpr const char *REQUESTS_TABLE = "__raft_requests";
+        static constexpr nuraft::ulong REQUEST_WINDOW = 10000;
         std::string SnapshotPath(nuraft::ulong index, const char *suffix) const;
         void DropOldSnapshots(nuraft::ulong keep);
 

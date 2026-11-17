@@ -52,7 +52,16 @@ namespace sql::cluster
         // One statement, replicated: committed by a quorum and applied on
         // every replica. Only the leader accepts writes; elsewhere (or if
         // the quorum is lost) the result is a failure saying so.
-        ExecutionResult Write(const std::string &sql);
+        //
+        // A "not committed" failure is uncertain: a leader change may have
+        // cancelled the request after it was replicated, and the new leader
+        // may still commit it. Retrying with the same `request_id` is safe:
+        // a write that went through returns its first outcome instead of
+        // applying again. Without an id, a fresh one is used.
+        ExecutionResult Write(const std::string &sql, const std::string &request_id = "");
+
+        // A new random request id
+        static std::string NewRequestId();
 
         // A SELECT/EXPLAIN that sees every write committed before it began
         // (linearizable): the leader commits a no-op through the log first,

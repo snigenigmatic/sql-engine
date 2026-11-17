@@ -1,6 +1,8 @@
 #include "cluster/shard/replicated_shard.h"
 #include "cluster/raft/raft_logger.h"
+#include <cstdio>
 #include <filesystem>
+#include <random>
 #include <stdexcept>
 
 namespace sql::cluster
@@ -72,9 +74,18 @@ namespace sql::cluster
         return ShardStateMachine::DecodeResult(result->get().get());
     }
 
-    ExecutionResult ReplicatedShard::Write(const std::string &sql)
+    std::string ReplicatedShard::NewRequestId()
     {
-        return Replicate(ShardStateMachine::EncodeWrite(sql));
+        static thread_local std::mt19937_64 random(std::random_device{}());
+        char id[33];
+        std::snprintf(id, sizeof(id), "%016llx%016llx", static_cast<unsigned long long>(random()),
+                      static_cast<unsigned long long>(random()));
+        return id;
+    }
+
+    ExecutionResult ReplicatedShard::Write(const std::string &sql, const std::string &request_id)
+    {
+        return Replicate(ShardStateMachine::EncodeWrite(sql, request_id.empty() ? NewRequestId() : request_id));
     }
 
     ExecutionResult ReplicatedShard::Read(const std::string &sql)

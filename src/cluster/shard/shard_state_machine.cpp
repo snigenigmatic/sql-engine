@@ -131,6 +131,17 @@ namespace sql::cluster
             if (!db_->Commit())
                 throw std::runtime_error("cannot create " + std::string(META_TABLE));
         }
+        if (catalog.GetTable(REQUESTS_TABLE) == nullptr)
+        {
+            Column id("id", DataType::VARCHAR, 255);
+            id.primary_key = id.not_null = true; // indexed: retries are looked up by id
+            catalog.CreateTable(REQUESTS_TABLE,
+                                Schema({id, Column("idx", DataType::INTEGER), Column("success", DataType::BOOLEAN),
+                                        Column("message", DataType::VARCHAR)}),
+                                true);
+            if (!db_->Commit())
+                throw std::runtime_error("cannot create " + std::string(REQUESTS_TABLE));
+        }
         const Table *meta = catalog.GetTable(META_TABLE);
         if (meta->GetTupleCount() != 1)
             throw std::runtime_error(std::string("shard replica: ") + META_TABLE + " must hold exactly one row");
@@ -152,9 +163,45 @@ namespace sql::cluster
         db_.reset();
     }
 
-    ptr<buffer> ShardStateMachine::EncodeWrite(const std::string &sql)
+    ptr<buffer> ShardStateMachine::EncodeWrite(const std::string &sql, const std::string &request_id)
     {
-        return Bytes(std::string(1, static_cast<char>(Kind::WRITE)) + sql);
+        if (request_id.empty() || request_id.size() > 255)
+            throw std::invalid_argument("a request id has 1 to 255 characters");
+        return Bytes(std::string(1, static_cast<char>(Kind::WRITE)) +
+                     std::string(1, static_cast<char>(request_id.size())) + request_id + sql);
+    }
+
+    std::optional<ExecutionResult> ShardStateMachine::Recorded(const std::string &request_id)
+    {
+        Table *requests = db_->GetCatalog().GetTable(REQUESTS_TABLE);
+        BTree *by_id = db_->GetCatalog().GetIndex(REQUESTS_TABLE, "id");
+        if (!by_id)
+            throw std::runtime_error(std::string(REQUESTS_TABLE) + " has no index on id");
+        for (const RID &rid : by_id->Search(Value(request_id)))
+        {
+            Tuple row;
+            if (requests->GetTuple(rid, &row))
+                return ExecutionResult{row.GetValue(2).GetAsBool(), row.GetValue(3).ToString(), {}, {}};
+        }
+        return std::nullopt;
+    }
+
+    void ShardStateMachine::Record(ulong index, const std::string &request_id, const ExecutionResult &result)
+    {
+        Catalog &catalog = db_->GetCatalog();
+        Table *requests = catalog.GetTable(REQUESTS_TABLE);
+        catalog.InsertRow(requests, Tuple({Value(request_id), Value(static_cast<int32_t>(index)),
+                                           Value(result.success), Value(result.message)}));
+        // Now and then, forget requests too old to be retried
+        if (index % 1024 == 0 && index > REQUEST_WINDOW)
+        {
+            std::vector<RID> old;
+            for (auto it = requests->begin(); it != requests->end(); ++it)
+                if (static_cast<ulong>(it->GetValue(1).GetAsInt()) < index - REQUEST_WINDOW)
+                    old.push_back(it.GetRID());
+            for (const RID &rid : old)
+                catalog.DeleteRow(requests, rid);
+        }
     }
 
     ptr<buffer> ShardStateMachine::EncodeBarrier() { return Bytes(std::string(1, static_cast<char>(Kind::BARRIER))); }
@@ -170,8 +217,16 @@ namespace sql::cluster
         return std::move(decoded->results.front());
     }
 
-    ExecutionResult ShardStateMachine::Apply(ulong index, const std::string &sql)
+    ExecutionResult ShardStateMachine::Apply(ulong index, const std::string &sql, const std::string &request_id)
     {
+        // A retry of a write that already went through: its first outcome
+        if (auto first = Recorded(request_id))
+        {
+            RecordApplied(index);
+            if (!db_->Commit())
+                throw std::runtime_error("shard replica cannot commit");
+            return *first;
+        }
         // Transactions across entries are two-phase commit's job (D6)
         if (TypeOf(sql) == StatementType::TRANSACTION_STMT)
             return Failure("BEGIN, COMMIT and ROLLBACK cannot be sent to a shard directly");
@@ -179,7 +234,8 @@ namespace sql::cluster
         // A failing statement is rolled back on its own; the transaction
         // stays open for the applied index
         ExecutionResult result = Run(*session_, sql);
-        RecordApplied(index); // inside the same transaction
+        Record(index, request_id, result); // inside the same transaction
+        RecordApplied(index);
         Must(session_->Execute("COMMIT;"), "commit");
         return result;
     }
@@ -191,8 +247,12 @@ namespace sql::cluster
         ExecutionResult result;
         if (log_idx <= last_applied_)
             result = Failure("already applied"); // cannot happen: NuRaft replays after last_commit_index
-        else if (!payload.empty() && payload[0] == static_cast<char>(Kind::WRITE))
-            result = Apply(log_idx, payload.substr(1));
+        else if (payload.size() >= 2 && payload[0] == static_cast<char>(Kind::WRITE) &&
+                 payload.size() >= 2 + static_cast<size_t>(static_cast<unsigned char>(payload[1])))
+        {
+            const size_t id_size = static_cast<unsigned char>(payload[1]);
+            result = Apply(log_idx, payload.substr(2 + id_size), payload.substr(2, id_size));
+        }
         else
         {
             // A barrier (or anything unknown): only the index moves on

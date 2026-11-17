@@ -88,7 +88,9 @@ namespace sql::cluster
                     options.directory = root_ + "/replica-" + std::to_string(options.id);
                     options.members = members_;
                     options.heartbeat_ms = 50;
-                    options.election_timeout_ms = 300;
+                    // Generous: under sanitizers on a loaded machine shorter
+                    // timeouts cause needless elections
+                    options.election_timeout_ms = 1000;
                     options.snapshot_distance = snapshot_distance;
                     options.snapshot_chunk = snapshot_chunk;
                     options_.push_back(options);
@@ -124,12 +126,38 @@ namespace sql::cluster
                 return leader;
             }
 
-            ExecutionResult Write(const std::string &sql)
+            // As a client should: an uncertain failure (no leader, or a
+            // leader change cancelled the request) is retried with the same
+            // request id, which a shard applies at most once
+            ExecutionResult Write(const std::string &sql, std::string id = "")
             {
-                ReplicatedShard *leader = Leader();
-                if (!leader)
-                    return ExecutionResult{false, "no leader", {}, {}};
-                return leader->Write(sql);
+                if (id.empty())
+                    id = ReplicatedShard::NewRequestId();
+                ExecutionResult result{false, "no leader", {}, {}};
+                const auto deadline = std::chrono::steady_clock::now() + 20s;
+                while (std::chrono::steady_clock::now() < deadline)
+                {
+                    if (ReplicatedShard *leader = Leader())
+                        result = leader->Write(sql, id);
+                    if (result.message.find("not committed") == std::string::npos &&
+                        result.message.find("not the leader") == std::string::npos && result.message != "no leader")
+                        return result;
+                    std::this_thread::sleep_for(50ms);
+                }
+                return result;
+            }
+
+            // A linearizable read through whichever replica leads
+            ExecutionResult Read(const std::string &sql)
+            {
+                ExecutionResult result{false, "no leader", {}, {}};
+                WaitFor(
+                    [&]
+                    {
+                        ReplicatedShard *leader = Leader();
+                        return leader && (result = leader->Read(sql)).success;
+                    });
+                return result;
             }
 
             // Every running replica's own data answers `sql` with `rows`
@@ -182,9 +210,9 @@ namespace sql::cluster
     TEST(ReplicatedShardTest, OnlyTheLeaderServes)
     {
         Shard shard;
+        ASSERT_TRUE(shard.Write("CREATE TABLE t (a INTEGER);").success);
         ReplicatedShard *leader = shard.Leader();
         ASSERT_NE(leader, nullptr);
-        ASSERT_TRUE(leader->Write("CREATE TABLE t (a INTEGER);").success);
         for (size_t i = 0; i < shard.Size(); ++i)
         {
             if (&shard[i] == leader)
@@ -220,13 +248,48 @@ namespace sql::cluster
         EXPECT_TRUE(shard.AllAgree("SELECT id FROM t ORDER BY id;", {"1", "3"}));
     }
 
-    TEST(ReplicatedShardTest, ReadsNeedAQuorum)
+    TEST(ReplicatedShardTest, RetriedRequestsApplyOnce)
     {
         Shard shard;
         ASSERT_TRUE(shard.Write("CREATE TABLE t (a INTEGER);").success);
+        // The same request twice (as after an uncertain failure): applied once,
+        // and the retry gets the first outcome
+        const auto first = shard.Write("INSERT INTO t VALUES (1), (2);", "request-1");
+        ASSERT_TRUE(first.success) << first.message;
+        const auto retry = shard.Write("INSERT INTO t VALUES (1), (2);", "request-1");
+        EXPECT_TRUE(retry.success);
+        EXPECT_EQ(retry.message, first.message);
+        // ...also a failed one: the retry fails the same way, unapplied
+        const auto bad = shard.Write("INSERT INTO nosuch VALUES (1);", "request-2");
+        const auto bad_retry = shard.Write("INSERT INTO nosuch VALUES (1);", "request-2");
+        EXPECT_FALSE(bad_retry.success);
+        EXPECT_EQ(bad_retry.message, bad.message);
+        // A new id is a new write
+        ASSERT_TRUE(shard.Write("INSERT INTO t VALUES (3);", "request-3").success);
+        EXPECT_TRUE(shard.AllAgree("SELECT COUNT(*), SUM(a) FROM t;", {"3|6"}));
+        // ...and so it stays across a full restart
+        for (size_t i = 0; i < shard.Size(); ++i)
+            shard.Stop(i);
+        for (size_t i = 0; i < shard.Size(); ++i)
+            shard.Start(i);
+        EXPECT_EQ(shard.Write("INSERT INTO t VALUES (1), (2);", "request-1").message, first.message);
+        EXPECT_TRUE(shard.AllAgree("SELECT COUNT(*), SUM(a) FROM t;", {"3|6"}));
+        // The ledger is the engine's: SQL cannot change it
+        EXPECT_FALSE(shard.Write("DELETE FROM __raft_requests;").success);
+    }
+
+    TEST(ReplicatedShardTest, ReadsNeedAQuorum)
+    {
+        Shard shard;
+        {
+            const auto created = shard.Write("CREATE TABLE t (a INTEGER);");
+            ASSERT_TRUE(created.success) << created.message;
+        }
         ReplicatedShard *leader = shard.Leader();
         ASSERT_NE(leader, nullptr);
-        ASSERT_TRUE(leader->Read("SELECT COUNT(*) FROM t;").success);
+        ASSERT_TRUE(shard.Read("SELECT COUNT(*) FROM t;").success);
+        leader = shard.Leader(); // whoever leads now
+        ASSERT_NE(leader, nullptr);
         // Cut off from both followers, the leader cannot prove it still
         // leads: it may not serve reads, since a new leader elsewhere could
         // already have taken writes it has not seen
@@ -241,7 +304,10 @@ namespace sql::cluster
     TEST(ReplicatedShardTest, SurvivesItsLeaderAndCatchesUpOnRestart)
     {
         Shard shard;
-        ASSERT_TRUE(shard.Write("CREATE TABLE t (a INTEGER);").success);
+        {
+            const auto created = shard.Write("CREATE TABLE t (a INTEGER);");
+            ASSERT_TRUE(created.success) << created.message;
+        }
         for (int i = 0; i < 10; ++i)
             ASSERT_TRUE(shard.Write("INSERT INTO t VALUES (" + std::to_string(i) + ");").success);
         ReplicatedShard *old_leader = shard.Leader();
@@ -257,7 +323,7 @@ namespace sql::cluster
         EXPECT_NE(leader->Id(), static_cast<int>(old) + 1);
         for (int i = 10; i < 20; ++i)
             ASSERT_TRUE(shard.Write("INSERT INTO t VALUES (" + std::to_string(i) + ");").success);
-        auto count = leader->Read("SELECT COUNT(*), SUM(a) FROM t;");
+        auto count = shard.Read("SELECT COUNT(*), SUM(a) FROM t;");
         EXPECT_EQ(Rows(count), (std::vector<std::string>{"20|190"}));
 
         // The old leader restarts from its own files and catches up
@@ -269,7 +335,10 @@ namespace sql::cluster
     {
         Shard shard;
         // No primary key: a replayed INSERT would show up as an extra row
-        ASSERT_TRUE(shard.Write("CREATE TABLE t (a INTEGER);").success);
+        {
+            const auto created = shard.Write("CREATE TABLE t (a INTEGER);");
+            ASSERT_TRUE(created.success) << created.message;
+        }
         for (int i = 0; i < 15; ++i)
             ASSERT_TRUE(shard.Write("INSERT INTO t VALUES (1);").success);
         ASSERT_TRUE(shard.AllAgree("SELECT COUNT(*) FROM t;", {"15"}));
@@ -287,7 +356,10 @@ namespace sql::cluster
     {
         // Small pieces: the snapshot (a few pages) crosses in many of them
         Shard shard(/*snapshot_distance=*/10, /*snapshot_chunk=*/1000);
-        ASSERT_TRUE(shard.Write("CREATE TABLE t (a INTEGER);").success);
+        {
+            const auto created = shard.Write("CREATE TABLE t (a INTEGER);");
+            ASSERT_TRUE(created.success) << created.message;
+        }
         for (int i = 0; i < 60; ++i)
             ASSERT_TRUE(shard.Write("INSERT INTO t VALUES (" + std::to_string(i) + ");").success);
         ASSERT_TRUE(shard.AllAgree("SELECT COUNT(*) FROM t;", {"60"}));
@@ -314,8 +386,6 @@ namespace sql::cluster
     {
         Shard shard;
         ASSERT_TRUE(shard.Write("CREATE TABLE t (writer INTEGER, n INTEGER);").success);
-        ReplicatedShard *leader = shard.Leader();
-        ASSERT_NE(leader, nullptr);
         std::vector<std::thread> writers;
         std::atomic<int> failures{0};
         for (int w = 0; w < 4; ++w)
@@ -323,8 +393,8 @@ namespace sql::cluster
                 [&, w]
                 {
                     for (int n = 0; n < 25; ++n)
-                        if (!leader->Write("INSERT INTO t VALUES (" + std::to_string(w) + ", " + std::to_string(n) +
-                                           ");")
+                        if (!shard.Write("INSERT INTO t VALUES (" + std::to_string(w) + ", " + std::to_string(n) +
+                                         ");")
                                  .success)
                             ++failures;
                 });
