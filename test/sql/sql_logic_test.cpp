@@ -9,11 +9,20 @@
 //   ----                      both sides first (for queries whose order is
 //   1|ann                     not defined)
 //
-// Each file runs in a fresh in-memory database, statement by statement,
-// through a Session (so BEGIN / COMMIT / ROLLBACK work).
+// Each file runs in a fresh temporary database, statement by statement,
+// through a Session (so BEGIN / COMMIT / ROLLBACK work). Every file runs
+// in this process (Local), through a server over TCP (Remote) and on an
+// in-process cluster of coordinators and storage nodes (Cluster), which
+// must all give the same answers.
 
 #include <gtest/gtest.h>
+#include "cli/local_connection.h"
+#include "net/remote_connection.h"
+#include "server/server.h"
 #include "session/session.h"
+#ifdef SQLENGINE_DISTRIBUTED
+#include "../cluster/test_cluster.h"
+#endif
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -46,9 +55,12 @@ namespace sql
 
         class SqlLogicTest : public ::testing::TestWithParam<std::string>
         {
+        protected:
+            // Runs the file's checks over a connection to an empty database
+            void RunScript(Connection &session);
         };
 
-        TEST_P(SqlLogicTest, Script)
+        void SqlLogicTest::RunScript(Connection &session)
         {
             const std::string path = std::string(SQL_TEST_DIR) + "/" + GetParam();
             std::ifstream file(path);
@@ -61,24 +73,6 @@ namespace sql
                 lines.push_back(line);
             }
 
-            // A real (temporary) database file, so transactions work
-            const std::string db_path =
-                (std::filesystem::temp_directory_path() / ("sql_logic_" + std::to_string(getpid()) + ".db")).string();
-            std::filesystem::remove(db_path);
-            std::filesystem::remove(db_path + "-wal");
-            struct RemoveFiles // declared first, so it runs after the database closes
-            {
-                std::string path;
-                ~RemoveFiles()
-                {
-                    std::filesystem::remove(path);
-                    std::filesystem::remove(path + "-wal");
-                }
-            } cleanup{db_path};
-            std::string error;
-            auto db = Database::Open(db_path, &error);
-            ASSERT_NE(db, nullptr) << error;
-            Session session(db.get());
             size_t checks = 0;
             size_t i = 0;
             while (i < lines.size())
@@ -142,6 +136,64 @@ namespace sql
             }
             EXPECT_GT(checks, 0u) << GetParam() << " has no checks";
         }
+
+        // A temporary database file (so transactions work), removed after
+        struct TempDatabase
+        {
+            std::string path;
+            std::unique_ptr<Database> db;
+
+            TempDatabase()
+                : path((std::filesystem::temp_directory_path() / ("sql_logic_" + std::to_string(getpid()) + ".db"))
+                           .string())
+            {
+                Remove();
+                std::string error;
+                db = Database::Open(path, &error);
+                EXPECT_NE(db, nullptr) << error;
+            }
+            ~TempDatabase()
+            {
+                db.reset();
+                Remove();
+            }
+            void Remove()
+            {
+                std::filesystem::remove(path);
+                std::filesystem::remove(path + "-wal");
+            }
+        };
+
+        TEST_P(SqlLogicTest, Local)
+        {
+            TempDatabase file;
+            ASSERT_NE(file.db, nullptr);
+            Session session(file.db.get());
+            LocalConnection connection(file.db.get(), &session);
+            RunScript(connection);
+        }
+
+        TEST_P(SqlLogicTest, Remote)
+        {
+            TempDatabase file;
+            ASSERT_NE(file.db, nullptr);
+            Server server(file.db.get());
+            server.Start("127.0.0.1", 0);
+            net::RemoteConnection connection("127.0.0.1", server.Port());
+            RunScript(connection);
+        }
+
+#ifdef SQLENGINE_DISTRIBUTED
+        TEST_P(SqlLogicTest, Cluster)
+        {
+            if (GetParam() == "transactions.test")
+                GTEST_SKIP() << "BEGIN/COMMIT across shards arrive with two-phase commit (milestone D6)";
+            cluster::testing::Cluster cluster;
+            ASSERT_TRUE(cluster.WaitFormed());
+            auto connection = cluster.Client(0);
+            RunScript(*connection);
+        }
+#endif
 
         INSTANTIATE_TEST_SUITE_P(Golden, SqlLogicTest, ::testing::ValuesIn(TestFiles()),
                                  [](const ::testing::TestParamInfo<std::string> &info)

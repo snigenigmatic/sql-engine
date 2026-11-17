@@ -119,11 +119,18 @@ namespace sql
         return sql;
     }
 
-    std::string Shell::Prompt() const
+    std::string Shell::Prompt()
     {
         if (!buffer_.empty())
             return "  -> ";
-        return session_->InTransaction() ? "sql*> " : "sql> ";
+        try
+        {
+            return connection_->InTransaction() ? "sql*> " : "sql> ";
+        }
+        catch (const std::exception &)
+        {
+            return "sql> "; // the next statement reports the broken connection
+        }
     }
 
     void Shell::PrintHelp()
@@ -141,28 +148,19 @@ namespace sql
              << "  INSERT INTO t VALUES (1, 'hello');\n"
              << "  SELECT name, COUNT(*) FROM t GROUP BY name ORDER BY 2 DESC LIMIT 10;\n"
              << "  BEGIN; ... COMMIT;   (or ROLLBACK;)\n"
-             << "\nDatabase: " << db_->GetPath() << " (write-ahead log: " << db_->GetPath() << "-wal)\n";
+             << "\n";
+        RunCommand("describe", "");
     }
 
-    void Shell::ListTables()
+    void Shell::RunCommand(const std::string &name, const std::string &argument)
     {
-        auto names = db_->GetCatalog().GetTableNames();
-        std::sort(names.begin(), names.end());
-        if (names.empty())
+        try
         {
-            out_ << "No tables.\n";
-            return;
+            out_ << connection_->Command(name, argument);
         }
-        for (const auto &name : names)
+        catch (const std::exception &e)
         {
-            Table *table = db_->GetCatalog().GetTable(name);
-            out_ << name << " (" << table->GetTupleCount() << " rows): ";
-            const auto &columns = table->GetSchema().GetColumns();
-            for (size_t i = 0; i < columns.size(); ++i)
-                out_ << (i ? ", " : "") << columns[i].name << " " << DataTypeName(columns[i].type);
-            if (db_->GetCatalog().GetStats(name) != nullptr)
-                out_ << " (analyzed)";
-            out_ << "\n";
+            out_ << "Error: " << e.what() << "\n";
         }
     }
 
@@ -171,7 +169,7 @@ namespace sql
         const auto start = std::chrono::steady_clock::now();
         try
         {
-            for (const auto &result : session_->ExecuteScript(sql))
+            for (const auto &result : connection_->ExecuteScript(sql))
                 out_ << FormatResult(result);
         }
         catch (const std::exception &e)
@@ -201,7 +199,7 @@ namespace sql
         std::vector<ExecutionResult> results;
         try
         {
-            results = session_->ExecuteScript(text.str(), true);
+            results = connection_->ExecuteScript(text.str(), true);
         }
         catch (const std::exception &e)
         {
@@ -233,21 +231,8 @@ namespace sql
             return false;
         if (command == "help" || command == "h")
             PrintHelp();
-        else if (command == "tables")
-            ListTables();
-        else if (command == "schema")
-        {
-            auto names = db_->GetCatalog().GetTableNames();
-            std::sort(names.begin(), names.end());
-            if (!argument.empty())
-            {
-                if (db_->GetCatalog().GetTable(argument) == nullptr)
-                    out_ << "Error: no table named " << argument << "\n";
-                names = {argument};
-            }
-            for (const auto &name : names)
-                out_ << SchemaSQL(db_->GetCatalog(), name);
-        }
+        else if (command == "tables" || command == "schema")
+            RunCommand(command, argument);
         else if (command == "read")
         {
             if (argument.empty())
@@ -264,13 +249,7 @@ namespace sql
                 out_ << "Usage: .timer on|off\n";
         }
         else if (command == "save")
-        {
-            std::string error;
-            if (session_->Checkpoint(&error))
-                out_ << "Checkpoint complete: all changes are in " << db_->GetPath() << ".\n";
-            else
-                out_ << "Error: " << error << "\n";
-        }
+            RunCommand("save", "");
         else
             out_ << "Unknown command: " << line << " (try .help)\n";
         return true;

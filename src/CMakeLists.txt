@@ -8,6 +8,9 @@ add_subdirectory(storage)
 add_subdirectory(catalog)
 add_subdirectory(session)
 add_subdirectory(cli)
+add_subdirectory(net)
+add_subdirectory(server)
+add_subdirectory(cluster)
 
 # Main executable (REPL)
 add_executable(sqlengine main.cpp)
@@ -24,6 +27,7 @@ target_link_libraries(sqlengine
         catalog
         session
         cli
+        net
 )
 
 # Install target

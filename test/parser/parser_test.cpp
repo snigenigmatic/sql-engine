@@ -872,4 +872,49 @@ namespace sql
         }
     }
 
+    namespace
+    {
+        std::unique_ptr<CreateTableStatement> ParseCreate(const std::string &sql)
+        {
+            Lexer lexer(sql);
+            Parser parser(lexer);
+            auto stmt = parser.ParseStatement();
+            if (!stmt || stmt->GetType() != StatementType::CREATE_TABLE)
+                return nullptr;
+            return std::unique_ptr<CreateTableStatement>(static_cast<CreateTableStatement *>(stmt.release()));
+        }
+    } // namespace
+
+    TEST(ParserTest, CreateTableDistribution)
+    {
+        auto plain = ParseCreate("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);");
+        ASSERT_NE(plain, nullptr);
+        EXPECT_EQ(plain->distribution, TableDistribution::DEFAULT);
+
+        auto hashed = ParseCreate("CREATE TABLE orders (id INTEGER, customer INTEGER) SHARD BY HASH (customer);");
+        ASSERT_NE(hashed, nullptr);
+        EXPECT_EQ(hashed->distribution, TableDistribution::HASH);
+        EXPECT_EQ(hashed->shard_column, "customer");
+        EXPECT_NE(DumpStatement(hashed.get()).find("shard by hash(customer)"), std::string::npos);
+
+        // The words are not reserved: any case, and usable as column names
+        auto words = ParseCreate("create table t (hash INTEGER, shard INTEGER, replicated BOOLEAN) shard by hash(hash);");
+        ASSERT_NE(words, nullptr);
+        EXPECT_EQ(words->shard_column, "hash");
+        EXPECT_EQ(words->columns.size(), 3u);
+
+        auto replicated = ParseCreate("CREATE TABLE countries (code VARCHAR(2), name VARCHAR(50)) REPLICATED;");
+        ASSERT_NE(replicated, nullptr);
+        EXPECT_EQ(replicated->distribution, TableDistribution::REPLICATED);
+    }
+
+    TEST(ParserTest, CreateTableDistributionErrors)
+    {
+        EXPECT_THROW(ParseCreate("CREATE TABLE t (id INTEGER) SHARD BY HASH (nosuch);"), std::runtime_error);
+        EXPECT_THROW(ParseCreate("CREATE TABLE t (id INTEGER) SHARD BY RANGE (id);"), std::runtime_error);
+        EXPECT_THROW(ParseCreate("CREATE TABLE t (id INTEGER) SHARD HASH (id);"), std::runtime_error);
+        EXPECT_THROW(ParseCreate("CREATE TABLE t (id INTEGER) SHARD BY HASH id;"), std::runtime_error);
+        EXPECT_THROW(ParseCreate("CREATE TABLE t (id INTEGER) SPREAD;"), std::runtime_error);
+    }
+
 } // namespace sql

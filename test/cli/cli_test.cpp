@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "cli/local_connection.h"
 #include "cli/shell.h"
 #include <cstdio>
 #include <fstream>
@@ -35,8 +36,9 @@ namespace sql
             std::string error;
             std::unique_ptr<Database> db = Database::Open(file.path, &error);
             Session session{db.get()};
+            LocalConnection connection{db.get(), &session};
             std::ostringstream out;
-            Shell shell{db.get(), &session, out};
+            Shell shell{&connection, out};
 
             std::string Run(const std::vector<std::string> &lines)
             {

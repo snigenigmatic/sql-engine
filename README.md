@@ -35,9 +35,10 @@ An educational SQL database engine built from scratch in C++ to understand datab
 ## Building
 
 ### Prerequisites
-- CMake 3.14 or higher
+- CMake 3.18 or higher
 - C++17 compatible compiler (GCC 7+, Clang 5+, MSVC 2017+)
 - Git (for fetching Google Test)
+- For the cluster components (on by default): OpenSSL development headers (`libssl-dev`), and network access at configure time, when CMake fetches [NuRaft](https://github.com/eBay/NuRaft) 2.1.0 and standalone [asio](https://github.com/chriskohlhoff/asio) 1.28. Configure with `-DSQLENGINE_DISTRIBUTED=OFF` to build only the single-node engine
 
 ### Build Instructions
 
@@ -64,6 +65,7 @@ ctest --test-dir build --output-on-failure
 | `CMAKE_BUILD_TYPE` | `Debug` | Build type (`Debug` / `Release`) |
 | `BUILD_TESTS` | `ON` | Build Google Test suites |
 | `ENABLE_LOGGING` | `ON` | Enable internal logging |
+| `SQLENGINE_DISTRIBUTED` | `ON` | Build the cluster components (Raft replication); fetches NuRaft and asio |
 
 ```bash
 # Release build
@@ -88,7 +90,12 @@ sql-engine/
 │   ├── catalog/   # Catalog (schema table), Database, legacy snapshot importer
 │   ├── execution/ # Operators: SeqScan, Filter, Projection, IndexScan, Executor
 │   ├── storage/   # Pager, BufferPool, TablePage/TableHeap, Table, BTree
-│   └── optimizer/ # (stub, planned)
+│   ├── optimizer/ # Planner, cost estimates
+│   ├── session/   # Session (transactions), Connection interface
+│   ├── cli/       # Shell, LocalConnection
+│   ├── net/       # Wire protocol, sockets, RemoteConnection
+│   ├── server/    # Server and the sqlnode binary
+│   └── cluster/   # Raft (NuRaft) building blocks for the distributed engine
 ├── test/
 │   ├── integration/  # End-to-end SQL tests
 │   └── parser/       # Parser unit tests
@@ -134,6 +141,32 @@ CREATE INDEX idx_id ON users (id);
 SELECT * FROM users WHERE id = 1;    -- uses index point lookup
 SELECT * FROM users WHERE id > 1;   -- uses index range scan
 ```
+
+### Client/server
+
+`sqlnode` serves a database file over TCP. `sqlengine --connect` is the same shell, talking to it:
+
+```bash
+./build/src/server/sqlnode --database mydb.db --port 7480    # Ctrl-C / SIGTERM stops it cleanly
+./build/src/sqlengine --connect 127.0.0.1:7480
+./build/src/sqlengine --connect 127.0.0.1:7480 < script.sql
+```
+
+Every client gets its own session, and the results are the same as in-process. The engine has one writer at a time, so clients take turns. A client inside `BEGIN … COMMIT` has the database to itself until it commits, rolls back or disconnects; a disconnect rolls its transaction back. The protocol is in `src/net/protocol.h`.
+
+### Cluster (in progress)
+
+Three coordinators (a Raft group holding the cluster's metadata) and three or more storage nodes (each holding Raft-replicated shards). Any coordinator takes clients:
+
+```bash
+SPEC=1=127.0.0.1:31101:31201,2=127.0.0.1:31102:31202,3=127.0.0.1:31103:31203   # id=host:raft_port:client_port
+for i in 1 2 3; do ./build/src/server/sqlnode --role coordinator --id $i --coordinators $SPEC --dir c$i & done
+for i in 0 1 2; do ./build/src/server/sqlnode --role storage --name node-$i --coordinators $SPEC \
+                     --dir n$i --raft-base $((32000 + 100 * i)) & done
+./build/src/sqlengine --connect 127.0.0.1:31201
+```
+
+Tables are spread over shards by `SHARD BY HASH(col)`, the primary key, or the whole row; `REPLICATED` tables are copied to every shard. See [docs/distributed-design.md](docs/distributed-design.md) for what works so far and what doesn't yet (no cross-shard transactions until D6).
 
 ### REPL Commands
 
@@ -218,7 +251,16 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
   - [x] Golden SQL tests (`test/sql`), sanitizer and Release CI jobs
   - [x] `ANALYZE` and cost-based planning
 ### Extra Goal
-- [ ] **Distributed Query Processing**
+- [ ] **Distributed Query Processing** (design: [docs/distributed-design.md](docs/distributed-design.md))
+  - [x] D0: NuRaft and asio in the build; Raft replication, leader failover and several Raft groups per process verified
+  - [x] D1: Server mode and wire protocol (`sqlnode`, `sqlengine --connect`)
+  - [x] D2: Hash rings and replica placement; `SHARD BY HASH(col)` / `REPLICATED` syntax
+  - [x] D3: A Raft-replicated shard (durable Raft log, exactly-once apply, snapshots, linearizable reads)
+  - [x] D4: Metadata Raft group and cluster bootstrap (`sqlnode --role coordinator|storage`)
+  - [x] D5: Distributed queries (shard pruning, single-shard statements, partial aggregates, filter and top-N pushdown, distributed `EXPLAIN`)
+  - [ ] D6: Two-phase commit across shards
+  - [ ] D7: Kubernetes (minikube)
+  - [ ] D8: Rebalancing
 ## Architecture
 
 See [docs/design.md](docs/design.md) for detailed architecture documentation.

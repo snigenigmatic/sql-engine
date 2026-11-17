@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include "common/value.h"
@@ -10,7 +11,9 @@
 #include "catalog/database.h"
 #include "catalog/legacy_import.h"
 #include "session/session.h"
+#include "cli/local_connection.h"
 #include "cli/shell.h"
+#include "net/remote_connection.h"
 #include <memory>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,6 +28,60 @@ void PrintBanner(const std::string &path)
     std::cout << "  Database: " << path << "\n";
     std::cout << "  Type .help for help, .quit to exit\n";
     std::cout << "========================================\n\n";
+}
+
+// Read lines from standard input into the shell until it quits or input ends
+void RunShell(sql::Shell &shell, bool interactive)
+{
+    std::string line;
+    while (true)
+    {
+        if (interactive)
+            std::cout << shell.Prompt() << std::flush;
+        if (!std::getline(std::cin, line))
+        {
+            if (interactive)
+                std::cout << "\n";
+            break;
+        }
+        if (!shell.HandleLine(line))
+            break;
+    }
+    if (interactive)
+        std::cout << "Goodbye!\n";
+}
+
+// Shell over a database served by sqlnode at host:port
+int RunRemote(const std::string &address)
+{
+    const size_t colon = address.rfind(':');
+    char *end = nullptr;
+    const long port = colon == std::string::npos ? -1 : std::strtol(address.c_str() + colon + 1, &end, 10);
+    if (colon == std::string::npos || colon == 0 || *end != '\0' || port <= 0 || port > 65535)
+    {
+        std::cerr << "Error: expected --connect HOST:PORT, got " << address << "\n";
+        return 1;
+    }
+    std::unique_ptr<sql::net::RemoteConnection> connection;
+    try
+    {
+        connection = std::make_unique<sql::net::RemoteConnection>(address.substr(0, colon),
+                                                                  static_cast<uint16_t>(port));
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+    sql::Shell shell(connection.get(), std::cout);
+    const bool interactive = isatty(STDIN_FILENO);
+    if (interactive)
+        PrintBanner(address + " (remote)");
+    RunShell(shell, interactive);
+    // Disconnecting rolls back a transaction left open on the server
+    if (connection->InTransaction())
+        std::cout << "Rolling back the open transaction.\n";
+    return 0;
 }
 
 // True if the path names an existing, non-empty file
@@ -43,8 +100,18 @@ int main(int argc, char **argv)
         if (arg == "-h" || arg == "--help")
         {
             std::cout << "Usage: " << argv[0] << " [database-file]   (default: sqlengine.db)\n"
+                      << "       " << argv[0] << " --connect HOST:PORT   (a database served by sqlnode)\n"
                       << "Reads SQL and .commands from standard input; pipe a script to run it.\n";
             return 0;
+        }
+        if (arg == "--connect")
+        {
+            if (argc < 3)
+            {
+                std::cerr << "Error: --connect needs HOST:PORT\n";
+                return 1;
+            }
+            return RunRemote(argv[2]);
         }
         path = arg;
     }
@@ -86,29 +153,15 @@ int main(int argc, char **argv)
     }
 
     g_session = std::make_unique<sql::Session>(g_db.get());
-    sql::Shell shell(g_db.get(), g_session.get(), std::cout);
+    sql::LocalConnection connection(g_db.get(), g_session.get());
+    sql::Shell shell(&connection, std::cout);
 
     // Piped input (sqlengine db < script.sql) gets no banner or prompts
     const bool interactive = isatty(STDIN_FILENO);
     if (interactive)
         PrintBanner(path);
 
-    std::string line;
-    while (true)
-    {
-        if (interactive)
-            std::cout << shell.Prompt() << std::flush;
-        if (!std::getline(std::cin, line))
-        {
-            if (interactive)
-                std::cout << "\n";
-            break;
-        }
-        if (!shell.HandleLine(line))
-            break;
-    }
-    if (interactive)
-        std::cout << "Goodbye!\n";
+    RunShell(shell, interactive);
 
     if (g_session->InTransaction())
         std::cout << "Rolling back the open transaction.\n";
