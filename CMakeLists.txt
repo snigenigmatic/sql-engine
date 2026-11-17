@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.18)
 
 project(SQLEngine
     VERSION 0.1.0
@@ -35,6 +35,9 @@ endif()
 # Options
 option(BUILD_TESTS "Build unit tests" ON)
 option(ENABLE_LOGGING "Enable logging" ON)
+# The cluster (Raft replication, sharding) needs NuRaft and asio, fetched at
+# configure time; turn off to build only the single-node engine offline
+option(SQLENGINE_DISTRIBUTED "Build the distributed (cluster) components" ON)
 
 if(ENABLE_LOGGING)
     add_compile_definitions(ENABLE_LOGGING)
@@ -42,6 +45,10 @@ endif()
 
 # Include directories
 include_directories(${PROJECT_SOURCE_DIR}/src)
+
+if(SQLENGINE_DISTRIBUTED)
+    include(${PROJECT_SOURCE_DIR}/cmake/NuRaft.cmake)
+endif()
 
 # Add subdirectories
 add_subdirectory(src)
@@ -61,5 +68,6 @@ message(STATUS "C++ standard: C++${CMAKE_CXX_STANDARD}")
 message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "Build tests: ${BUILD_TESTS}")
 message(STATUS "Enable logging: ${ENABLE_LOGGING}")
+message(STATUS "Distributed: ${SQLENGINE_DISTRIBUTED}")
 message(STATUS "===========================================")
 message(STATUS "")

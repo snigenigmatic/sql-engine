@@ -35,9 +35,10 @@ An educational SQL database engine built from scratch in C++ to understand datab
 ## Building
 
 ### Prerequisites
-- CMake 3.14 or higher
+- CMake 3.18 or higher
 - C++17 compatible compiler (GCC 7+, Clang 5+, MSVC 2017+)
 - Git (for fetching Google Test)
+- For the cluster components (on by default): OpenSSL development headers (`libssl-dev`), and network access at configure time, when CMake fetches [NuRaft](https://github.com/eBay/NuRaft) 2.1.0 and standalone [asio](https://github.com/chriskohlhoff/asio) 1.28. Configure with `-DSQLENGINE_DISTRIBUTED=OFF` to build only the single-node engine
 
 ### Build Instructions
 
@@ -64,6 +65,7 @@ ctest --test-dir build --output-on-failure
 | `CMAKE_BUILD_TYPE` | `Debug` | Build type (`Debug` / `Release`) |
 | `BUILD_TESTS` | `ON` | Build Google Test suites |
 | `ENABLE_LOGGING` | `ON` | Enable internal logging |
+| `SQLENGINE_DISTRIBUTED` | `ON` | Build the cluster components (Raft replication); fetches NuRaft and asio |
 
 ```bash
 # Release build
@@ -218,7 +220,16 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
   - [x] Golden SQL tests (`test/sql`), sanitizer and Release CI jobs
   - [x] `ANALYZE` and cost-based planning
 ### Extra Goal
-- [ ] **Distributed Query Processing**
+- [ ] **Distributed Query Processing** (design: [docs/distributed-design.md](docs/distributed-design.md))
+  - [x] D0: NuRaft and asio in the build; Raft replication, leader failover and several Raft groups per process verified
+  - [ ] D1: Server mode and wire protocol
+  - [ ] D2: Hash rings and replica placement
+  - [ ] D3: A Raft-replicated shard
+  - [ ] D4: Metadata Raft group and cluster bootstrap
+  - [ ] D5: Distributed queries
+  - [ ] D6: Two-phase commit across shards
+  - [ ] D7: Kubernetes (minikube)
+  - [ ] D8: Rebalancing
 ## Architecture
 
 See [docs/design.md](docs/design.md) for detailed architecture documentation.

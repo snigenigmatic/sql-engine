@@ -1,6 +1,6 @@
 # Distributed sql-engine — design and build plan
 
-Status: proposal, nothing built yet. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
+Status: D0 is done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
 
 **Decisions already made**
 - **Raft:** use the NuRaft library rather than writing our own.
@@ -229,7 +229,7 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 
 | # | Milestone | Done when |
 |---|---|---|
-| D0 | **Dependencies and layout.** Pull NuRaft and standalone asio in via CMake `FetchContent`, add the `src/net`, `src/cluster` and `src/distributed` modules, CI caches the dependencies | Builds on CI, single-node tests unchanged |
+| D0 ✅ | **Dependencies and layout.** Pull NuRaft and standalone asio in via CMake `FetchContent`, add the `src/cluster` module (`src/net` and `src/distributed` arrive with their first code in D1 and D5) | Builds on CI, single-node tests unchanged |
 | D1 | **Server mode.** The wire protocol, a single-node `sqlnode` with one `Session` per connection (serialized), and the CLI's `--connect` | The golden runner passes against a server over TCP |
 | D2 | **Rings and placement.** The `ring` library, the metadata model, and the `SHARD BY` / `REPLICATED` syntax | Unit tests for spread, minimal movement and placement |
 | D3 | **One replicated shard.** The NuRaft state machine on `Database`, the log store, snapshots and exactly-once apply | An in-process 3-replica test: kill the leader, keep writing, restart, catch up, install a snapshot, same `.db` contents on every replica |
@@ -253,7 +253,13 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 - **On minikube:** `chaos.sh` runs for a set number of minutes as a manual or nightly job. It is not part of PR CI.
 
 ## 9. Risks and open points
-- **NuRaft fit:** one port per Raft server, and its asio dependency. Prove both in D0 before building on them.
+- **NuRaft fit:** settled in D0.
+  - NuRaft 2.1.0 is built from its sources by our own CMake target (`cmake/NuRaft.cmake`), because its CMakeLists always builds its examples and tests and forces C++11.
+  - asio is pinned to 1.28: NuRaft still uses `io_service`, which asio removed in 1.33, and the 1.12 that NuRaft pins does not build with GCC 13.
+  - NuRaft is linked against OpenSSL even though TLS stays off: its no-SSL build uses a mock socket that newer asio rejects.
+  - Its headers miss `<cstdint>`, so our code includes NuRaft through `src/cluster/raft/nuraft.h`.
+  - `test/cluster/nuraft_test` runs real servers on localhost. A 3-replica group replicates a log, elects a new leader when the old one stops, and stops committing without a quorum. Two groups of 3 share one process, one port each, which is how a storage pod will hold many shards.
+  - Each `raft_launcher` brings its own asio thread pool. For ~16 shards per pod, D3 should share one `asio_service` between a pod's Raft servers.
 - **Write serialization:** a shard's single connection serializes all its writes, and shard-level 2PC locks are coarse. Fine at this scale; row-level locking is future work.
 - **Read-your-writes in transactions:** not supported in v1, as described in 4.7.
 - **Large gathers:** results are bounded by coordinator memory, because sorting is in-memory only. Spilling to disk is future work.

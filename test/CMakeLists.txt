@@ -37,6 +37,14 @@ add_sqlengine_test(estimator_test optimizer/estimator_test.cpp)
 # REPL shell
 add_sqlengine_test(cli_test cli/cli_test.cpp)
 
+# Cluster components (need NuRaft)
+if(SQLENGINE_DISTRIBUTED)
+    add_sqlengine_test(memory_log_store_test cluster/memory_log_store_test.cpp)
+    target_link_libraries(memory_log_store_test PRIVATE cluster)
+    add_sqlengine_test(nuraft_test cluster/nuraft_test.cpp)
+    target_link_libraries(nuraft_test PRIVATE cluster)
+endif()
+
 # Golden SQL scripts (test/sql/*.test)
 add_sqlengine_test(sql_logic_test sql/sql_logic_test.cpp)
 target_compile_definitions(sql_logic_test PRIVATE SQL_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sql")
