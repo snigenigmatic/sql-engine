@@ -51,22 +51,34 @@ void RunShell(sql::Shell &shell, bool interactive)
         std::cout << "Goodbye!\n";
 }
 
-// Shell over a database served by sqlnode at host:port
+// Shell over a database served by sqlnode at host:port, or by a cluster at
+// any of several host:port addresses (its coordinators)
 int RunRemote(const std::string &address)
 {
-    const size_t colon = address.rfind(':');
-    char *end = nullptr;
-    const long port = colon == std::string::npos ? -1 : std::strtol(address.c_str() + colon + 1, &end, 10);
-    if (colon == std::string::npos || colon == 0 || *end != '\0' || port <= 0 || port > 65535)
+    std::vector<std::pair<std::string, uint16_t>> servers;
+    size_t start = 0;
+    while (start <= address.size())
     {
-        std::cerr << "Error: expected --connect HOST:PORT, got " << address << "\n";
-        return 1;
+        size_t comma = address.find(',', start);
+        if (comma == std::string::npos)
+            comma = address.size();
+        const std::string one = address.substr(start, comma - start);
+        const size_t colon = one.rfind(':');
+        char *end = nullptr;
+        const long port = colon == std::string::npos ? -1 : std::strtol(one.c_str() + colon + 1, &end, 10);
+        if (colon == std::string::npos || colon == 0 || *end != '\0' || port <= 0 || port > 65535)
+        {
+            std::cerr << "Error: expected --connect HOST:PORT[,HOST:PORT...], got " << address << "\n";
+            return 1;
+        }
+        servers.emplace_back(one.substr(0, colon), static_cast<uint16_t>(port));
+        start = comma + 1;
     }
     std::unique_ptr<sql::net::RemoteConnection> connection;
     try
     {
-        connection = std::make_unique<sql::net::RemoteConnection>(address.substr(0, colon),
-                                                                  static_cast<uint16_t>(port));
+        // A lost connection is re-established at the next statement
+        connection = std::make_unique<sql::net::RemoteConnection>(servers, true);
     }
     catch (const std::exception &e)
     {
@@ -100,7 +112,8 @@ int main(int argc, char **argv)
         if (arg == "-h" || arg == "--help")
         {
             std::cout << "Usage: " << argv[0] << " [database-file]   (default: sqlengine.db)\n"
-                      << "       " << argv[0] << " --connect HOST:PORT   (a database served by sqlnode)\n"
+                      << "       " << argv[0] << " --connect HOST:PORT[,HOST:PORT...]   (a database served by sqlnode;\n"
+                      << "             list every coordinator of a cluster to fail over between them)\n"
                       << "Reads SQL and .commands from standard input; pipe a script to run it.\n";
             return 0;
         }

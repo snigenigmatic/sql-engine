@@ -28,6 +28,10 @@ namespace sql
         // (checkpoint) and "describe" (where the database lives)
         virtual std::string Command(const std::string &name, const std::string &argument) = 0;
 
+        // Something to tell the user about the connection itself (e.g. that
+        // it was re-established), once; "" if nothing
+        virtual std::string TakeNotice() { return ""; }
+
         // An internal request between cluster processes (a coordinator and
         // its storage nodes). Ordinary databases answer none.
         virtual ExecutionResult Call(const std::string &method, const std::vector<std::string> & /*arguments*/)

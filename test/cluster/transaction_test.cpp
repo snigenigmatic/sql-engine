@@ -417,6 +417,35 @@ namespace sql::cluster
         EXPECT_TRUE(survivor->Execute("INSERT INTO t VALUES (2);").success);
     }
 
+    TEST(ClusterTransactionTest, AnIdleTransactionIsRolledBack)
+    {
+        Cluster cluster(3, /*idle_transaction_timeout_ms=*/1500);
+        ASSERT_TRUE(cluster.WaitFormed());
+        auto idle = cluster.Client(1), busy = cluster.Client(2);
+        RunAll(*idle, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO t VALUES (1, 0), (2, 0);"
+                      "BEGIN; UPDATE t SET v = 1;");
+        // Someone else waits for it, but not forever
+        auto write = busy->Execute("UPDATE t SET v = 2;");
+        ASSERT_TRUE(write.success) << write.message;
+        EXPECT_EQ(Rows(busy->Execute("SELECT SUM(v) FROM t;")), (std::vector<std::string>{"4"}));
+        // The idle client still thinks it is in its transaction: its next
+        // statement is told what happened instead of running on its own
+        EXPECT_TRUE(idle->InTransaction());
+        auto told = idle->Execute("SELECT COUNT(*) FROM t;");
+        EXPECT_FALSE(told.success);
+        EXPECT_NE(told.message.find("rolled back after being idle"), std::string::npos) << told.message;
+        EXPECT_FALSE(idle->InTransaction());
+        auto after = idle->Execute("UPDATE t SET v = 3 WHERE id = 1;");
+        ASSERT_TRUE(after.success) << after.message; // now a statement of its own
+        EXPECT_EQ(Rows(busy->Execute("SELECT SUM(v) FROM t;")), (std::vector<std::string>{"5"}));
+        // ROLLBACK after the timeout just agrees
+        RunAll(*idle, "BEGIN;");
+        std::this_thread::sleep_for(2500ms);
+        auto rollback = idle->Execute("ROLLBACK;");
+        EXPECT_TRUE(rollback.success) << rollback.message;
+        EXPECT_EQ(rollback.message, "Transaction rolled back.");
+    }
+
     // The design's acceptance test: money moves between accounts on
     // different shards while a storage node and the leading coordinator are
     // killed, and none is created or lost

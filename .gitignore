@@ -42,4 +42,4 @@ CTestTestfile.cmake
 *.importing
 
 # Compilation database
-compile_commands.json
+compile_commands.json__pycache__/

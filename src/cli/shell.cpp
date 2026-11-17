@@ -162,6 +162,14 @@ namespace sql
         {
             out_ << "Error: " << e.what() << "\n";
         }
+        PrintNotice();
+    }
+
+    void Shell::PrintNotice()
+    {
+        const std::string notice = connection_->TakeNotice();
+        if (!notice.empty())
+            out_ << notice << "\n";
     }
 
     void Shell::RunSQL(const std::string &sql)
@@ -176,6 +184,7 @@ namespace sql
         {
             out_ << "Error: " << e.what() << "\n";
         }
+        PrintNotice();
         if (timer_)
         {
             const double ms =
@@ -204,8 +213,10 @@ namespace sql
         catch (const std::exception &e)
         {
             out_ << "Error: " << e.what() << "\n";
+            PrintNotice();
             return false;
         }
+        PrintNotice();
         for (const auto &result : results)
             out_ << FormatResult(result);
         if (!results.empty() && !results.back().success)

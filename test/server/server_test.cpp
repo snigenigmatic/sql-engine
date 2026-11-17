@@ -236,4 +236,41 @@ namespace sql
         EXPECT_TRUE(client->Execute("CREATE TABLE t (a INTEGER);").success);
     }
 
+    TEST(ServerTest, AClientReconnectsWithoutLosingTrackOfItsTransaction)
+    {
+        auto a = std::make_unique<TestServer>();
+        TestServer b;
+        net::RemoteConnection client({{"127.0.0.1", a->server->Port()}, {"127.0.0.1", b.server->Port()}}, true);
+        ASSERT_TRUE(client.Execute("CREATE TABLE t (id INTEGER);").success);
+        ASSERT_TRUE(client.Execute("BEGIN;").success);
+        ASSERT_TRUE(client.Execute("INSERT INTO t VALUES (1);").success);
+        a.reset(); // the server goes away mid-transaction
+        EXPECT_THROW(client.Execute("INSERT INTO t VALUES (2);"), std::runtime_error);
+        EXPECT_FALSE(client.InTransaction());
+        // The next statement is not run as a statement of its own
+        try
+        {
+            client.Execute("INSERT INTO t VALUES (3);");
+            FAIL() << "the statement after a lost transaction must not run";
+        }
+        catch (const std::runtime_error &e)
+        {
+            EXPECT_NE(std::string(e.what()).find("transaction was rolled back"), std::string::npos) << e.what();
+        }
+        EXPECT_NE(client.TakeNotice().find("reconnected to 127.0.0.1:" + std::to_string(b.server->Port())),
+                  std::string::npos);
+        EXPECT_EQ(client.TakeNotice(), "");
+        // Then it works against the other server
+        ASSERT_TRUE(client.Execute("CREATE TABLE t (id INTEGER);").success);
+        ASSERT_TRUE(client.Execute("INSERT INTO t VALUES (4);").success);
+        EXPECT_EQ(Rows(client.Execute("SELECT id FROM t;")), (std::vector<std::string>{"4"}));
+        // Without reconnect, a lost connection stays lost
+        auto c = std::make_unique<TestServer>();
+        net::RemoteConnection fixed("127.0.0.1", c->server->Port());
+        ASSERT_TRUE(fixed.Execute("CREATE TABLE t (id INTEGER);").success);
+        c.reset();
+        EXPECT_THROW(fixed.Execute("SELECT * FROM t;"), std::runtime_error);
+        EXPECT_THROW(fixed.Execute("SELECT * FROM t;"), std::runtime_error);
+    }
+
 } // namespace sql

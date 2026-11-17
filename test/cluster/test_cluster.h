@@ -70,7 +70,7 @@ namespace sql::cluster::testing
     class Cluster
     {
     public:
-        explicit Cluster(size_t storage_nodes = 3)
+        explicit Cluster(size_t storage_nodes = 3, int idle_transaction_timeout_ms = 60000)
         {
             static int counter = 0;
             root_ = (std::filesystem::temp_directory_path() /
@@ -98,6 +98,7 @@ namespace sql::cluster::testing
                 options.replication_factor = 3;
                 options.heartbeat_ms = 50;
                 options.election_timeout_ms = 1000; // shorter ones cause needless elections under sanitizers
+                options.idle_transaction_timeout_ms = idle_transaction_timeout_ms;
                 coordinator_options_.push_back(options);
                 coordinator_addresses_.push_back(clients[id]);
             }

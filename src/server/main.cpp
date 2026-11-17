@@ -35,6 +35,9 @@ namespace
             << "  --dir DIR        where this process keeps its Raft logs and data\n"
             << "  --shards S       shards in a new cluster (default 16)\n"
             << "  --rf R           replicas of each shard (default 3)\n"
+            << "  --lock-timeout S      how long a statement waits for another transaction's shard (default 5)\n"
+            << "  --txn-idle-timeout S  roll back a transaction idle this long, releasing its shards (default 60;\n"
+            << "                        0: never)\n"
             << "  --name NAME      a storage node's stable name (e.g. node-0)\n"
             << "  --raft-base P    a storage node's replica of shard s listens on P + s\n"
 #endif
@@ -81,7 +84,8 @@ int main(int argc, char **argv)
 {
     std::map<std::string, std::string> args = {{"--role", "single"},   {"--database", "sqlengine.db"},
                                                {"--host", ""},         {"--port", ""},
-                                               {"--shards", "16"},     {"--rf", "3"}};
+                                               {"--shards", "16"},     {"--rf", "3"},
+                                               {"--lock-timeout", "5"}, {"--txn-idle-timeout", "60"}};
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -137,6 +141,8 @@ int main(int argc, char **argv)
             options.directory = args.at("--dir");
             options.shard_count = static_cast<uint32_t>(std::stoul(args["--shards"]));
             options.replication_factor = std::stoul(args["--rf"]);
+            options.lock_timeout_ms = static_cast<int>(std::stod(args["--lock-timeout"]) * 1000);
+            options.idle_transaction_timeout_ms = static_cast<int>(std::stod(args["--txn-idle-timeout"]) * 1000);
             bool found = false;
             for (const auto &spec : specs)
             {

@@ -6,6 +6,7 @@
 #include "net/remote_connection.h"
 #include "server/server.h"
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -74,6 +75,9 @@ namespace sql::cluster
             int election_timeout_ms = 1000;
             int snapshot_distance = 1000;
             int lock_timeout_ms = 5000; // waiting for another transaction's shard
+            // A transaction no statement used for this long is rolled back,
+            // releasing its shards (0: never)
+            int idle_transaction_timeout_ms = 60000;
         };
 
         // A client's transaction (one per client connection)
@@ -84,6 +88,10 @@ namespace sql::cluster
             std::set<uint32_t> shards;    // participants
             std::vector<std::string> ddl; // schema changes, applied to the metadata at COMMIT
             bool implicit = false;        // one statement's own, outside BEGIN
+            std::chrono::steady_clock::time_point last_used{};
+            // Rolled back by the coordinator (idle too long): the client's
+            // next statement is told so instead of running on its own
+            std::string expired;
             bool Open() const { return !id.empty(); }
         };
 
@@ -104,6 +112,11 @@ namespace sql::cluster
         ExecutionResult Execute(const std::string &sql, Transaction *txn = nullptr);
         // The client went away: roll back its transaction, if any
         void Abandon(Transaction *txn);
+        // Whether the client is (as far as it knows) inside a transaction
+        bool InTransaction(const Transaction *txn);
+        // Forget the client's transaction (this coordinator lost the
+        // leadership: the next leader rolls it back); true if one was open
+        bool Drop(Transaction *txn);
         std::string Command(const std::string &name, const std::string &argument);
         ExecutionResult Call(const std::string &method, const std::vector<std::string> &arguments);
 
@@ -236,6 +249,8 @@ namespace sql::cluster
         std::chrono::steady_clock::time_point last_full_ensure_{};
         Transaction *txn_ = nullptr;           // the operation's transaction, if open
         std::set<std::string> active_txns_;    // open in clients' sessions (this term)
+        std::set<Transaction *> explicit_txns_; // clients' BEGIN ... (this term), for the idle timeout
+        void ExpireIdleTransactions();
         // Transactions waiting for a shard another one holds (waiter ->
         // holder); a cycle is a deadlock
         std::map<std::string, std::string> waits_for_;

@@ -43,6 +43,7 @@ namespace sql
         void RunSQL(const std::string &sql);
         // A question for the database (.tables, .schema, .save)
         void RunCommand(const std::string &name, const std::string &argument);
+        void PrintNotice(); // the connection's notice, if any
 
         Connection *connection_;
         std::ostream &out_;

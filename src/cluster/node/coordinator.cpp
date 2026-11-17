@@ -131,12 +131,8 @@ namespace sql::cluster
                     }
                     if (coordinator_->IsLeader())
                         return coordinator_->Execute(sql, &txn_);
-                    if (txn_.Open())
-                    {
-                        // Its shards are rolled back by the next leader
-                        txn_ = Coordinator::Transaction();
+                    if (coordinator_->Drop(&txn_)) // its shards are rolled back by the next leader
                         return Failure("the transaction was rolled back: the coordinator lost the leadership");
-                    }
                     net::RemoteConnection *leader = nullptr;
                     try
                     {
@@ -182,7 +178,7 @@ namespace sql::cluster
 
             bool InTransaction() override
             {
-                if (txn_.Open())
+                if (coordinator_->InTransaction(&txn_))
                     return true;
                 return !coordinator_->IsLeader() && forward_ && forward_->InTransaction();
             }
@@ -354,6 +350,7 @@ namespace sql::cluster
         last_full_ensure_ = {};
         // Whatever an earlier term left open on the shards is settled anew
         active_txns_.clear();
+        explicit_txns_.clear();
         waits_for_.clear();
         unsettled_.clear();
         for (uint32_t s = 0; s < options_.shard_count; ++s)
@@ -402,6 +399,7 @@ namespace sql::cluster
         if (force)
             last_full_ensure_ = Clock::now();
         CatchUpDdl();
+        ExpireIdleTransactions();
         if (!unsettled_.empty() && Clock::now() - last_recover_ > std::chrono::seconds(1))
         {
             last_recover_ = Clock::now();
@@ -831,14 +829,13 @@ namespace sql::cluster
                 return result;
             if (Clock::now() >= deadline)
             {
+                result.message = "lock wait timed out: " + result.message;
+                std::lock_guard<std::mutex> lock(op_mutex_);
                 if (txn && txn->Open())
                 {
-                    std::lock_guard<std::mutex> lock(op_mutex_);
                     waits_for_.erase(txn->id);
-                }
-                result.message = "lock wait timed out: " + result.message;
-                if (txn && txn->Open())
                     result.message += KEPT_OPEN;
+                }
                 return result;
             }
             std::this_thread::sleep_for(pause + std::chrono::milliseconds(random() % 10));
@@ -848,9 +845,12 @@ namespace sql::cluster
 
     void Coordinator::Abandon(Transaction *txn)
     {
-        if (!txn || !txn->Open())
+        if (!txn)
             return;
         std::lock_guard<std::mutex> lock(op_mutex_);
+        explicit_txns_.erase(txn);
+        if (!txn->Open())
+            return;
         try
         {
             if (IsLeader() && was_leader_ && txn->epoch == view_.epoch)
@@ -861,6 +861,21 @@ namespace sql::cluster
             // the next leader settles it
         }
         *txn = Transaction();
+    }
+
+    bool Coordinator::InTransaction(const Transaction *txn)
+    {
+        std::lock_guard<std::mutex> lock(op_mutex_);
+        return txn->Open() || !txn->expired.empty();
+    }
+
+    bool Coordinator::Drop(Transaction *txn)
+    {
+        std::lock_guard<std::mutex> lock(op_mutex_);
+        explicit_txns_.erase(txn);
+        const bool open = txn->Open() || !txn->expired.empty();
+        *txn = Transaction();
+        return open;
     }
 
     ExecutionResult Coordinator::ExecuteLocked(const std::string &sql, Transaction *txn)
@@ -878,6 +893,19 @@ namespace sql::cluster
                 BecomeLeader();
             std::string error;
             auto stmt = ParseOne(sql, &error);
+            if (txn && !txn->expired.empty())
+            {
+                // Said once, in place of the statement (ROLLBACK just agrees)
+                const std::string why = txn->expired;
+                txn->expired.clear();
+                if (stmt && stmt->GetType() == StatementType::TRANSACTION_STMT &&
+                    static_cast<const struct TransactionStatement *>(stmt.get())->kind ==
+                        TransactionStatement::Kind::ROLLBACK)
+                    return Success("Transaction rolled back.");
+                return Failure(why + "; this statement was not run");
+            }
+            if (txn && txn->Open())
+                txn->last_used = Clock::now();
             if (txn && txn->Open() && txn->epoch != view_.epoch)
             {
                 // A new term settled (rolled back) everything left open
@@ -1007,7 +1035,9 @@ namespace sql::cluster
             *txn = Transaction();
             txn->id = "c" + std::to_string(options_.id) + "-" + ReplicatedShard::NewRequestId();
             txn->epoch = view_.epoch;
+            txn->last_used = Clock::now();
             active_txns_.insert(txn->id);
+            explicit_txns_.insert(txn);
             return Success("Transaction started.");
         case TransactionStatement::Kind::COMMIT:
             if (!txn || !txn->Open())
@@ -1115,6 +1145,7 @@ namespace sql::cluster
 
     ExecutionResult Coordinator::Commit(Transaction *txn)
     {
+        explicit_txns_.erase(txn);
         Transaction t = *txn;
         *txn = Transaction();
         active_txns_.erase(t.id);
@@ -1208,6 +1239,7 @@ namespace sql::cluster
 
     void Coordinator::Abort(Transaction *txn)
     {
+        explicit_txns_.erase(txn);
         Transaction t = *txn;
         *txn = Transaction();
         active_txns_.erase(t.id);
@@ -1215,6 +1247,22 @@ namespace sql::cluster
         for (uint32_t shard : t.shards)
             if (!ShardCall(shard, "txn", "", "abort", t.id).success)
                 unsettled_.insert(shard); // recovery rolls it back
+    }
+
+    void Coordinator::ExpireIdleTransactions()
+    {
+        if (options_.idle_transaction_timeout_ms <= 0)
+            return;
+        const auto limit = std::chrono::milliseconds(options_.idle_transaction_timeout_ms);
+        for (Transaction *txn : std::set<Transaction *>(explicit_txns_))
+        {
+            if (!txn->Open() || Clock::now() - txn->last_used < limit)
+                continue;
+            Abort(txn);
+            txn->expired = "the transaction was rolled back after being idle for " +
+                           std::to_string(options_.idle_transaction_timeout_ms / 1000) +
+                           " s (it held shards other clients need)";
+        }
     }
 
     void Coordinator::Recover()
