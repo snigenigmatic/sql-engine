@@ -21,6 +21,9 @@ namespace sql
         void NextToken();
         Token Expect(TokenType type);
         bool Match(TokenType type);
+        // The current token is an identifier spelling this (upper-case)
+        // word in any case: words with a meaning in one place only
+        bool IsWord(const char *word) const;
         Token Peek() const { return current_token_; }
 
         std::unique_ptr<Statement> ParseCreate();

@@ -673,7 +673,12 @@ namespace sql
         case StatementType::CREATE_TABLE:
         {
             const auto *create = static_cast<const CreateTableStatement *>(stmt);
-            out << "CreateTableStatement(table=" << create->table << ")\n";
+            out << "CreateTableStatement(table=" << create->table;
+            if (create->distribution == TableDistribution::HASH)
+                out << ", shard by hash(" << create->shard_column << ")";
+            else if (create->distribution == TableDistribution::REPLICATED)
+                out << ", replicated";
+            out << ")\n";
             out << "  columns:";
             for (const auto &column : create->columns)
             {

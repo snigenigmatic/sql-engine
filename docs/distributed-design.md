@@ -1,6 +1,6 @@
 # Distributed sql-engine — design and build plan
 
-Status: D0 and D1 are done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
+Status: D0–D2 are done; the rest is a proposal. It starts from `master` at 9d67d5b, the single-node engine with M1–M8 merged.
 
 **Decisions already made**
 - **Raft:** use the NuRaft library rather than writing our own.
@@ -92,10 +92,18 @@ Status: D0 and D1 are done; the rest is a proposal. It starts from `master` at 9
 
 ### 4.3 `src/cluster/ring`: consistent hashing
 - **Hash:** 64-bit MurmurHash3 over the canonical key from `AppendGroupKey` (`src/execution/evaluator.h`). The canonical key is used so that `1` and `1.0` (and the NULL cases) hash the same way they compare.
-- **Key → shard:** a ring of `shards × 64` virtual-node tokens. `ShardFor(hash)` finds the first token at or after the hash, wrapping around (`upper_bound` on a sorted vector).
+- **Key → shard:** a ring of `shards × 256` virtual-node tokens. `ShardFor(hash)` finds the first token at or after the hash, wrapping around (`lower_bound` on a sorted vector). Measured over 200,000 integer and 200,000 text keys on 16 shards, rows per shard have a standard deviation of 7.8% and 8.3% of the mean.
 - **Shard → nodes:** a second ring of nodes × 128 virtual nodes. A shard's replicas are the first 3 distinct nodes clockwise from `hash(shard_id)`, which is Dynamo's preference list.
   - Adding a node moves only about 1/N of the replicas, and moves no rows between shards.
-- **Pure library:** no I/O, fully unit-tested for even spread (stddev under 10% of the mean) and for minimal movement when nodes come and go.
+- **Pure library (D2):** `src/cluster/ring` (`hash.h`, `hash_ring.h`, `placement.h`), with no I/O and no NuRaft dependency. Unit tests check:
+  - the hash against reference MurmurHash3 outputs, and that `1`/`1.0`, `0.0`/`-0.0` and all NULLs hash alike;
+  - even spread (stddev under 10% of the mean);
+  - every process building the same ring whatever order nodes were added in;
+  - a new node only joining replica sets, each losing at most one old member, about 1/N of them in all;
+  - a removed node being replaced while every other member stays;
+  - nodes holding between 0.6× and 1.4× their share of replicas.
+  - Measured on 64 shards: 0.78–1.22× with 5 nodes and 0.83–1.29× with 8; adding a 5th node to 4 moved 43 replicas (about 38 expected).
+- **Syntax (D2):** `CREATE TABLE … SHARD BY HASH(col)` and `CREATE TABLE … REPLICATED`. `SHARD`, `HASH` and `REPLICATED` are matched as words, not reserved, so columns may still have those names. The shard column must be one of the table's columns. A single node accepts the clause and ignores it; the metadata service stores it in D4.
 
 ### 4.4 `src/cluster/metadata`: the metadata state machine (on coordinators)
 - **Contents:**
@@ -233,7 +241,7 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 |---|---|---|
 | D0 ✅ | **Dependencies and layout.** Pull NuRaft and standalone asio in via CMake `FetchContent`, add the `src/cluster` module (`src/net` and `src/distributed` arrive with their first code in D1 and D5) | Builds on CI, single-node tests unchanged |
 | D1 ✅ | **Server mode.** The wire protocol, a single-node `sqlnode` with one `Session` per connection (serialized), and the CLI's `--connect` | The golden runner passes against a server over TCP |
-| D2 | **Rings and placement.** The `ring` library, the metadata model, and the `SHARD BY` / `REPLICATED` syntax | Unit tests for spread, minimal movement and placement |
+| D2 ✅ | **Rings and placement.** The `ring` library, the metadata model, and the `SHARD BY` / `REPLICATED` syntax | Unit tests for spread, minimal movement and placement |
 | D3 | **One replicated shard.** The NuRaft state machine on `Database`, the log store, snapshots and exactly-once apply | An in-process 3-replica test: kill the leader, keep writing, restart, catch up, install a snapshot, same `.db` contents on every replica |
 | D4 | **The metadata group and cluster.** The coordinators' Raft group, node join, shard bootstrap, DDL fan-out, epochs | An in-process cluster of 3 coordinators and 3 nodes boots, then `CREATE TABLE`/`INSERT`/`SELECT` work |
 | D5 | **Distributed queries.** Pruning, scatter-gather, pushdown, partial aggregates, co-located and broadcast joins, gathering, distributed `EXPLAIN` | Every `test/sql/*.test` gives the same rows on the cluster; `EXPLAIN` tests show pruning and pushdown |

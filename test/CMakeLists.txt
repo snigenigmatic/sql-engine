@@ -43,6 +43,10 @@ target_link_libraries(server_test PRIVATE server net)
 # REPL shell
 add_sqlengine_test(cli_test cli/cli_test.cpp)
 
+# Consistent hashing and placement
+add_sqlengine_test(ring_test cluster/ring_test.cpp)
+target_link_libraries(ring_test PRIVATE ring)
+
 # Cluster components (need NuRaft)
 if(SQLENGINE_DISTRIBUTED)
     add_sqlengine_test(memory_log_store_test cluster/memory_log_store_test.cpp)

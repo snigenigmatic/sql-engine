@@ -268,10 +268,21 @@ namespace sql
         std::optional<Value> default_value;
     };
 
+    // How a cluster spreads a table's rows; a single node keeps them all
+    // and ignores this
+    enum class TableDistribution
+    {
+        DEFAULT,    // by the primary key's hash
+        HASH,       // SHARD BY HASH(shard_column)
+        REPLICATED, // a full copy in every shard (small reference tables)
+    };
+
     struct CreateTableStatement : public Statement
     {
         std::string table;
         std::vector<ColumnDef> columns;
+        TableDistribution distribution = TableDistribution::DEFAULT;
+        std::string shard_column; // with HASH
         StatementType GetType() const override { return StatementType::CREATE_TABLE; }
     };
 

@@ -240,7 +240,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
 - [ ] **Distributed Query Processing** (design: [docs/distributed-design.md](docs/distributed-design.md))
   - [x] D0: NuRaft and asio in the build; Raft replication, leader failover and several Raft groups per process verified
   - [x] D1: Server mode and wire protocol (`sqlnode`, `sqlengine --connect`)
-  - [ ] D2: Hash rings and replica placement
+  - [x] D2: Hash rings and replica placement; `SHARD BY HASH(col)` / `REPLICATED` syntax
   - [ ] D3: A Raft-replicated shard
   - [ ] D4: Metadata Raft group and cluster bootstrap
   - [ ] D5: Distributed queries

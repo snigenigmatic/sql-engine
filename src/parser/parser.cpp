@@ -1,6 +1,8 @@
 #include "parser/parser.h"
+#include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -318,8 +320,44 @@ namespace sql
         } while (Match(TokenType::COMMA));
 
         Expect(TokenType::RPAREN);
+
+        // SHARD BY HASH (column) | REPLICATED. Plain words rather than
+        // keywords, so columns may still be called "hash" or "shard".
+        if (IsWord("SHARD"))
+        {
+            NextToken();
+            Expect(TokenType::BY);
+            if (!IsWord("HASH"))
+                throw std::runtime_error("Expected HASH after SHARD BY, got: " + current_token_.value);
+            NextToken();
+            Expect(TokenType::LPAREN);
+            const Token column = Expect(TokenType::IDENTIFIER);
+            Expect(TokenType::RPAREN);
+            const bool known = std::any_of(stmt->columns.begin(), stmt->columns.end(),
+                                           [&](const ColumnDef &col) { return col.name == column.value; });
+            if (!known)
+                throw std::runtime_error("Shard key " + column.value + " is not a column of " + stmt->table);
+            stmt->distribution = TableDistribution::HASH;
+            stmt->shard_column = column.value;
+        }
+        else if (IsWord("REPLICATED"))
+        {
+            NextToken();
+            stmt->distribution = TableDistribution::REPLICATED;
+        }
+
         Expect(TokenType::SEMICOLON);
         return stmt;
+    }
+
+    bool Parser::IsWord(const char *word) const
+    {
+        if (current_token_.type != TokenType::IDENTIFIER || current_token_.value.size() != std::strlen(word))
+            return false;
+        for (size_t i = 0; word[i] != '\0'; ++i)
+            if (std::toupper(static_cast<unsigned char>(current_token_.value[i])) != word[i])
+                return false;
+        return true;
     }
 
     std::unique_ptr<CreateIndexStatement> Parser::ParseCreateIndex()
