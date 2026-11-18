@@ -166,7 +166,7 @@ for i in 0 1 2; do ./build/src/server/sqlnode --role storage --name node-$i --co
 ./build/src/sqlengine --connect 127.0.0.1:31201
 ```
 
-Tables are spread over shards by `SHARD BY HASH(col)`, the primary key, or the whole row; `REPLICATED` tables are copied to every shard. See [docs/distributed-design.md](docs/distributed-design.md) for what works so far and what doesn't yet (no cross-shard transactions until D6).
+Tables are spread over shards by `SHARD BY HASH(col)`, the primary key, or the whole row; `REPLICATED` tables are copied to every shard. Every statement is atomic across shards, and `BEGIN` / `COMMIT` / `ROLLBACK` work across shards with two-phase commit over the shards' Raft groups. Give clients every coordinator (`--connect h1:p1,h2:p2,h3:p3`) so they fail over. `scripts/local-cluster.sh` runs a six-process cluster on one machine; [docs/cluster-user-testing.md](docs/cluster-user-testing.md) is what happened when people used it while processes were killed. See [docs/distributed-design.md](docs/distributed-design.md) for what works so far and what doesn't yet.
 
 ### REPL Commands
 
@@ -258,7 +258,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
   - [x] D3: A Raft-replicated shard (durable Raft log, exactly-once apply, snapshots, linearizable reads)
   - [x] D4: Metadata Raft group and cluster bootstrap (`sqlnode --role coordinator|storage`)
   - [x] D5: Distributed queries (shard pruning, single-shard statements, partial aggregates, filter and top-N pushdown, distributed `EXPLAIN`)
-  - [ ] D6: Two-phase commit across shards
+  - [x] D6: Two-phase commit across shards (interactive transactions that read their own writes, shard locks, recovery by presumed abort)
   - [ ] D7: Kubernetes (minikube)
   - [ ] D8: Rebalancing
 ## Architecture

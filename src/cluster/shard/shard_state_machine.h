@@ -41,13 +41,52 @@ namespace sql::cluster
         // returns the first outcome instead of applying again
         static nuraft::ptr<nuraft::buffer> EncodeWrite(const std::string &sql, const std::string &request_id);
         static nuraft::ptr<nuraft::buffer> EncodeBarrier(); // applies nothing
+
+        // Several statements applied all or nothing: if one fails, none of
+        // them stays and the result is that failure; otherwise the last
+        // statement's result. For the coordinators' metadata.
+        static nuraft::ptr<nuraft::buffer> EncodeBatch(const std::string &script, const std::string &request_id);
+
+        // A step of a distributed transaction (two-phase commit). While a
+        // transaction is open on a replica its changes stay uncommitted in
+        // the database's own transaction, and the shard is locked: every
+        // other write, and every read outside that transaction, is refused
+        // with a "locked by another transaction" failure (callers retry).
+        //
+        //   EXEC     run sql in the transaction (opening it if needed); a
+        //            failing statement is undone on its own
+        //   UNDO     undo the last EXEC (the coordinator's statement failed
+        //            on another shard)
+        //   PREPARE  vote: succeeds if the transaction is open here; after it
+        //            no more EXEC or UNDO
+        //   COMMIT   commit it and unlock
+        //   ABORT    roll it back and unlock (a no-op if it is not open)
+        //
+        // A replica that restarts replays its log, which reopens the
+        // transaction exactly as it was.
+        enum class TxnOp : uint8_t
+        {
+            EXEC = 0,
+            UNDO = 1,
+            PREPARE = 2,
+            COMMIT = 3,
+            ABORT = 4,
+        };
+        static nuraft::ptr<nuraft::buffer> EncodeTxn(TxnOp op, const std::string &txid, const std::string &sql,
+                                                     const std::string &request_id);
+        static bool ParseTxnOp(const std::string &name, TxnOp *op);
+
+        // The id of the transaction open on this replica, or ""
+        std::string OpenTransaction();
         // The result an entry's commit returned (an error if malformed)
         static ExecutionResult DecodeResult(nuraft::buffer *result);
 
         // A read-only statement (SELECT / EXPLAIN) against this replica's
         // data as applied so far. Callers wanting the latest committed data
         // first pass a barrier through the log (ReplicatedShard::Read).
-        ExecutionResult Query(const std::string &sql);
+        // Inside transaction `txid` (if not empty) it sees that
+        // transaction's own changes.
+        ExecutionResult Query(const std::string &sql, const std::string &txid = "");
 
         nuraft::ptr<nuraft::buffer> commit(const nuraft::ulong log_idx, nuraft::buffer &data) override;
         nuraft::ulong last_commit_index() override { return last_applied_; }
@@ -65,12 +104,20 @@ namespace sql::cluster
         {
             BARRIER = 0,
             WRITE = 1,
+            BATCH = 2,
+            TXN = 3,
         };
 
         // Caller holds mutex_
         void OpenDatabase();
         void CloseDatabase();
-        ExecutionResult Apply(nuraft::ulong index, const std::string &sql, const std::string &request_id);
+        ExecutionResult Apply(nuraft::ulong index, const std::string &sql, const std::string &request_id, bool batch);
+        ExecutionResult ApplyTxn(nuraft::ulong index, TxnOp op, const std::string &txid, const std::string &sql,
+                                 const std::string &request_id);
+        // Moves the applied index on, committing it unless a transaction is
+        // open (then it commits, or rolls back, with the transaction)
+        void Advance(nuraft::ulong index);
+        ExecutionResult Locked() const;
         // The outcome recorded for a request id, if it was applied
         std::optional<ExecutionResult> Recorded(const std::string &request_id);
         void Record(nuraft::ulong index, const std::string &request_id, const ExecutionResult &result);
@@ -91,6 +138,11 @@ namespace sql::cluster
         std::unique_ptr<Database> db_;
         std::unique_ptr<Session> session_;
         std::atomic<nuraft::ulong> last_applied_{0};
+        // The open distributed transaction (see EncodeTxn)
+        std::string open_txid_;
+        bool prepared_ = false;
+        bool has_statement_savepoint_ = false;
+        Pager::Savepoint statement_savepoint_{};
         // The snapshot being received (one at a time)
         bool receiving_ok_ = false;
         uint64_t expected_size_ = 0;

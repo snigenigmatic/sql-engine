@@ -20,7 +20,12 @@ namespace sql::cluster
     //   ensure_replica  epoch, shard, members ("id@host:port,...")
     //   write           epoch, shard, sql, request id (on the shard's
     //                   leader; a retry with the same id applies once)
-    //   read            epoch, shard, sql   (linearizable, on the leader)
+    //   read            epoch, shard, sql[, txid]   (linearizable, on the
+    //                   leader; inside transaction txid if given)
+    //   txn             epoch, shard, op, txid, sql, request id: a step of
+    //                   a distributed transaction (exec, undo, prepare,
+    //                   commit, abort; see ShardStateMachine::EncodeTxn)
+    //   txn_status      epoch, shard, -: the transaction open on the shard
     //
     // A request carrying an older epoch than one already seen is refused:
     // after a coordinator failover the deposed leader cannot change data.

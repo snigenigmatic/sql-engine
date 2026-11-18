@@ -217,32 +217,203 @@ namespace sql::cluster
         return std::move(decoded->results.front());
     }
 
-    ExecutionResult ShardStateMachine::Apply(ulong index, const std::string &sql, const std::string &request_id)
+    ptr<buffer> ShardStateMachine::EncodeBatch(const std::string &script, const std::string &request_id)
+    {
+        if (request_id.empty() || request_id.size() > 255)
+            throw std::invalid_argument("a request id has 1 to 255 characters");
+        return Bytes(std::string(1, static_cast<char>(Kind::BATCH)) +
+                     std::string(1, static_cast<char>(request_id.size())) + request_id + script);
+    }
+
+    ptr<buffer> ShardStateMachine::EncodeTxn(TxnOp op, const std::string &txid, const std::string &sql,
+                                             const std::string &request_id)
+    {
+        if (request_id.empty() || request_id.size() > 255)
+            throw std::invalid_argument("a request id has 1 to 255 characters");
+        if (txid.empty() || txid.size() > 255)
+            throw std::invalid_argument("a transaction id has 1 to 255 characters");
+        return Bytes(std::string(1, static_cast<char>(Kind::TXN)) + std::string(1, static_cast<char>(op)) +
+                     std::string(1, static_cast<char>(request_id.size())) + request_id +
+                     std::string(1, static_cast<char>(txid.size())) + txid + sql);
+    }
+
+    bool ShardStateMachine::ParseTxnOp(const std::string &name, TxnOp *op)
+    {
+        static const std::pair<const char *, TxnOp> names[] = {{"exec", TxnOp::EXEC},       {"undo", TxnOp::UNDO},
+                                                               {"prepare", TxnOp::PREPARE}, {"commit", TxnOp::COMMIT},
+                                                               {"abort", TxnOp::ABORT}};
+        for (const auto &[text, value] : names)
+            if (name == text)
+            {
+                *op = value;
+                return true;
+            }
+        return false;
+    }
+
+    std::string ShardStateMachine::OpenTransaction()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return open_txid_;
+    }
+
+    ExecutionResult ShardStateMachine::Locked() const
+    {
+        return Failure("shard is locked by another transaction (" + open_txid_ + ")");
+    }
+
+    void ShardStateMachine::Advance(ulong index)
+    {
+        RecordApplied(index);
+        if (open_txid_.empty() && !db_->Commit())
+            throw std::runtime_error("shard replica cannot commit");
+    }
+
+    namespace
+    {
+        // The wrapping transaction is ours, not the client's: report the
+        // error as a single node would
+        void StripRollbackNote(ExecutionResult *result)
+        {
+            const std::string suffix = " (statement rolled back; transaction still open)";
+            if (!result->success && result->message.size() >= suffix.size() &&
+                result->message.compare(result->message.size() - suffix.size(), suffix.size(), suffix) == 0)
+                result->message.erase(result->message.size() - suffix.size());
+        }
+    } // namespace
+
+    ExecutionResult ShardStateMachine::Apply(ulong index, const std::string &sql, const std::string &request_id,
+                                             bool batch)
     {
         // A retry of a write that already went through: its first outcome
         if (auto first = Recorded(request_id))
         {
-            RecordApplied(index);
-            if (!db_->Commit())
-                throw std::runtime_error("shard replica cannot commit");
+            Advance(index);
             return *first;
         }
-        // Transactions across entries are two-phase commit's job (D6)
-        if (TypeOf(sql) == StatementType::TRANSACTION_STMT)
+        // Nothing else may change the data while a transaction holds it.
+        // Refusing changes nothing, so a retry later is safe.
+        if (!open_txid_.empty())
+        {
+            Advance(index);
+            return Locked();
+        }
+        if (!batch && TypeOf(sql) == StatementType::TRANSACTION_STMT)
             return Failure("BEGIN, COMMIT and ROLLBACK cannot be sent to a shard directly");
         Must(session_->Execute("BEGIN;"), "start a transaction");
-        // A failing statement is rolled back on its own; the transaction
-        // stays open for the applied index
-        ExecutionResult result = Run(*session_, sql);
-        // The wrapping transaction is ours, not the client's: report the
-        // error as a single node would
-        const std::string suffix = " (statement rolled back; transaction still open)";
-        if (!result.success && result.message.size() >= suffix.size() &&
-            result.message.compare(result.message.size() - suffix.size(), suffix.size(), suffix) == 0)
-            result.message.erase(result.message.size() - suffix.size());
+        ExecutionResult result;
+        if (batch)
+        {
+            // All or nothing: the first failure undoes the whole batch
+            for (auto &one : session_->ExecuteScript(sql, true))
+            {
+                result = std::move(one);
+                if (!result.success)
+                    break;
+            }
+            if (!result.success)
+            {
+                StripRollbackNote(&result);
+                Must(session_->Execute("ROLLBACK;"), "roll back");
+                Must(session_->Execute("BEGIN;"), "start a transaction");
+            }
+        }
+        else
+        {
+            // A failing statement is rolled back on its own; the transaction
+            // stays open for the applied index
+            result = Run(*session_, sql);
+            StripRollbackNote(&result);
+        }
         Record(index, request_id, result); // inside the same transaction
         RecordApplied(index);
         Must(session_->Execute("COMMIT;"), "commit");
+        return result;
+    }
+
+    ExecutionResult ShardStateMachine::ApplyTxn(ulong index, TxnOp op, const std::string &txid, const std::string &sql,
+                                                const std::string &request_id)
+    {
+        if (auto first = Recorded(request_id))
+        {
+            Advance(index);
+            return *first;
+        }
+        const bool mine = open_txid_ == txid;
+        ExecutionResult result;
+        result.success = true;
+        switch (op)
+        {
+        case TxnOp::EXEC:
+            if (!open_txid_.empty() && !mine)
+                result = Locked();
+            else if (prepared_)
+                result = Failure("transaction " + txid + " is already prepared");
+            else if (TypeOf(sql) == StatementType::TRANSACTION_STMT)
+                result = Failure("BEGIN, COMMIT and ROLLBACK cannot be sent to a shard directly");
+            else
+            {
+                if (!mine)
+                {
+                    Must(session_->Execute("BEGIN;"), "start a transaction");
+                    open_txid_ = txid;
+                    prepared_ = false;
+                }
+                if (!db_->CreateSavepoint(&statement_savepoint_))
+                    throw std::runtime_error("shard replica cannot take a savepoint");
+                has_statement_savepoint_ = true;
+                result = Run(*session_, sql);
+                StripRollbackNote(&result);
+                Record(index, request_id, result);
+            }
+            break;
+        case TxnOp::UNDO:
+            if (!mine || prepared_ || !has_statement_savepoint_)
+                result = Failure("nothing to undo in transaction " + txid);
+            else
+            {
+                std::string error;
+                if (!db_->RollbackTo(statement_savepoint_, &error))
+                    throw std::runtime_error("shard replica cannot undo a statement: " + error);
+                has_statement_savepoint_ = false;
+                result.message = "undone";
+            }
+            break;
+        case TxnOp::PREPARE:
+            if (!mine)
+                result = Failure("transaction " + txid + " is not open on this shard");
+            else
+            {
+                prepared_ = true;
+                has_statement_savepoint_ = false;
+                result.message = "prepared";
+            }
+            break;
+        case TxnOp::COMMIT:
+            if (!mine)
+                result = Failure("transaction " + txid + " is not open on this shard");
+            else
+            {
+                result.message = "committed";
+                Record(index, request_id, result);
+                RecordApplied(index);
+                open_txid_.clear();
+                prepared_ = has_statement_savepoint_ = false;
+                Must(session_->Execute("COMMIT;"), "commit");
+                return result;
+            }
+            break;
+        case TxnOp::ABORT:
+            if (mine)
+            {
+                Must(session_->Execute("ROLLBACK;"), "roll back");
+                open_txid_.clear();
+                prepared_ = has_statement_savepoint_ = false;
+            }
+            result.message = "aborted";
+            break;
+        }
+        Advance(index);
         return result;
     }
 
@@ -257,14 +428,32 @@ namespace sql::cluster
                  payload.size() >= 2 + static_cast<size_t>(static_cast<unsigned char>(payload[1])))
         {
             const size_t id_size = static_cast<unsigned char>(payload[1]);
-            result = Apply(log_idx, payload.substr(2 + id_size), payload.substr(2, id_size));
+            result = Apply(log_idx, payload.substr(2 + id_size), payload.substr(2, id_size), false);
+        }
+        else if (payload.size() >= 2 && payload[0] == static_cast<char>(Kind::BATCH) &&
+                 payload.size() >= 2 + static_cast<size_t>(static_cast<unsigned char>(payload[1])))
+        {
+            const size_t id_size = static_cast<unsigned char>(payload[1]);
+            result = Apply(log_idx, payload.substr(2 + id_size), payload.substr(2, id_size), true);
+        }
+        else if (payload.size() >= 4 && payload[0] == static_cast<char>(Kind::TXN))
+        {
+            const size_t id_size = static_cast<unsigned char>(payload[2]);
+            const size_t txid_at = 3 + id_size;
+            const size_t txid_size = payload.size() > txid_at ? static_cast<unsigned char>(payload[txid_at]) : 0;
+            if (txid_size == 0 || payload.size() < txid_at + 1 + txid_size || static_cast<uint8_t>(payload[1]) > 4)
+            {
+                Advance(log_idx);
+                result = Failure("malformed transaction entry");
+            }
+            else
+                result = ApplyTxn(log_idx, static_cast<TxnOp>(payload[1]), payload.substr(txid_at + 1, txid_size),
+                                  payload.substr(txid_at + 1 + txid_size), payload.substr(3, id_size));
         }
         else
         {
             // A barrier (or anything unknown): only the index moves on
-            RecordApplied(log_idx);
-            if (!db_->Commit())
-                throw std::runtime_error("shard replica cannot commit");
+            Advance(log_idx);
             result.success = true;
         }
         last_applied_ = std::max<ulong>(last_applied_, log_idx);
@@ -273,12 +462,15 @@ namespace sql::cluster
         return Bytes(net::Encode(response).payload);
     }
 
-    ExecutionResult ShardStateMachine::Query(const std::string &sql)
+    ExecutionResult ShardStateMachine::Query(const std::string &sql, const std::string &txid)
     {
         const auto type = TypeOf(sql);
         if (type && *type != StatementType::SELECT && *type != StatementType::EXPLAIN_STMT)
             return Failure("only SELECT and EXPLAIN can be read from a replica");
         std::lock_guard<std::mutex> lock(mutex_);
+        // Uncommitted changes are visible only to their own transaction
+        if (!open_txid_.empty() && open_txid_ != txid)
+            return Locked();
         return Run(*session_, sql);
     }
 
@@ -309,6 +501,10 @@ namespace sql::cluster
             std::lock_guard<std::mutex> lock(mutex_);
             // NuRaft asks right after applying s's index, before any later
             // entry: the database is exactly the state as of that index
+            // The open transaction's changes are not committed: no snapshot
+            // until it ends (replaying the log reopens it instead)
+            if (!open_txid_.empty())
+                throw std::runtime_error("a transaction is open");
             if (last_applied_ != s.get_last_log_idx())
                 throw std::runtime_error("snapshot index " + std::to_string(s.get_last_log_idx()) +
                                          " is not the applied index " + std::to_string(last_applied_.load()));
@@ -415,7 +611,9 @@ namespace sql::cluster
         const ulong index = s.get_last_log_idx();
         if (!fs::exists(SnapshotPath(index, ".db")))
             return false;
-        CloseDatabase();
+        CloseDatabase(); // rolls back an open transaction
+        open_txid_.clear();
+        prepared_ = has_statement_savepoint_ = false;
         // Replace the data with the snapshot's; its __raft_meta says index
         fs::copy_file(SnapshotPath(index, ".db"), dir_ + "/shard.db.tmp", fs::copy_options::overwrite_existing);
         fs::remove(dir_ + "/shard.db-wal");

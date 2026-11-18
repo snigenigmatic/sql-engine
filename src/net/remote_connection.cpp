@@ -5,14 +5,64 @@ namespace sql::net
 {
 
     RemoteConnection::RemoteConnection(const std::string &host, uint16_t port)
-        : socket_(Connect(host, port)), address_(host + ":" + std::to_string(port))
+        : servers_{{host, port}}, socket_(Connect(host, port)), address_(host + ":" + std::to_string(port))
     {
+    }
+
+    RemoteConnection::RemoteConnection(const std::vector<std::pair<std::string, uint16_t>> &servers, bool reconnect)
+        : servers_(servers), reconnect_(reconnect)
+    {
+        if (servers_.empty())
+            throw std::invalid_argument("no server to connect to");
+        ConnectAny();
+    }
+
+    void RemoteConnection::ConnectAny()
+    {
+        std::string errors;
+        for (size_t i = 0; i < servers_.size(); ++i)
+        {
+            const size_t at = (current_ + i) % servers_.size();
+            const auto &[host, port] = servers_[at];
+            try
+            {
+                socket_ = Connect(host, port);
+                current_ = at;
+                address_ = host + ":" + std::to_string(port);
+                return;
+            }
+            catch (const std::exception &e)
+            {
+                errors += std::string(errors.empty() ? "" : "; ") + e.what();
+            }
+        }
+        throw std::runtime_error(errors);
+    }
+
+    std::string RemoteConnection::TakeNotice()
+    {
+        std::string notice;
+        notice.swap(notice_);
+        return notice;
     }
 
     Frame RemoteConnection::RoundTrip(const Frame &request)
     {
         if (!socket_.IsOpen())
-            throw std::runtime_error("not connected to " + address_);
+        {
+            if (!reconnect_)
+                throw std::runtime_error("not connected to " + address_);
+            const std::string lost = address_;
+            ConnectAny(); // nothing was sent: safe to try another server
+            notice_ = "(reconnected to " + address_ + ")";
+            if (lost_transaction_)
+            {
+                lost_transaction_ = false;
+                throw std::runtime_error("the connection to " + lost +
+                                         " was lost with a transaction open, so the transaction was rolled back; "
+                                         "this statement was not run (reconnected to " + address_ + ")");
+            }
+        }
         Frame response;
         try
         {
@@ -25,6 +75,7 @@ namespace sql::net
             // Whatever the server was doing, its session is gone with the
             // connection (an open transaction was rolled back)
             socket_.Close();
+            lost_transaction_ = in_transaction_;
             in_transaction_ = false;
             throw std::runtime_error("lost connection to " + address_ + ": " + e.what());
         }

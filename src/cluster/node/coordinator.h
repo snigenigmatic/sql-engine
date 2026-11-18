@@ -6,9 +6,12 @@
 #include "net/remote_connection.h"
 #include "server/server.h"
 #include <atomic>
+#include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,6 +28,8 @@ namespace sql::cluster
     //   tables    (name, definition, kind, shard_column) kind: hash|row|replicated
     //   ddl       (seq, statement)                       every schema change, in order
     //   shard_ddl (shard, applied)                       how far each shard got
+    //   txns      (id, state)                            2PC decisions not yet
+    //                                                    applied everywhere
     //
     // The group's leader is the cluster's coordinator: it accepts storage
     // nodes, forms the cluster once `replication_factor` nodes have joined
@@ -42,6 +47,16 @@ namespace sql::cluster
     //
     // Becoming leader bumps the epoch, which storage nodes use to refuse a
     // deposed leader. Followers redirect clients to the leader.
+    //
+    // Writes are atomic across shards (D6). A statement that writes one
+    // shard is a plain write; anything wider, and everything inside BEGIN
+    // ... COMMIT, runs as a distributed transaction: each shard keeps the
+    // transaction open in its Raft log (and is locked to everyone else
+    // meanwhile), and COMMIT is two-phase: every participant prepares, the
+    // decision is written to the metadata group (the commit point), then
+    // every participant commits. A new leader finishes or rolls back
+    // whatever an earlier one left open (presumed abort). Waiting for a
+    // locked shard gives up after `lock_timeout_ms`.
     class Coordinator
     {
     public:
@@ -59,6 +74,25 @@ namespace sql::cluster
             int heartbeat_ms = 100;
             int election_timeout_ms = 1000;
             int snapshot_distance = 1000;
+            int lock_timeout_ms = 5000; // waiting for another transaction's shard
+            // A transaction no statement used for this long is rolled back,
+            // releasing its shards (0: never)
+            int idle_transaction_timeout_ms = 60000;
+        };
+
+        // A client's transaction (one per client connection)
+        struct Transaction
+        {
+            std::string id; // empty: none open
+            uint64_t epoch = 0;
+            std::set<uint32_t> shards;    // participants
+            std::vector<std::string> ddl; // schema changes, applied to the metadata at COMMIT
+            bool implicit = false;        // one statement's own, outside BEGIN
+            std::chrono::steady_clock::time_point last_used{};
+            // Rolled back by the coordinator (idle too long): the client's
+            // next statement is told so instead of running on its own
+            std::string expired;
+            bool Open() const { return !id.empty(); }
         };
 
         explicit Coordinator(const Options &options);
@@ -68,16 +102,30 @@ namespace sql::cluster
         void Stop();
         uint16_t Port() const { return server_ ? server_->Port() : 0; }
         bool IsLeader() const { return metadata_ && metadata_->IsLeader(); }
+        // How long a follower waits for a new leader before failing a client
+        int ElectionWaitMs() const { return options_.election_timeout_ms * 5; }
         // host:client_port of the current leader, or "" if unknown
         std::string LeaderAddress() const;
 
-        // The client-facing operations (on the leader)
-        ExecutionResult Execute(const std::string &sql);
+        // The client-facing operations (on the leader). `txn` is the
+        // client's transaction state; without one, BEGIN is refused.
+        ExecutionResult Execute(const std::string &sql, Transaction *txn = nullptr);
+        // The client went away: roll back its transaction, if any
+        void Abandon(Transaction *txn);
+        // Whether the client is (as far as it knows) inside a transaction
+        bool InTransaction(const Transaction *txn);
+        // Forget the client's transaction (this coordinator lost the
+        // leadership: the next leader rolls it back); true if one was open
+        bool Drop(Transaction *txn);
         std::string Command(const std::string &name, const std::string &argument);
         ExecutionResult Call(const std::string &method, const std::vector<std::string> &arguments);
 
         // For tests: shard reads sent so far
         uint64_t ShardReads() const { return shard_reads_; }
+        // For tests: the metadata group's replica here
+        ReplicatedShard &Metadata() { return *metadata_; }
+        // For tests: distributed transactions committed with two phases
+        uint64_t TwoPhaseCommits() const { return two_phase_commits_; }
 
         // For tests and status: as last loaded by the leader
         bool Formed();
@@ -114,12 +162,35 @@ namespace sql::cluster
         void BecomeLeader();
         void Reconcile();
         void Load();
-        ExecutionResult MetaWrite(const std::string &sql);
+        // batch: several statements, all or nothing
+        ExecutionResult MetaWrite(const std::string &sql, bool batch = false);
         ExecutionResult MetaRead(const std::string &sql);
         void Form();
         void EnsureReplicas(bool force);
         void CatchUpDdl();
-        ExecutionResult ShardCall(uint32_t shard, const std::string &method, const std::string &sql);
+        // A call to a shard's leader: "write" (sql), "read" (sql, inside
+        // txn_ if open), "txn" (op, txid, sql) or "txn_status". Writes and
+        // transaction steps carry a request id, kept across retries.
+        ExecutionResult ShardCall(uint32_t shard, const std::string &method, const std::string &sql,
+                                  const std::string &op = "", const std::string &txid = "", int timeout_ms = 0);
+        ExecutionResult ExecuteLocked(const std::string &sql, Transaction *txn);
+        ExecutionResult RunTransactionStatement(const TransactionStatement &stmt, Transaction *txn);
+        // Runs body inside txn_, or, outside a transaction, inside an implicit
+        // one that commits if body succeeds and rolls back if not
+        ExecutionResult Atomically(const std::function<ExecutionResult()> &body);
+        // Runs per-shard statements: one shard outside a transaction is a
+        // plain write; otherwise inside txn_ (callers wrap several shards in
+        // Atomically). A failure undoes the statement on every shard. With
+        // release_untouched, a shard the statement changed no row on is
+        // left out of the transaction. Each shard's result goes in *results.
+        ExecutionResult WriteShards(const std::map<uint32_t, std::string> &statements, bool release_untouched,
+                                    std::map<uint32_t, ExecutionResult> *results);
+        ExecutionResult Commit(Transaction *txn);
+        void Abort(Transaction *txn);
+        // Settle transactions an earlier leader left open on the shards
+        void Recover();
+        const std::map<std::string, TableInfo> &Tables(); // as txn_ sees them
+        static TableInfo DescribeTable(const std::string &sql, const CreateTableStatement &create);
         net::RemoteConnection *NodeConnection(int node);
         std::unique_ptr<Database> SchemaDatabase(); // every table and index, empty
         ExecutionResult Ddl(const std::string &sql);
@@ -167,6 +238,7 @@ namespace sql::cluster
         std::thread loop_;
         std::atomic<bool> stopping_{false};
         std::atomic<uint64_t> shard_reads_{0};
+        std::atomic<uint64_t> two_phase_commits_{0};
 
         std::mutex op_mutex_; // one cluster operation at a time
         bool was_leader_ = false;
@@ -175,6 +247,17 @@ namespace sql::cluster
         std::map<uint32_t, int> shard_leaders_;
         std::map<std::pair<uint32_t, int>, bool> ensured_;
         std::chrono::steady_clock::time_point last_full_ensure_{};
+        Transaction *txn_ = nullptr;           // the operation's transaction, if open
+        std::set<std::string> active_txns_;    // open in clients' sessions (this term)
+        std::set<Transaction *> explicit_txns_; // clients' BEGIN ... (this term), for the idle timeout
+        void ExpireIdleTransactions();
+        // Transactions waiting for a shard another one holds (waiter ->
+        // holder); a cycle is a deadlock
+        std::map<std::string, std::string> waits_for_;
+        std::map<std::string, TableInfo> overlay_tables_;
+        std::string overlay_key_;
+        std::chrono::steady_clock::time_point last_recover_{};
+        std::set<uint32_t> unsettled_; // shards that may hold a transaction no session owns
     };
 
 } // namespace sql::cluster
