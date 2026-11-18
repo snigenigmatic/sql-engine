@@ -1,6 +1,9 @@
 #include "cluster/shard/replicated_shard.h"
 #include "cluster/raft/raft_logger.h"
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <filesystem>
 #include <random>
 #include <stdexcept>
@@ -25,8 +28,11 @@ namespace sql::cluster
         machine_ = nuraft::cs_new<ShardStateMachine>(options.directory + "/data", options.snapshot_chunk);
 
         auto members = nuraft::cs_new<nuraft::cluster_config>();
-        for (const auto &member : options.members)
-            members->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(member.id, member.endpoint));
+        if (options.joining) // the leader sends the real membership when it adds us
+            members->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(options.id, options.endpoint));
+        else
+            for (const auto &member : options.members)
+                members->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(member.id, member.endpoint));
         state_ = nuraft::cs_new<FileStateManager>(options.id, options.directory, members);
 
         nuraft::raft_params params;
@@ -41,8 +47,10 @@ namespace sql::cluster
         asio.thread_pool_size_ = 2;
 
         launcher_ = std::make_unique<nuraft::raft_launcher>();
+        nuraft::raft_server::init_options init;
+        init.skip_initial_election_timeout_ = options.joining;
         raft_ = launcher_->init(machine_, state_, nuraft::cs_new<RaftLogger>(options.log_level), options.port, asio,
-                                params);
+                                params, init);
         if (!raft_)
             throw std::runtime_error("cannot start Raft server " + std::to_string(options.id) + " on port " +
                                      std::to_string(options.port));
@@ -59,6 +67,79 @@ namespace sql::cluster
     }
 
     bool ReplicatedShard::IsLeader() const { return raft_ && raft_->is_leader(); }
+
+    namespace
+    {
+        bool HasMember(const nuraft::ptr<nuraft::raft_server> &raft, int id)
+        {
+            std::vector<nuraft::ptr<nuraft::srv_config>> members;
+            raft->get_srv_config_all(members);
+            for (const auto &member : members)
+                if (member->get_id() == id)
+                    return true;
+            return false;
+        }
+    } // namespace
+
+    ExecutionResult ReplicatedShard::Members()
+    {
+        if (!IsLeader())
+            return Failure("not the leader (leader: " + std::to_string(LeaderId()) + ")");
+        std::vector<nuraft::ptr<nuraft::srv_config>> members;
+        raft_->get_srv_config_all(members);
+        std::vector<int> ids;
+        for (const auto &member : members)
+            ids.push_back(member->get_id());
+        std::sort(ids.begin(), ids.end());
+        std::string text;
+        for (int id : ids)
+            text += (text.empty() ? "" : ",") + std::to_string(id);
+        ExecutionResult result;
+        result.success = true;
+        result.message = text;
+        return result;
+    }
+
+    ExecutionResult ReplicatedShard::AddMember(int id, const std::string &endpoint)
+    {
+        if (!IsLeader())
+            return Failure("not the leader (leader: " + std::to_string(LeaderId()) + ")");
+        ExecutionResult done;
+        done.success = true;
+        done.message = "member";
+        if (HasMember(raft_, id))
+            return done;
+        auto result = raft_->add_srv(nuraft::srv_config(id, endpoint));
+        if (!result->get_accepted() && result->get_result_code() != nuraft::cmd_result_code::SERVER_ALREADY_EXISTS)
+            return Failure("pending: adding replica " + std::to_string(id) + " (" + result->get_result_str() + ")");
+        // NuRaft catches the new member up, then commits the new membership
+        for (int i = 0; i < 40 && !HasMember(raft_, id); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return HasMember(raft_, id) ? done : Failure("pending: replica " + std::to_string(id) + " is catching up");
+    }
+
+    ExecutionResult ReplicatedShard::RemoveMember(int id)
+    {
+        if (!IsLeader())
+            return Failure("not the leader (leader: " + std::to_string(LeaderId()) + ")");
+        ExecutionResult done;
+        done.success = true;
+        done.message = "removed";
+        if (!HasMember(raft_, id))
+            return done;
+        if (id == options_.id)
+        {
+            // A leader cannot remove itself: hand over first
+            raft_->yield_leadership();
+            return Failure("pending: replica " + std::to_string(id) + " is handing over its leadership");
+        }
+        auto result = raft_->remove_srv(id);
+        if (!result->get_accepted() && result->get_result_code() != nuraft::cmd_result_code::SERVER_NOT_FOUND)
+            return Failure("pending: removing replica " + std::to_string(id) + " (" + result->get_result_str() + ")");
+        for (int i = 0; i < 40 && HasMember(raft_, id); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return HasMember(raft_, id) ? Failure("pending: removing replica " + std::to_string(id)) : done;
+    }
 
     int ReplicatedShard::LeaderId() const { return raft_ ? raft_->get_leader() : -1; }
 

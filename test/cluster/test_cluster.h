@@ -73,7 +73,9 @@ namespace sql::cluster::testing
     class Cluster
     {
     public:
-        explicit Cluster(size_t storage_nodes = 3, int idle_transaction_timeout_ms = 60000)
+        explicit Cluster(size_t storage_nodes = 3, int idle_transaction_timeout_ms = 60000,
+                         int node_down_after_ms = 300000, int snapshot_distance = 1000)
+            : snapshot_distance_(snapshot_distance)
         {
             static int counter = 0;
             root_ = (std::filesystem::temp_directory_path() /
@@ -102,6 +104,7 @@ namespace sql::cluster::testing
                 options.heartbeat_ms = 50;
                 options.election_timeout_ms = 1000; // shorter ones cause needless elections under sanitizers
                 options.idle_transaction_timeout_ms = idle_transaction_timeout_ms;
+                options.node_down_after_ms = node_down_after_ms;
                 coordinator_options_.push_back(options);
                 coordinator_addresses_.push_back(clients[id]);
             }
@@ -136,12 +139,14 @@ namespace sql::cluster::testing
             options.coordinators = coordinator_addresses_;
             options.heartbeat_ms = 50;
             options.election_timeout_ms = 1000; // shorter ones cause needless elections under sanitizers
+            options.snapshot_distance = snapshot_distance_;
             node_options_.push_back(options);
             nodes_.push_back(std::make_unique<StorageNode>(options));
             nodes_.back()->Start();
             return *nodes_.back();
         }
         void StopNode(size_t i) { nodes_[i].reset(); }
+        size_t NodeCount() const { return nodes_.size(); }
         // Node i's replica of shard s, once it has one: a shard serves
         // writes with 2 of its 3 replicas while the third is still being
         // created (the coordinator retries that every few seconds)
@@ -183,6 +188,7 @@ namespace sql::cluster::testing
         }
 
     private:
+        int snapshot_distance_ = 1000;
         std::string root_;
         std::vector<Coordinator::Options> coordinator_options_;
         std::vector<std::string> coordinator_addresses_;

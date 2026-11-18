@@ -54,6 +54,8 @@ namespace sql
         }
         if (name == "describe")
             return "Database: " + db_->GetPath() + " (write-ahead log: " + db_->GetPath() + "-wal)\n";
+        if (name == "cluster")
+            return "Error: .cluster needs a connection to a cluster (sqlengine --connect to its coordinators)\n";
         return "Error: unknown command " + name + "\n";
     }
 

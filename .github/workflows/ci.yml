@@ -135,9 +135,22 @@ jobs:
       - name: Kubernetes, with pods deleted
         run: deploy/chaos.sh 90 15
 
+      - name: Kubernetes, scaling storage nodes while money moves
+        run: |
+          before=$(kubectl exec sql-client -- workload.sh total)
+          kubectl exec sql-client -- workload.sh transfers 150 > transfers.log 2>&1 &
+          deploy/scale.sh 4
+          deploy/scale.sh 3
+          wait
+          cat transfers.log
+          after=$(kubectl exec sql-client -- workload.sh total)
+          echo "total: $before -> $after"
+          [ "$before" = "$after" ]
+
       - name: Kubernetes state
         if: failure()
         run: |
           kubectl get pods,pvc,svc -o wide
+          kubectl exec coord-0 -- sh -c "printf '.cluster\\n' | sqlengine --connect 127.0.0.1:7480" || true
           kubectl describe pods -l app.kubernetes.io/name=sqlengine | tail -100
           for p in coord-0 coord-1 coord-2 node-0 node-1 node-2; do echo "== $p"; kubectl logs $p --tail 30 || true; done

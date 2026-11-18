@@ -122,7 +122,7 @@ Status: D0–D5 are done; the rest is a proposal. It starts from `master` at 9d6
 - **Storage:** the metadata group is a D3 `ReplicatedShard` whose members are the coordinators. Its tables are plain SQL tables (the cluster is the only client, so they don't need reserved names):
   - `cluster(shards, rf, epoch, formed)`;
   - `nodes(id, name, host, port, raft_base)`;
-  - `replicas(shard, position, node)`: fixed when the cluster forms (rebalancing is D8);
+  - `replicas(shard, position, node)`: placed when the cluster forms, then moved by rebalancing (D8, §4.8);
   - `tables(name, definition, kind, shard_column)`, where `kind` is `hash`, `row` or `replicated`;
   - `ddl(seq, statement)`: every schema change, in order;
   - `shard_ddl(shard, applied)`: how far each shard has got through `ddl`.
@@ -141,7 +141,7 @@ Status: D0–D5 are done; the rest is a proposal. It starts from `master` at 9d6
   - ~~a write that spans shards is not atomic~~ (D6: it is);
   - `UNIQUE` on a column other than the shard key is enforced per shard only;
   - ~~`BEGIN`/`COMMIT` are refused~~ (D6: distributed transactions, §4.7);
-  - nodes that join after formation get no replicas (D8);
+  - ~~nodes that join after formation get no replicas~~ (D8: rebalancing);
   - coordinator operations run one at a time.
 
 ### 4.5 `src/cluster/shard`: a replicated shard on NuRaft
@@ -257,6 +257,23 @@ Status: D0–D5 are done; the rest is a proposal. It starts from `master` at 9d6
   - **Why it can't hang:** both the participants and the decision live in Raft groups, so a single dead node cannot leave a transaction stuck.
 
 ### 4.8 `src/cluster/membership`: membership and rebalancing (on the coordinator leader)
+
+**As built (D8)**, in `Coordinator::Rebalance` and `ReplicatedShard::AddMember`/`RemoveMember`:
+- **Target:** the ring placement (`Placement`) of the *active* storage nodes, meaning joined, not removed, and heard from within `--node-down-after` (300 s). Nodes announce themselves every second, which is the heartbeat. With fewer active nodes than the replication factor, nothing moves.
+- **Moves:** one membership change per round (every 100 ms), always adding before removing, so a group never has fewer replicas than wanted. Rounds start from a rotating shard, so a stuck shard does not hold up the rest.
+  - **Adding a replica:** the new node creates it as a *joiner*, knowing only itself and starting no election (NuRaft `skip_initial_election_timeout_`). The shard's leader adds it with `add_srv`, which catches it up from the log or a snapshot before the new membership commits. Only then does the coordinator record it in `replicas`.
+  - **Removing a replica:** `remove_srv` on the leader, after the leader hands over leadership if it is the one leaving. Then the coordinator deletes the `replicas` row, and the node deletes its copy (`drop_replica`). A node that is down keeps its stale copy, which Raft treats as an old log prefix if the node is ever added back.
+  - **Crash safety:** every step is idempotent and starts from the Raft group's actual membership, so a coordinator that dies between a membership change and its metadata write is finished by the next one.
+- **Operators:** `.cluster` lists the nodes (active, silent, down, removed), each shard's replicas, and the moves left. `.cluster remove NODE` decommissions a node: its replicas move away first, and it is refused if fewer than `rf` active nodes would remain. `.cluster add NODE` lets a removed name back in. `deploy/scale.sh N` uses these to scale the StatefulSet (or compose) both ways.
+- **Tested:**
+  - a 4th node gets replicas while writes continue, catching up from snapshots;
+  - removal drains a node and deletes its copies;
+  - a down node's replicas are re-placed, after which losing one more node is survivable;
+  - on compose, scaling 3 → 4 → 3 while random containers were killed: 7,959 transfers, total unchanged, all replicas identical;
+  - in CI, the same scaling on kind while money moves.
+- **Not done:** splitting shards, shuffle joins, follower reads.
+
+**The original plan:**
 - **Join:** a node starts → `Join` → it is added to `nodes` and the node ring → the shards whose preference lists now include it gain a replica.
   - The new replica is added as a NuRaft learner, catches up from a snapshot, is promoted to voter, and then the old replica is removed.
   - Only one membership change happens per shard at a time.
@@ -347,7 +364,7 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 | D5 ✅ | **Distributed queries.** Pruning, scatter-gather, pushdown, partial aggregates, co-located and broadcast joins, gathering, distributed `EXPLAIN` | Every `test/sql/*.test` gives the same rows on the cluster; `EXPLAIN` tests show pruning and pushdown |
 | D6 ✅ | **2PC.** Prepare, decide and commit over Raft, the transaction table, recovery, shard locks with no-wait retry | A bank-transfer test keeps total money constant while leaders and coordinators are killed |
 | D7 ✅ | **Kubernetes.** The `Dockerfile`, the manifests, `up.sh`/`chaos.sh`, probes | On minikube: golden tests pass, and pass again under the `chaos.sh` loop |
-| D8 | **Rebalancing.** Join, decommission, re-replication after `down`; `SHOW CLUSTER`/`SHOW SHARDS` | Adding a 4th node moves about 1/4 of the replicas with no errors, and killing a node permanently restores the replication factor to 3 |
+| D8 ✅ | **Rebalancing.** Join, decommission, re-replication after `down`; `SHOW CLUSTER`/`SHOW SHARDS` | Adding a 4th node moves about 1/4 of the replicas with no errors, and killing a node permanently restores the replication factor to 3 |
 
 ## 8. Testing strategy
 - **Unit tests:** the rings, placement, fragment planning (EXPLAIN text), the transaction state machine, and frame encoding.

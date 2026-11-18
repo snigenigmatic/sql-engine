@@ -142,6 +142,8 @@ namespace sql
              << "  .read FILE         Run the SQL in FILE (stops at the first error)\n"
              << "  .timer on|off      Show how long each statement takes\n"
              << "  .save              Checkpoint: copy the write-ahead log into the database file\n"
+             << "  .cluster [remove|add NODE]  A cluster's nodes and shard replicas; take a storage node out\n"
+             << "                     (its replicas move first) or let a removed one back in\n"
              << "  .quit              Exit (an open transaction is rolled back)\n"
              << "\nSQL statements end with ';' and may span lines, e.g.:\n"
              << "  CREATE TABLE t (id INTEGER PRIMARY KEY, name VARCHAR(50) NOT NULL);\n"
@@ -261,6 +263,8 @@ namespace sql
         }
         else if (command == "save")
             RunCommand("save", "");
+        else if (command == "cluster")
+            RunCommand("cluster", argument);
         else
             out_ << "Unknown command: " << line << " (try .help)\n";
         return true;

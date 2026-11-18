@@ -30,6 +30,7 @@ namespace sql::cluster
     //   shard_ddl (shard, applied)                       how far each shard got
     //   txns      (id, state)                            2PC decisions not yet
     //                                                    applied everywhere
+    //   node_state (id, state)                           'removed': decommissioned
     //
     // The group's leader is the cluster's coordinator: it accepts storage
     // nodes, forms the cluster once `replication_factor` nodes have joined
@@ -78,6 +79,9 @@ namespace sql::cluster
             // A transaction no statement used for this long is rolled back,
             // releasing its shards (0: never)
             int idle_transaction_timeout_ms = 60000;
+            // A storage node silent this long is down: its replicas are
+            // placed on the other nodes (D8)
+            int node_down_after_ms = 300000;
         };
 
         // A client's transaction (one per client connection)
@@ -122,6 +126,11 @@ namespace sql::cluster
 
         // For tests: shard reads sent so far
         uint64_t ShardReads() const { return shard_reads_; }
+        // For tests and status: every shard's replicas (node ids), and a
+        // node's id by name (-1 if unknown)
+        std::map<uint32_t, std::vector<int>> Replicas();
+        int NodeIdOf(const std::string &name);
+
         // For tests: the metadata group's replica here
         ReplicatedShard &Metadata() { return *metadata_; }
         // For tests: distributed transactions committed with two phases
@@ -155,6 +164,7 @@ namespace sql::cluster
             std::map<std::string, TableInfo> tables;
             std::vector<std::pair<int64_t, std::string>> ddl;
             std::map<uint32_t, int64_t> shard_ddl;
+            std::set<int> removed; // decommissioned nodes
         };
 
         // All below: caller holds op_mutex_, on the leader
@@ -252,6 +262,17 @@ namespace sql::cluster
         std::set<std::string> active_txns_;    // open in clients' sessions (this term)
         std::set<Transaction *> explicit_txns_; // clients' BEGIN ... (this term), for the idle timeout
         void ExpireIdleTransactions();
+        // Rebalancing (D8): one membership change per round towards the
+        // placement of the active nodes
+        void Rebalance();
+        std::vector<int> ActiveNodes() const; // joined, not removed, not down
+        std::string ClusterStatus();
+        std::string RemoveNode(const std::string &name);
+        std::map<int, std::chrono::steady_clock::time_point> last_seen_; // storage nodes' announcements
+        uint32_t rebalance_cursor_ = 0;
+        // Removed replicas whose node did not answer drop_replica yet
+        std::set<std::pair<uint32_t, int>> pending_drops_;
+        bool DropReplica(uint32_t shard, int node); // true once it is gone
         // Transactions waiting for a shard another one holds (waiter ->
         // holder); a cycle is a deadlock
         std::map<std::string, std::string> waits_for_;

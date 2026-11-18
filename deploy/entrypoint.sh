@@ -12,7 +12,7 @@
 #   SHARDS, RF    for a new cluster (coordinators; default 16, 3)
 #   PORT          storage node port (default 7500)
 #   RAFT_BASE     storage replicas listen on RAFT_BASE + shard (default 20000)
-#   LOCK_TIMEOUT, TXN_IDLE_TIMEOUT   seconds (default 5, 60)
+#   LOCK_TIMEOUT, TXN_IDLE_TIMEOUT, NODE_DOWN_AFTER   seconds (default 5, 60, 300)
 # Data lives in /data. Anything else on the command line goes to sqlnode.
 set -eu
 host=$(hostname)
@@ -22,7 +22,8 @@ case "${ROLE:-}" in
   coordinator)
     exec sqlnode --role coordinator --id "${ID:-$((ordinal + 1))}" --coordinators "$COORDINATORS" \
       --dir /data --shards "${SHARDS:-16}" --rf "${RF:-3}" \
-      --lock-timeout "${LOCK_TIMEOUT:-5}" --txn-idle-timeout "${TXN_IDLE_TIMEOUT:-60}" "$@"
+      --lock-timeout "${LOCK_TIMEOUT:-5}" --txn-idle-timeout "${TXN_IDLE_TIMEOUT:-60}" \
+      --node-down-after "${NODE_DOWN_AFTER:-300}" "$@"
     ;;
   storage)
     exec sqlnode --role storage --name "${NAME:-$host}" --coordinators "$COORDINATORS" --dir /data \

@@ -38,6 +38,8 @@ namespace
             << "  --lock-timeout S      how long a statement waits for another transaction's shard (default 5)\n"
             << "  --txn-idle-timeout S  roll back a transaction idle this long, releasing its shards (default 60;\n"
             << "                        0: never)\n"
+            << "  --node-down-after S   a storage node silent this long is down: its replicas are placed\n"
+            << "                        on the other nodes (default 300)\n"
             << "  --name NAME      a storage node's stable name (e.g. node-0)\n"
             << "  --raft-base P    a storage node's replica of shard s listens on P + s\n"
             << "  --listen HOST    where a storage node listens, if not at --host (e.g. 0.0.0.0 in a container\n"
@@ -88,7 +90,7 @@ int main(int argc, char **argv)
                                                {"--host", ""},         {"--port", ""},
                                                {"--shards", "16"},     {"--rf", "3"},
                                                {"--lock-timeout", "5"}, {"--txn-idle-timeout", "60"},
-                                               {"--listen", ""}};
+                                               {"--listen", ""}, {"--node-down-after", "300"}};
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -146,6 +148,7 @@ int main(int argc, char **argv)
             options.replication_factor = std::stoul(args["--rf"]);
             options.lock_timeout_ms = static_cast<int>(std::stod(args["--lock-timeout"]) * 1000);
             options.idle_transaction_timeout_ms = static_cast<int>(std::stod(args["--txn-idle-timeout"]) * 1000);
+            options.node_down_after_ms = static_cast<int>(std::stod(args["--node-down-after"]) * 1000);
             bool found = false;
             for (const auto &spec : specs)
             {

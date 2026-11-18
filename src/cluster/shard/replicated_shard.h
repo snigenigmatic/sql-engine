@@ -30,6 +30,11 @@ namespace sql::cluster
             int port = 0;               // its Raft port
             std::string directory;      // its log, state and data
             std::vector<Member> members; // every replica, this one included
+            // A new replica of an existing group (D8): it starts knowing only
+            // itself, at `endpoint`, and never calls an election until the
+            // group's leader adds it (AddMember) and catches it up
+            bool joining = false;
+            std::string endpoint;
             int heartbeat_ms = 100;
             int election_timeout_ms = 1000; // randomized up to twice this
             // Take a snapshot (and compact the log) every this many entries;
@@ -82,6 +87,18 @@ namespace sql::cluster
         // Inside transaction `txid` (if not empty) it sees that
         // transaction's uncommitted changes.
         ExecutionResult Read(const std::string &sql, const std::string &txid = "");
+
+        // Membership changes, on the leader, one at a time (NuRaft
+        // add_srv / remove_srv). A new member is caught up (from the log or
+        // a snapshot) before it counts. Each returns success once the change
+        // is in the group's configuration, or a failure starting with
+        // "pending" while it is under way (call again later), or "not the
+        // leader (leader: N)". Removing the leader hands leadership over
+        // first (pending meanwhile).
+        ExecutionResult AddMember(int id, const std::string &endpoint);
+        ExecutionResult RemoveMember(int id);
+        // The group's members as the leader sees them: "1,2,4"
+        ExecutionResult Members();
 
         bool IsLeader() const;
         int LeaderId() const; // -1 if unknown

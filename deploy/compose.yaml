@@ -54,6 +54,14 @@ services:
     hostname: node-2
     volumes: [node-2:/data]
 
+  # A fourth storage node, to watch replicas move to it:
+  #   docker compose -f deploy/compose.yaml --profile scale up -d node-3
+  node-3:
+    <<: *storage
+    hostname: node-3
+    profiles: [scale]
+    volumes: [node-3:/data]
+
   # A shell for clients and deploy/chaos.sh (docker compose --profile client up -d client)
   client:
     image: ${SQLENGINE_IMAGE:-sqlengine:dev}
@@ -63,6 +71,7 @@ services:
       SQL_ADDRESSES: coord-0:7480,coord-1:7480,coord-2:7480
 
 volumes:
+  node-3:
   coord-0:
   coord-1:
   coord-2:
