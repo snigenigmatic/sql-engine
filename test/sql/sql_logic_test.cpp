@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <cstdlib>
 #include <unistd.h>
 
 namespace sql
@@ -192,6 +194,38 @@ namespace sql
             RunScript(*connection);
         }
 #endif
+
+        // A deployed cluster (deploy/): SQLENGINE_CLUSTER=host:port[,host:port...].
+        // Every table is dropped before each file, so use a cluster of its own.
+        TEST_P(SqlLogicTest, External)
+        {
+            const char *addresses = std::getenv("SQLENGINE_CLUSTER");
+            if (!addresses || !*addresses)
+                GTEST_SKIP() << "set SQLENGINE_CLUSTER to run against a deployed cluster";
+            std::vector<std::pair<std::string, uint16_t>> servers;
+            std::stringstream list(addresses);
+            for (std::string one; std::getline(list, one, ',');)
+            {
+                const size_t colon = one.rfind(':');
+                servers.emplace_back(one.substr(0, colon), static_cast<uint16_t>(std::stoi(one.substr(colon + 1))));
+            }
+            net::RemoteConnection connection(servers, true);
+            auto drop_everything = [&]
+            {
+                std::stringstream tables(connection.Command("tables", ""));
+                for (std::string line; std::getline(tables, line);)
+                {
+                    const size_t bracket = line.find(" [");
+                    if (bracket != std::string::npos)
+                    {
+                        ASSERT_TRUE(connection.Execute("DROP TABLE " + line.substr(0, bracket) + ";").success) << line;
+                    }
+                }
+            };
+            drop_everything();
+            RunScript(connection);
+            drop_everything();
+        }
 
         INSTANTIATE_TEST_SUITE_P(Golden, SqlLogicTest, ::testing::ValuesIn(TestFiles()),
                                  [](const ::testing::TestParamInfo<std::string> &info)

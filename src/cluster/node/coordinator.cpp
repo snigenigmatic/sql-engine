@@ -345,6 +345,7 @@ namespace sql::cluster
         // Fence off the previous leader: storage nodes refuse older epochs
         MetaWrite("UPDATE cluster SET epoch = epoch + 1;");
         connections_.clear();
+        unreachable_until_.clear();
         shard_leaders_.clear();
         ensured_.clear();
         last_full_ensure_ = {};
@@ -447,13 +448,20 @@ namespace sql::cluster
         auto info = view_.nodes.find(node);
         if (info == view_.nodes.end())
             return nullptr;
+        // A node that just failed to answer is left alone for a moment: every
+        // try costs up to the connect timeout, with every client waiting
+        auto backoff = unreachable_until_.find(node);
+        if (backoff != unreachable_until_.end() && Clock::now() < backoff->second)
+            return nullptr;
         try
         {
             auto connection = std::make_unique<net::RemoteConnection>(info->second.host, info->second.port);
+            unreachable_until_.erase(node);
             return (connections_[node] = std::move(connection)).get();
         }
         catch (const std::exception &)
         {
+            unreachable_until_[node] = Clock::now() + std::chrono::seconds(3);
             return nullptr;
         }
     }
@@ -694,6 +702,7 @@ namespace sql::cluster
         {
             if (node.name != name)
                 continue;
+            unreachable_until_.erase(id); // it is back
             if (node.host != host || node.port != port || node.raft_base != raft_base)
             {
                 MetaWrite("UPDATE nodes SET host = " + Quote(host) + ", port = " + std::to_string(port) +

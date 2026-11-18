@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 #include "net/protocol.h"
 #include "net/socket.h"
+#include <chrono>
 #include <cmath>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -160,6 +163,41 @@ namespace sql::net
             b.Close();
             EXPECT_THROW(WriteFrame(a, EncodeError("nobody listening")), std::runtime_error);
         }
+    }
+
+    // A peer that vanishes (a killed container, a lost machine) sends no
+    // reset; connections must notice by themselves
+    TEST(ProtocolTest, ConnectionsDetectVanishedPeers)
+    {
+        uint16_t port = 0;
+        Socket listener = Listen("127.0.0.1", 0, &port);
+        Socket client = Connect("127.0.0.1", port);
+        int value = 0;
+        socklen_t size = sizeof(value);
+        ASSERT_EQ(getsockopt(client.Fd(), SOL_SOCKET, SO_KEEPALIVE, &value, &size), 0);
+        EXPECT_EQ(value, 1);
+        size = sizeof(value);
+        ASSERT_EQ(getsockopt(client.Fd(), IPPROTO_TCP, TCP_KEEPIDLE, &value, &size), 0);
+        EXPECT_LE(value, 5);
+        unsigned int timeout = 0;
+        size = sizeof(timeout);
+        ASSERT_EQ(getsockopt(client.Fd(), IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout, &size), 0);
+        EXPECT_GT(timeout, 0u);
+        EXPECT_LE(timeout, 10000u);
+        // A server does not bound what its clients have not read yet
+        Socket accepted(::accept(listener.Fd(), nullptr, nullptr));
+        DetectDeadPeer(accepted.Fd(), false);
+        size = sizeof(value);
+        ASSERT_EQ(getsockopt(accepted.Fd(), SOL_SOCKET, SO_KEEPALIVE, &value, &size), 0);
+        EXPECT_EQ(value, 1);
+        size = sizeof(timeout);
+        ASSERT_EQ(getsockopt(accepted.Fd(), IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout, &size), 0);
+        EXPECT_EQ(timeout, 0u);
+        // An address nobody answers gives up within the connect timeout
+        // (TEST-NET-1: never routed; some networks refuse it at once)
+        const auto start = std::chrono::steady_clock::now();
+        EXPECT_THROW(Connect("192.0.2.1", 7480, 500), std::runtime_error);
+        EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(3));
     }
 
 } // namespace sql::net

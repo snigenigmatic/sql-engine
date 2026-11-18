@@ -90,7 +90,7 @@ namespace sql::cluster
     {
         std::filesystem::create_directories(options_.directory);
         server_ = std::make_unique<Server>([this] { return std::make_unique<NodeConnection>(this); }, false);
-        server_->Start(options_.host, options_.port);
+        server_->Start(options_.listen_host.empty() ? options_.host : options_.listen_host, options_.port);
         announcer_ = std::thread([this] { Announce(); });
     }
 

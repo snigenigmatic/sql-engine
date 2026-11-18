@@ -1,0 +1,7 @@
+# Only CMakeLists.txt, cmake/, src/ and deploy/ go into the image build
+*
+!CMakeLists.txt
+!cmake/
+!src/
+!deploy/entrypoint.sh
+!deploy/workload.sh

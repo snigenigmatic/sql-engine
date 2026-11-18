@@ -1,0 +1,71 @@
+# The cluster on one machine with Docker: 3 coordinators and 3 storage nodes,
+# named like the Kubernetes StatefulSet pods (coord-0, node-0, ...).
+#
+#   docker build -f deploy/Dockerfile -t sqlengine:dev .
+#   docker compose -f deploy/compose.yaml up -d
+#   docker compose -f deploy/compose.yaml exec coord-0 \
+#     sqlengine --connect coord-0:7480,coord-1:7480,coord-2:7480
+#   # or from the host: build/src/sqlengine --connect 127.0.0.1:7481,127.0.0.1:7482,127.0.0.1:7483
+#   docker compose -f deploy/compose.yaml kill node-1     # and: start node-1
+#   docker compose -f deploy/compose.yaml down -v         # -v: delete the data
+
+x-coordinator: &coordinator
+  image: ${SQLENGINE_IMAGE:-sqlengine:dev}
+  restart: unless-stopped
+  environment: &coordinator-env
+    ROLE: coordinator
+    COORDINATORS: 1=coord-0:7100:7480,2=coord-1:7100:7480,3=coord-2:7100:7480
+    SHARDS: ${SHARDS:-8}
+    RF: 3
+
+x-storage: &storage
+  image: ${SQLENGINE_IMAGE:-sqlengine:dev}
+  restart: unless-stopped
+  environment:
+    ROLE: storage
+    COORDINATORS: 1=coord-0:7100:7480,2=coord-1:7100:7480,3=coord-2:7100:7480
+
+services:
+  coord-0:
+    <<: *coordinator
+    hostname: coord-0
+    ports: ["7481:7480"]
+    volumes: [coord-0:/data]
+  coord-1:
+    <<: *coordinator
+    hostname: coord-1
+    ports: ["7482:7480"]
+    volumes: [coord-1:/data]
+  coord-2:
+    <<: *coordinator
+    hostname: coord-2
+    ports: ["7483:7480"]
+    volumes: [coord-2:/data]
+  node-0:
+    <<: *storage
+    hostname: node-0
+    volumes: [node-0:/data]
+  node-1:
+    <<: *storage
+    hostname: node-1
+    volumes: [node-1:/data]
+  node-2:
+    <<: *storage
+    hostname: node-2
+    volumes: [node-2:/data]
+
+  # A shell for clients and deploy/chaos.sh (docker compose --profile client up -d client)
+  client:
+    image: ${SQLENGINE_IMAGE:-sqlengine:dev}
+    profiles: [client]
+    entrypoint: [sleep, infinity]
+    environment:
+      SQL_ADDRESSES: coord-0:7480,coord-1:7480,coord-2:7480
+
+volumes:
+  coord-0:
+  coord-1:
+  coord-2:
+  node-0:
+  node-1:
+  node-2:
