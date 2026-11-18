@@ -75,6 +75,9 @@ namespace sql::net
             // Whatever the server was doing, its session is gone with the
             // connection (an open transaction was rolled back)
             socket_.Close();
+            // That server is likely gone: try the others first next time (a
+            // port forwarder may still accept connections for it)
+            current_ = (current_ + 1) % servers_.size();
             lost_transaction_ = in_transaction_;
             in_transaction_ = false;
             throw std::runtime_error("lost connection to " + address_ + ": " + e.what());

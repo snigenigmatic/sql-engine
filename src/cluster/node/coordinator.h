@@ -244,6 +244,7 @@ namespace sql::cluster
         bool was_leader_ = false;
         View view_;
         std::map<int, std::unique_ptr<net::RemoteConnection>> connections_;
+        std::map<int, std::chrono::steady_clock::time_point> unreachable_until_; // connect failed: skip until
         std::map<uint32_t, int> shard_leaders_;
         std::map<std::pair<uint32_t, int>, bool> ensured_;
         std::chrono::steady_clock::time_point last_full_ensure_{};

@@ -52,6 +52,7 @@ namespace sql
                     std::this_thread::sleep_for(std::chrono::milliseconds(10)); // e.g. out of descriptors
                 continue;
             }
+            net::DetectDeadPeer(fd, false); // a vanished client's session (and transaction) ends
             Reap();
             std::lock_guard<std::mutex> lock(clients_mutex_);
             if (stopping_)

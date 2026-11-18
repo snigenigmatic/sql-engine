@@ -1,0 +1,198 @@
+# sqlengine on Kubernetes (built for minikube / kind): 3 coordinators and
+# 3 storage nodes as StatefulSets, each pod with its own volume.
+#
+#   coord-0..2   the coordinators' Raft group; clients reach them through
+#                Service "sql" (any coordinator: followers forward)
+#   node-0..2    storage nodes; each holds replicas of the shards placed on it
+#
+# Pods find each other by their stable DNS names (coord-1.coord, node-2.node),
+# published before they are ready so the Raft groups can form.
+# See deploy/README.md.
+apiVersion: v1
+kind: Service
+metadata:
+  name: coord
+  labels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: coordinator}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: coordinator}
+  ports:
+    - {name: raft, port: 7100}
+    - {name: sql, port: 7480}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node
+  labels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: storage}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: storage}
+  ports:
+    - {name: calls, port: 7500}
+---
+# Clients: kubectl port-forward svc/sql 7480, or on minikube the node port
+apiVersion: v1
+kind: Service
+metadata:
+  name: sql
+  labels: {app.kubernetes.io/name: sqlengine}
+spec:
+  type: NodePort
+  selector: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: coordinator}
+  ports:
+    - {name: sql, port: 7480, targetPort: 7480, nodePort: 30480}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: coord
+  labels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: coordinator}
+spec:
+  serviceName: coord
+  replicas: 3
+  podManagementPolicy: Parallel # a Raft group needs a quorum up to become ready
+  selector:
+    matchLabels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: coordinator}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: coordinator}
+    spec:
+      securityContext: {fsGroup: 10001}
+      terminationGracePeriodSeconds: 10
+      affinity:
+        podAntiAffinity: # spread over machines when there are several
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: coordinator}
+      initContainers:
+        # Some volume provisioners (minikube's, kind's) ignore fsGroup
+        - name: data-owner
+          image: sqlengine:dev
+          imagePullPolicy: IfNotPresent
+          command: [chown, "10001:10001", /data]
+          securityContext: {runAsUser: 0}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      containers:
+        - name: sqlnode
+          image: sqlengine:dev
+          imagePullPolicy: IfNotPresent
+          securityContext: {runAsUser: 10001, runAsNonRoot: true, allowPrivilegeEscalation: false}
+          env:
+            - {name: ROLE, value: coordinator}
+            - {name: SUBDOMAIN, value: coord}
+            - {name: COORDINATORS, value: "1=coord-0.coord:7100:7480,2=coord-1.coord:7100:7480,3=coord-2.coord:7100:7480"}
+            - {name: SHARDS, value: "8"}
+            - {name: RF, value: "3"}
+          ports:
+            - {name: raft, containerPort: 7100}
+            - {name: sql, containerPort: 7480}
+          # Ready: it answers SQL clients and knows the cluster's leader
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "printf '.help\\n' | sqlengine --connect 127.0.0.1:7480 | grep -q '^Cluster: '"]
+            periodSeconds: 5
+            timeoutSeconds: 4
+          livenessProbe:
+            tcpSocket: {port: 7480}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: node
+  labels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: storage}
+spec:
+  serviceName: node
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: storage}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: storage}
+    spec:
+      securityContext: {fsGroup: 10001}
+      terminationGracePeriodSeconds: 10
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: storage}
+      initContainers:
+        # Some volume provisioners (minikube's, kind's) ignore fsGroup
+        - name: data-owner
+          image: sqlengine:dev
+          imagePullPolicy: IfNotPresent
+          command: [chown, "10001:10001", /data]
+          securityContext: {runAsUser: 0}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      containers:
+        - name: sqlnode
+          image: sqlengine:dev
+          imagePullPolicy: IfNotPresent
+          securityContext: {runAsUser: 10001, runAsNonRoot: true, allowPrivilegeEscalation: false}
+          env:
+            - {name: ROLE, value: storage}
+            - {name: SUBDOMAIN, value: node}
+            - {name: COORDINATORS, value: "1=coord-0.coord:7100:7480,2=coord-1.coord:7100:7480,3=coord-2.coord:7100:7480"}
+          ports:
+            - {name: calls, containerPort: 7500}
+          readinessProbe:
+            tcpSocket: {port: 7500}
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: 7500}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}
+---
+# Voluntary disruptions (drains, upgrades) take one pod of each kind at a time:
+# every Raft group keeps its quorum
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coord
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: coordinator}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: node
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: sqlengine, app.kubernetes.io/component: storage}

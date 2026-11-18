@@ -11,7 +11,9 @@ Start a cluster first (scripts/local-cluster.sh up), then:
                                         # coordinator are killed and restarted
 
 Every scenario checks that the total balance does not change.
-Environment: SQLENGINE (default build/src/sqlengine).
+Environment: SQLENGINE (default build/src/sqlengine); COMPOSE_PROJECT: drive
+the containers of deploy/compose.yaml (docker compose -p PROJECT) instead of
+scripts/local-cluster.sh (both publish the coordinators on ports 7481-7483).
 """
 import collections
 import os
@@ -28,6 +30,19 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.environ.get("SQLENGINE", os.path.join(ROOT, "build/src/sqlengine"))
 CLUSTER = os.path.join(ROOT, "scripts/local-cluster.sh")
+COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT")
+
+
+def control(action, name):
+    """kill (-9) or start one process: coord-1..3 (by coordinator id), node-0..2"""
+    if COMPOSE_PROJECT:
+        if name.startswith("coord-"):  # services are named by ordinal, like StatefulSet pods
+            name = "coord-%d" % (int(name.split("-")[1]) - 1)
+        command = ["docker", "compose", "-f", os.path.join(ROOT, "deploy/compose.yaml"), "-p", COMPOSE_PROJECT,
+                   action, name]
+    else:
+        command = [CLUSTER, action, name]
+    subprocess.run(command, check=True, capture_output=True)
 PORTS = [7481, 7482, 7483]
 PROMPT = re.compile(rb"sql\*?> $")
 
@@ -199,13 +214,13 @@ def chaos():
     for t in threads:
         t.start()
     phase("steady", 8)
-    subprocess.run([CLUSTER, "kill", "node-1"], check=True)
+    control("kill", "node-1")
     phase("node-1 killed (kill -9)", 8)
     coordinator = leader()
-    subprocess.run([CLUSTER, "kill", "coord-%d" % coordinator], check=True)
+    control("kill", "coord-%d" % coordinator)
     phase("leading coordinator %d killed" % coordinator, 10)
-    subprocess.run([CLUSTER, "start", "node-1"], check=True)
-    subprocess.run([CLUSTER, "start", "coord-%d" % coordinator], check=True)
+    control("start", "node-1")
+    control("start", "coord-%d" % coordinator)
     phase("both restarted", 10)
     stop.set()
     for t in threads:

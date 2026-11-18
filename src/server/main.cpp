@@ -24,7 +24,7 @@ namespace
             << "       " << program
             << " --role coordinator --id N --coordinators SPEC --dir DIR [--shards S] [--rf R]\n"
             << "       " << program
-            << " --role storage --name NAME --coordinators SPEC --dir DIR --raft-base PORT [--host HOST] [--port PORT]\n"
+            << " --role storage --name NAME --coordinators SPEC --dir DIR --raft-base PORT [--host HOST] [--listen HOST] [--port PORT]\n"
 #endif
             << "  --database FILE  database to serve (single; default: sqlengine.db)\n"
             << "  --host HOST      address to listen on / to be reached at (default: 0.0.0.0, or 127.0.0.1)\n"
@@ -40,6 +40,8 @@ namespace
             << "                        0: never)\n"
             << "  --name NAME      a storage node's stable name (e.g. node-0)\n"
             << "  --raft-base P    a storage node's replica of shard s listens on P + s\n"
+            << "  --listen HOST    where a storage node listens, if not at --host (e.g. 0.0.0.0 in a container\n"
+            << "                   whose --host is its DNS name)\n"
 #endif
             << "Stops cleanly on SIGINT or SIGTERM.\n";
     }
@@ -85,7 +87,8 @@ int main(int argc, char **argv)
     std::map<std::string, std::string> args = {{"--role", "single"},   {"--database", "sqlengine.db"},
                                                {"--host", ""},         {"--port", ""},
                                                {"--shards", "16"},     {"--rf", "3"},
-                                               {"--lock-timeout", "5"}, {"--txn-idle-timeout", "60"}};
+                                               {"--lock-timeout", "5"}, {"--txn-idle-timeout", "60"},
+                                               {"--listen", ""}};
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -171,6 +174,7 @@ int main(int argc, char **argv)
             sql::cluster::StorageNode::Options options;
             options.name = args.at("--name");
             options.host = args["--host"].empty() ? "127.0.0.1" : args["--host"];
+            options.listen_host = args["--listen"];
             options.port = static_cast<uint16_t>(args["--port"].empty() ? 0 : std::stoi(args["--port"]));
             options.raft_port_base = std::stoi(args.at("--raft-base"));
             options.directory = args.at("--dir");

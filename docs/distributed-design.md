@@ -271,6 +271,22 @@ Status: D0–D5 are done; the rest is a proposal. It starts from `master` at 9d6
   - reads from followers at a bounded staleness.
 
 ### 4.9 `deploy/`: Kubernetes on minikube
+
+**As built (D7)**; [deploy/README.md](../deploy/README.md) has the commands.
+- One image (`deploy/Dockerfile`, 120 MB) for every role. `entrypoint.sh` derives a process's identity from its hostname: pod `coord-N` is coordinator `N + 1`, and pod `node-N` is the storage node named `node-N`.
+- The headless Services publish addresses before pods are ready, because a Raft group cannot become ready without its peers. Both StatefulSets use `podManagementPolicy: Parallel`.
+- **Readiness:** a coordinator is ready when it answers SQL and knows a leader (`.help` shows `Cluster:`); a storage node is ready when it accepts calls. Liveness is a TCP check.
+- An init container `chown`s the volume, because minikube's and kind's provisioners ignore `fsGroup`. A storage node listens on `0.0.0.0` (`--listen`) and advertises its DNS name.
+- **Found by killing containers:** a dead pod's IP sends no TCP reset, so a connect or a read waited minutes while the coordinator held its operation lock, and the whole cluster stalled. Fixed with:
+  - a 2 s connect timeout;
+  - TCP keepalive on every connection (about 5 s), plus a 10 s `TCP_USER_TIMEOUT` on outgoing ones. Servers don't get it, so a client suspended with Ctrl-Z keeps its session;
+  - the coordinator skipping a node that just failed;
+  - clients rotating to the next address after a lost connection.
+- `deploy/compose.yaml` runs the same topology on plain Docker.
+- **Chaos:** `deploy/chaos.sh` kills random pods or containers while `workload.sh` moves money (one atomic two-row `UPDATE` per transfer), then checks the total. A NetworkPolicy partition is not included: kind's default network does not enforce NetworkPolicy.
+- **Acceptance, run in CI (`deploy` job):** the golden SQL files run against the deployed cluster (`sql_logic_test` External mode) on compose and on kind, then the chaos run. Golden files are not run *during* chaos: a statement caught by a crash has an unknown outcome, which those exact-output files cannot express. The money invariant covers that case instead.
+
+**The original plan:**
 - **Image:** a multi-stage `Dockerfile` (build with CMake, then a slim runtime image holding just `sqlnode`).
 - **Coordinators:** `StatefulSet coord`, 3 replicas, with a headless Service `coord`.
 - **Storage nodes:** `StatefulSet node`, 3 replicas, a 1 Gi PVC each, and a headless Service `node`.
@@ -330,7 +346,7 @@ Each milestone ends green in CI (Debug, ASan/UBSan, Release) and is one PR.
 | D4 ✅ | **The metadata group and cluster.** The coordinators' Raft group, node join, shard bootstrap, DDL fan-out, epochs | An in-process cluster of 3 coordinators and 3 nodes boots, then `CREATE TABLE`/`INSERT`/`SELECT` work |
 | D5 ✅ | **Distributed queries.** Pruning, scatter-gather, pushdown, partial aggregates, co-located and broadcast joins, gathering, distributed `EXPLAIN` | Every `test/sql/*.test` gives the same rows on the cluster; `EXPLAIN` tests show pruning and pushdown |
 | D6 ✅ | **2PC.** Prepare, decide and commit over Raft, the transaction table, recovery, shard locks with no-wait retry | A bank-transfer test keeps total money constant while leaders and coordinators are killed |
-| D7 | **Kubernetes.** The `Dockerfile`, the manifests, `up.sh`/`chaos.sh`, probes | On minikube: golden tests pass, and pass again under the `chaos.sh` loop |
+| D7 ✅ | **Kubernetes.** The `Dockerfile`, the manifests, `up.sh`/`chaos.sh`, probes | On minikube: golden tests pass, and pass again under the `chaos.sh` loop |
 | D8 | **Rebalancing.** Join, decommission, re-replication after `down`; `SHOW CLUSTER`/`SHOW SHARDS` | Adding a 4th node moves about 1/4 of the replicas with no errors, and killing a node permanently restores the replication factor to 3 |
 
 ## 8. Testing strategy

@@ -76,3 +76,68 @@ jobs:
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
+
+  # The image, the cluster in containers and on Kubernetes (kind), each
+  # with processes killed while money moves between accounts
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build the image
+        run: docker build -f deploy/Dockerfile -t sqlengine:dev .
+
+      # The golden SQL files, run against a deployed cluster (External mode)
+      - name: Build the golden test runner
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel --target sql_logic_test
+
+      - name: Compose cluster, golden tests
+        run: |
+          docker compose -f deploy/compose.yaml up -d
+          docker compose -f deploy/compose.yaml --profile client up -d client
+          docker compose -f deploy/compose.yaml exec -T client sh -c \
+            "until printf '.help\\n' | sqlengine --connect \$SQL_ADDRESSES | grep '^Cluster: ' | grep -qv forming; do sleep 2; done"
+          SQLENGINE_CLUSTER=127.0.0.1:7481,127.0.0.1:7482,127.0.0.1:7483 \
+            build/test/sql_logic_test --gtest_filter='*External*'
+
+      - name: Compose cluster, with containers killed
+        run: MODE=compose deploy/chaos.sh 60 12
+
+      - name: Compose logs
+        if: failure()
+        run: docker compose -f deploy/compose.yaml logs --tail 50
+
+      - name: Stop the compose cluster
+        if: always()
+        run: docker compose -f deploy/compose.yaml --profile client down -v
+
+      - name: Create a kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: sqlengine
+
+      - name: Deploy to Kubernetes
+        run: KIND=1 KIND_CLUSTER=sqlengine deploy/up.sh
+
+      - name: Kubernetes, golden tests
+        run: |
+          kubectl port-forward svc/sql 7480:7480 > /dev/null &
+          sleep 3
+          SQLENGINE_CLUSTER=127.0.0.1:7480 build/test/sql_logic_test --gtest_filter='*External*'
+          kill %1
+
+      - name: Kubernetes, with pods deleted
+        run: deploy/chaos.sh 90 15
+
+      - name: Kubernetes state
+        if: failure()
+        run: |
+          kubectl get pods,pvc,svc -o wide
+          kubectl describe pods -l app.kubernetes.io/name=sqlengine | tail -100
+          for p in coord-0 coord-1 coord-2 node-0 node-1 node-2; do echo "== $p"; kubectl logs $p --tail 30 || true; done

@@ -3,7 +3,9 @@
 #include <cstring>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -64,7 +66,54 @@ namespace sql::net
             ::shutdown(fd_, SHUT_RDWR);
     }
 
-    Socket Connect(const std::string &host, uint16_t port)
+    void DetectDeadPeer(int fd, bool bound_unacknowledged)
+    {
+        const int on = 1, idle = 2, interval = 1, count = 3;
+        ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+        if (bound_unacknowledged)
+        {
+            const unsigned int user_timeout_ms = 10000;
+            ::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms));
+        }
+    }
+
+    namespace
+    {
+        // connect(), giving up after timeout_ms; leaves the socket blocking
+        bool ConnectWithin(int fd, const sockaddr *address, socklen_t length, int timeout_ms)
+        {
+            const int flags = ::fcntl(fd, F_GETFL, 0);
+            ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            int result = ::connect(fd, address, length);
+            if (result != 0 && errno == EINPROGRESS)
+            {
+                pollfd waiting{fd, POLLOUT, 0};
+                int ready;
+                do
+                    ready = ::poll(&waiting, 1, timeout_ms);
+                while (ready < 0 && errno == EINTR);
+                if (ready == 0)
+                    errno = ETIMEDOUT;
+                else if (ready > 0)
+                {
+                    int error = 0;
+                    socklen_t size = sizeof(error);
+                    ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size);
+                    errno = error;
+                    result = error == 0 ? 0 : -1;
+                }
+            }
+            const int saved = errno;
+            ::fcntl(fd, F_SETFL, flags);
+            errno = saved;
+            return result == 0;
+        }
+    } // namespace
+
+    Socket Connect(const std::string &host, uint16_t port, int timeout_ms)
     {
         addrinfo hints{};
         hints.ai_family = AF_UNSPEC;
@@ -79,11 +128,12 @@ namespace sql::net
             Socket socket(::socket(a->ai_family, a->ai_socktype, a->ai_protocol));
             if (!socket.IsOpen())
                 continue;
-            if (::connect(socket.Fd(), a->ai_addr, a->ai_addrlen) == 0)
+            if (ConnectWithin(socket.Fd(), a->ai_addr, a->ai_addrlen, timeout_ms))
             {
                 ::freeaddrinfo(found);
                 const int on = 1; // requests are small: send them at once
                 ::setsockopt(socket.Fd(), IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+                DetectDeadPeer(socket.Fd(), true);
                 return socket;
             }
             last_error = std::strerror(errno);

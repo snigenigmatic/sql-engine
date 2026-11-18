@@ -41,7 +41,10 @@ namespace sql::cluster::testing
         static std::mt19937 random(static_cast<unsigned>(getpid()));
         for (;;)
         {
-            const int base = 20000 + static_cast<int>(random() % 30000);
+            // Below Linux's ephemeral range (32768+), which outgoing
+            // connections take ports from: a port found free there can be
+            // taken by one before the test binds it (seen under load)
+            const int base = 20000 + static_cast<int>(random() % (32768 - 20000 - count));
             bool ok = true;
             for (int p = base; p < base + count && ok; ++p)
                 ok = !taken.count(p) && PortFree(p);

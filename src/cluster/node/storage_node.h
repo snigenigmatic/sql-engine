@@ -38,6 +38,7 @@ namespace sql::cluster
         {
             std::string name;                     // stable across restarts, e.g. node-0
             std::string host = "127.0.0.1";       // how others reach this node
+            std::string listen_host;              // where it listens ("": host; "0.0.0.0": everywhere)
             uint16_t port = 0;                    // its CALL port (0: any free)
             int raft_port_base = 20000;           // shard s's replica listens on base + s
             std::string directory;                // its replicas' files
