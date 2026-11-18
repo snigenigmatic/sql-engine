@@ -28,32 +28,46 @@ else
   stop() { "${K[@]}" scale statefulset node --replicas="$WANT" > /dev/null; }
 fi
 
-wait_balanced() {
+status() { admin .cluster; }
+node_line() { status | grep "^  node-$1 (id " || true; }
+
+# wait_for WHAT COMMAND: until COMMAND succeeds (up to 4 minutes)
+wait_for() {
   for _ in $(seq 1 120); do
-    if admin .cluster | grep -q '^Balanced'; then
-      admin .cluster
-      return 0
-    fi
+    if eval "$2"; then return 0; fi
     sleep 2
   done
-  admin .cluster
-  echo "scale: not balanced after 4 minutes" >&2
+  status
+  echo "scale: timed out waiting for $1" >&2
   return 1
 }
 
 if [ "$WANT" -lt "$have" ]; then
+  draining=()
   for n in $(seq "$WANT" $((have - 1))); do
-    admin ".cluster remove node-$n"
+    out=$(admin ".cluster remove node-$n")
+    case "$out" in
+      Removing*) draining+=("$n") ;;
+      *"no storage node named"*) echo "node-$n never joined the cluster" ;;
+      *"already removed"*) ;;
+      *) echo "$out" >&2; exit 1 ;;
+    esac
   done
-  # Drained when the removed nodes hold no replica any more
-  wait_balanced
+  # Only once a node holds no replica may its pod go
+  for n in "${draining[@]}"; do
+    wait_for "node-$n to be drained" "node_line $n | grep -q 'removed, 0 replica'"
+  done
+  wait_for "the shards to be balanced" "status | grep -q '^Balanced'"
   for n in $(seq "$WANT" $((have - 1))); do stop "$n"; done
 elif [ "$WANT" -gt "$have" ]; then
   for n in $(seq "$have" $((WANT - 1))); do
     admin ".cluster add node-$n" > /dev/null || true # in case it was removed before
     start "$n"
   done
-  sleep 5 # let them announce themselves
-  wait_balanced
+  for n in $(seq "$have" $((WANT - 1))); do
+    wait_for "node-$n to join" "node_line $n | grep -q ' active, [1-9]'"
+  done
+  wait_for "the shards to be balanced" "status | grep -q '^Balanced'"
 fi
+status
 echo "storage nodes: $WANT"
