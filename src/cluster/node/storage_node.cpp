@@ -1,4 +1,5 @@
 #include "cluster/node/storage_node.h"
+#include <algorithm>
 #include "net/remote_connection.h"
 #include <chrono>
 #include <filesystem>
@@ -186,8 +187,30 @@ namespace sql::cluster
                 options.snapshot_distance = options_.snapshot_distance;
                 if (options.id < 0)
                     return Failure("this node has not joined yet");
+                // Not among the members: a new replica of an existing group,
+                // which waits for its leader to add it
+                options.joining = std::none_of(options.members.begin(), options.members.end(),
+                                               [&](const ReplicatedShard::Member &m) { return m.id == options.id; });
+                options.endpoint = options_.host + ":" + std::to_string(options.port);
                 replicas_[shard] = std::make_unique<ReplicatedShard>(options);
-                return Success("created");
+                return Success(options.joining ? "joining" : "created");
+            }
+            if (method == "drop_replica")
+            {
+                // No longer a member (the coordinator removed it): its data goes
+                std::unique_ptr<ReplicatedShard> gone;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    auto it = replicas_.find(shard);
+                    if (it != replicas_.end())
+                    {
+                        gone = std::move(it->second);
+                        replicas_.erase(it);
+                    }
+                }
+                gone.reset(); // stops its Raft server
+                std::filesystem::remove_all(options_.directory + "/shard-" + std::to_string(shard));
+                return Success("dropped");
             }
             ReplicatedShard *replica = Replica(shard);
             if (!replica)
@@ -205,6 +228,17 @@ namespace sql::cluster
             }
             if (method == "txn_status")
                 return replica->OpenTransaction();
+            if (method == "members") // on the leader
+                return replica->Members();
+            if (method == "add_member") // id@host:port, on the leader
+            {
+                const auto members = DecodeMembers(arguments[2]);
+                if (members.size() != 1)
+                    return Failure("bad call add_member");
+                return replica->AddMember(members[0].id, members[0].endpoint);
+            }
+            if (method == "remove_member") // id, on the leader
+                return replica->RemoveMember(std::stoi(arguments[2]));
             return Failure("unknown call " + method);
         }
         catch (const std::exception &e)

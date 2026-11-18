@@ -9,6 +9,7 @@ One image, `sqlengine:dev`, runs every process of a cluster: `sqlnode` in the ro
 | `compose.yaml` | The cluster as 6 containers with Docker Compose (no Kubernetes needed) |
 | `k8s/sqlengine.yaml` | Kubernetes: headless Services `coord` and `node`, StatefulSets with a 1 Gi volume per pod, Service `sql` (NodePort 30480) for clients, PodDisruptionBudgets, soft anti-affinity |
 | `up.sh` | Build, load the image into minikube (or kind), apply, wait until ready |
+| `scale.sh` | Change the number of storage nodes and wait until the replicas are rebalanced |
 | `chaos.sh` | Kill random pods (or containers) while `workload.sh` moves money between accounts; fails if the total changes |
 | `workload.sh` | The money-moving client, run inside the image |
 
@@ -47,4 +48,5 @@ docker build --secret id=ca,src=/path/to/proxy-ca.crt \
 - **Readiness:** a coordinator is ready when it answers SQL and knows the cluster's leader; a storage node is ready when it accepts calls. Service `sql` sends clients only to ready coordinators, and any of them forwards to the leader.
 - **Vanished peers:** a killed pod's IP sends no TCP reset. Connections therefore time out on connect (2 s) and use TCP keepalive (a dead peer is noticed in about 5 s); outgoing connections also fail a send unacknowledged for 10 s. The coordinator also skips a node that just failed for a few seconds. Without this, one dead pod stalled the whole cluster for minutes.
 - **Disruptions:** the PodDisruptionBudgets let a drain take one coordinator and one storage node at a time, so every Raft group keeps its quorum.
-- **Not yet:** adding storage nodes after formation (`replicas: 4`) gives the new node no shards until rebalancing (D8), and pods are not spread by zone.
+- **Scaling storage nodes:** `deploy/scale.sh N` (or `MODE=compose deploy/scale.sh 4`). Going up, new pods join and receive replicas until `.cluster` says `Balanced`. Going down, the highest-numbered nodes are first decommissioned (`.cluster remove`) so their replicas move, and only then deleted. Don't just `kubectl scale` down: a pod that simply disappears counts as down only after `--node-down-after` (5 min), and until then its shards run one replica short.
+- **Not yet:** pods are not spread by zone.

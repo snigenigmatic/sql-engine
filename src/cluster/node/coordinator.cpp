@@ -12,6 +12,7 @@
 #include <chrono>
 #include <random>
 #include <set>
+#include <sstream>
 
 namespace sql::cluster
 {
@@ -339,6 +340,8 @@ namespace sql::cluster
         }
         if (!MetaRead("SELECT COUNT(*) FROM txns;").success)
             MetaWrite("CREATE TABLE txns (id VARCHAR(300) PRIMARY KEY, state VARCHAR(20));");
+        if (!MetaRead("SELECT COUNT(*) FROM node_state;").success)
+            MetaWrite("CREATE TABLE node_state (id INTEGER PRIMARY KEY, state VARCHAR(20));");
         if (MetaRead("SELECT COUNT(*) FROM cluster;").tuples.at(0).GetValue(0).GetAsInt() == 0)
             MetaWrite("INSERT INTO cluster VALUES (" + std::to_string(options_.shard_count) + ", " +
                       std::to_string(options_.replication_factor) + ", 0, FALSE);");
@@ -346,6 +349,7 @@ namespace sql::cluster
         MetaWrite("UPDATE cluster SET epoch = epoch + 1;");
         connections_.clear();
         unreachable_until_.clear();
+        last_seen_.clear(); // every node gets a full grace period under a new leader
         shard_leaders_.clear();
         ensured_.clear();
         last_full_ensure_ = {};
@@ -358,6 +362,8 @@ namespace sql::cluster
             unsettled_.insert(s);
         last_recover_ = {};
         Load();
+        for (const auto &[id, node] : view_.nodes)
+            last_seen_[id] = Clock::now();
         was_leader_ = true;
     }
 
@@ -387,6 +393,8 @@ namespace sql::cluster
             view.ddl.emplace_back(t.GetValue(0).GetAsInt(), Text(t.GetValue(1)));
         for (const auto &t : MetaRead("SELECT shard, applied FROM shard_ddl;").tuples)
             view.shard_ddl[static_cast<uint32_t>(t.GetValue(0).GetAsInt())] = t.GetValue(1).GetAsInt();
+        for (const auto &t : MetaRead("SELECT id FROM node_state WHERE state = 'removed';").tuples)
+            view.removed.insert(t.GetValue(0).GetAsInt());
         view_ = std::move(view);
     }
 
@@ -406,6 +414,7 @@ namespace sql::cluster
             last_recover_ = Clock::now();
             Recover();
         }
+        Rebalance();
     }
 
     void Coordinator::Form()
@@ -520,7 +529,7 @@ namespace sql::cluster
             call.push_back(sql);
             if (method == "write")
                 call.push_back(request_id);
-            else if (txn_ && txn_->Open())
+            else if (method == "read" && txn_ && txn_->Open())
                 call.push_back(txn_->id); // a read sees its transaction's changes
         }
         int hint = -1;
@@ -702,7 +711,10 @@ namespace sql::cluster
         {
             if (node.name != name)
                 continue;
+            if (view_.removed.count(id))
+                return Failure("node " + name + " was removed from the cluster; join under a new name");
             unreachable_until_.erase(id); // it is back
+            last_seen_[id] = Clock::now();
             if (node.host != host || node.port != port || node.raft_base != raft_base)
             {
                 MetaWrite("UPDATE nodes SET host = " + Quote(host) + ", port = " + std::to_string(port) +
@@ -718,6 +730,7 @@ namespace sql::cluster
         MetaWrite("INSERT INTO nodes VALUES (" + std::to_string(id) + ", " + Quote(name) + ", " + Quote(host) + ", " +
                   std::to_string(port) + ", " + std::to_string(raft_base) + ");");
         Load();
+        last_seen_[id] = Clock::now();
         return Success(std::to_string(id));
     }
 
@@ -1256,6 +1269,229 @@ namespace sql::cluster
         for (uint32_t shard : t.shards)
             if (!ShardCall(shard, "txn", "", "abort", t.id).success)
                 unsettled_.insert(shard); // recovery rolls it back
+    }
+
+    std::vector<int> Coordinator::ActiveNodes() const
+    {
+        std::vector<int> active;
+        const auto limit = std::chrono::milliseconds(options_.node_down_after_ms);
+        for (const auto &[id, node] : view_.nodes)
+        {
+            auto seen = last_seen_.find(id);
+            if (!view_.removed.count(id) && seen != last_seen_.end() && Clock::now() - seen->second < limit)
+                active.push_back(id);
+        }
+        return active;
+    }
+
+    bool Coordinator::DropReplica(uint32_t shard, int node)
+    {
+        net::RemoteConnection *connection = NodeConnection(node);
+        bool dropped = false;
+        if (connection)
+        {
+            try
+            {
+                dropped =
+                    connection->Call("drop_replica", {std::to_string(view_.epoch), std::to_string(shard), "-"}).success;
+            }
+            catch (const std::exception &)
+            {
+                connections_.erase(node);
+            }
+        }
+        if (dropped)
+            pending_drops_.erase({shard, node});
+        else
+            pending_drops_.insert({shard, node});
+        return dropped;
+    }
+
+    void Coordinator::Rebalance()
+    {
+        if (!view_.formed)
+            return;
+        // Copies left on nodes that were unreachable when they were removed
+        for (const auto &[shard, node] : std::set<std::pair<uint32_t, int>>(pending_drops_))
+            if (view_.nodes.count(node))
+                DropReplica(shard, node);
+            else
+                pending_drops_.erase({shard, node});
+        const std::vector<int> active = ActiveNodes();
+        if (active.size() < view_.rf)
+            return; // the replicas have nowhere else to go
+        Placement placement(view_.shards, view_.rf);
+        for (int id : active)
+            placement.AddNode(static_cast<NodeId>(id), view_.nodes.at(id).name);
+        const auto wanted = placement.Assignment();
+        // The first shard (from a rotating start, so one stuck shard does not
+        // hold up the rest) whose replicas are not where they should be
+        for (uint32_t i = 0; i < view_.shards; ++i)
+        {
+            const uint32_t shard = (rebalance_cursor_ + i) % view_.shards;
+            const auto &want_list = wanted.at(shard);
+            const std::set<int> want(want_list.begin(), want_list.end());
+            const std::vector<int> have_list = view_.replicas[shard];
+            const std::set<int> have(have_list.begin(), have_list.end());
+            if (want == have)
+                continue;
+            rebalance_cursor_ = shard + 1;
+            auto endpoint = [&](int node)
+            {
+                const NodeInfo &info = view_.nodes.at(node);
+                return info.host + ":" + std::to_string(info.raft_base + static_cast<int>(shard));
+            };
+            // Add before removing: the group never has fewer replicas than wanted
+            for (int node : want)
+            {
+                if (have.count(node))
+                    continue;
+                // A stale copy from an earlier membership goes first
+                if (pending_drops_.count({shard, node}) && !DropReplica(shard, node))
+                    return;
+                // A new replica, joining the group as it is now
+                std::vector<ReplicatedShard::Member> members;
+                for (int member : have_list)
+                    members.push_back({member, endpoint(member)});
+                net::RemoteConnection *connection = NodeConnection(node);
+                if (!connection)
+                    return;
+                try
+                {
+                    if (!connection->Call("ensure_replica", {std::to_string(view_.epoch), std::to_string(shard),
+                                                             EncodeMembers(members)})
+                             .success)
+                        return;
+                }
+                catch (const std::exception &)
+                {
+                    connections_.erase(node);
+                    return;
+                }
+                const ExecutionResult added =
+                    ShardCall(shard, "add_member", std::to_string(node) + "@" + endpoint(node), "", "", 3000);
+                if (!added.success)
+                    return; // under way, or the group is unavailable: next round
+                const auto next = MetaRead("SELECT MAX(position) FROM replicas WHERE shard = " +
+                                           std::to_string(shard) + ";");
+                const int position = next.tuples.empty() || next.tuples[0].GetValue(0).IsNull()
+                                         ? 0
+                                         : next.tuples[0].GetValue(0).GetAsInt() + 1;
+                MetaWrite("INSERT INTO replicas VALUES (" + std::to_string(shard) + ", " + std::to_string(position) +
+                          ", " + std::to_string(node) + ");");
+                ensured_[{shard, node}] = true;
+                Load();
+                return;
+            }
+            for (int node : have_list)
+            {
+                if (want.count(node))
+                    continue;
+                const ExecutionResult removed = ShardCall(shard, "remove_member", std::to_string(node), "", "", 3000);
+                if (!removed.success)
+                    return;
+                MetaWrite("DELETE FROM replicas WHERE shard = " + std::to_string(shard) +
+                          " AND node = " + std::to_string(node) + ";");
+                ensured_.erase({shard, node});
+                if (shard_leaders_.count(shard) && shard_leaders_[shard] == node)
+                    shard_leaders_.erase(shard);
+                Load();
+                // Its copy is no longer a member: delete it (retried while
+                // the node does not answer)
+                DropReplica(shard, node);
+                return;
+            }
+        }
+    }
+
+    std::string Coordinator::ClusterStatus()
+    {
+        const std::vector<int> active = ActiveNodes();
+        std::map<int, int> held;
+        for (const auto &[shard, nodes] : view_.replicas)
+            for (int node : nodes)
+                ++held[node];
+        std::string out = "Nodes:\n";
+        for (const auto &[id, node] : view_.nodes)
+        {
+            std::string state = "active";
+            if (view_.removed.count(id))
+                state = "removed";
+            else if (std::find(active.begin(), active.end(), id) == active.end())
+                state = "down";
+            else if (Clock::now() - last_seen_[id] > std::chrono::seconds(3))
+                state = "silent for " +
+                        std::to_string(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - last_seen_[id]).count()) +
+                        " s";
+            out += "  " + node.name + " (id " + std::to_string(id) + ") " + node.host + ":" + std::to_string(node.port) +
+                   "  " + state + ", " + std::to_string(held[id]) + " replica(s)\n";
+        }
+        if (!view_.formed)
+            return out + "Forming: " + std::to_string(view_.nodes.size()) + " of " + std::to_string(view_.rf) +
+                   " storage nodes have joined\n";
+        out += "Shards:\n";
+        size_t moves = 0;
+        Placement placement(view_.shards, view_.rf);
+        for (int id : active)
+            placement.AddNode(static_cast<NodeId>(id), view_.nodes.at(id).name);
+        const auto wanted = placement.Assignment();
+        for (const auto &[shard, nodes] : view_.replicas)
+        {
+            out += "  " + std::to_string(shard) + ":";
+            for (int node : nodes)
+                out += " " + (view_.nodes.count(node) ? view_.nodes.at(node).name : std::to_string(node));
+            out += "\n";
+            if (active.size() >= view_.rf)
+            {
+                const std::set<int> want(wanted.at(shard).begin(), wanted.at(shard).end());
+                for (int node : want) // replicas to add...
+                    moves += std::count(nodes.begin(), nodes.end(), node) == 0;
+                for (int node : nodes) // ...and to remove
+                    moves += want.count(node) == 0;
+            }
+        }
+        if (active.size() < view_.rf)
+            out += "Only " + std::to_string(active.size()) + " active node(s) for " + std::to_string(view_.rf) +
+                   " replicas: replicas stay where they are\n";
+        else
+            out += moves == 0 ? "Balanced\n"
+                              : "Rebalancing: " + std::to_string(moves) + " replica change(s) to go\n";
+        return out;
+    }
+
+    std::string Coordinator::RemoveNode(const std::string &name)
+    {
+        for (const auto &[id, node] : view_.nodes)
+        {
+            if (node.name != name)
+                continue;
+            if (view_.removed.count(id))
+                return "Error: " + name + " is already removed\n";
+            std::vector<int> active = ActiveNodes();
+            active.erase(std::remove(active.begin(), active.end(), id), active.end());
+            if (active.size() < view_.rf)
+                return "Error: without " + name + " only " + std::to_string(active.size()) +
+                       " active node(s) would remain for " + std::to_string(view_.rf) + " replicas of each shard\n";
+            MetaWrite("INSERT INTO node_state VALUES (" + std::to_string(id) + ", 'removed');");
+            Load();
+            return "Removing " + name + ": its replicas move to the other nodes (see .cluster)\n";
+        }
+        return "Error: no storage node named " + name + "\n";
+    }
+
+    std::map<uint32_t, std::vector<int>> Coordinator::Replicas()
+    {
+        std::lock_guard<std::mutex> lock(op_mutex_);
+        return view_.replicas;
+    }
+
+    int Coordinator::NodeIdOf(const std::string &name)
+    {
+        std::lock_guard<std::mutex> lock(op_mutex_);
+        for (const auto &[id, node] : view_.nodes)
+            if (node.name == name)
+                return id;
+        return -1;
     }
 
     void Coordinator::ExpireIdleTransactions()
@@ -1978,6 +2214,32 @@ namespace sql::cluster
                        std::to_string(view_.nodes.size()) + " storage node(s), " + std::to_string(view_.shards) +
                        " shards x " + std::to_string(view_.rf) + " replicas, epoch " + std::to_string(view_.epoch) +
                        (view_.formed ? "" : " (forming)") + "\n";
+            if (name == "cluster")
+            {
+                std::istringstream words(argument);
+                std::string verb, node;
+                words >> verb >> node;
+                if (verb.empty() || verb == "status")
+                    return ClusterStatus();
+                if (verb == "remove" && !node.empty())
+                    return RemoveNode(node);
+                if (verb == "add" && !node.empty())
+                {
+                    // Undo a removal: the name may join again (e.g. a
+                    // StatefulSet scaled down and back up reuses node names)
+                    for (const auto &[id, info] : view_.nodes)
+                        if (info.name == node)
+                        {
+                            if (!view_.removed.count(id))
+                                return node + " is already a member\n";
+                            MetaWrite("DELETE FROM node_state WHERE id = " + std::to_string(id) + ";");
+                            Load();
+                            return node + " may join again; it gets replicas once it announces itself\n";
+                        }
+                    return "Error: no storage node named " + node + " (a new node joins by itself)\n";
+                }
+                return "Usage: .cluster [status | remove NODE | add NODE]\n";
+            }
             if (name == "tables")
             {
                 if (Tables().empty())

@@ -26,6 +26,13 @@ namespace sql::cluster
     //                   a distributed transaction (exec, undo, prepare,
     //                   commit, abort; see ShardStateMachine::EncodeTxn)
     //   txn_status      epoch, shard, -: the transaction open on the shard
+    //   members         epoch, shard, -: the group's members (on its leader)
+    //   add_member      epoch, shard, "id@host:port"   membership changes,
+    //   remove_member   epoch, shard, id               on the group's leader
+    //   drop_replica    epoch, shard, -: stop this node's replica and delete it
+    //
+    // ensure_replica with members that do not include this node creates a
+    // joining replica, which waits for the group's leader to add it.
     //
     // A request carrying an older epoch than one already seen is refused:
     // after a coordinator failover the deposed leader cannot change data.

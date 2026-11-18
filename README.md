@@ -260,7 +260,7 @@ The path to a fully working embedded database (page storage, WAL, transactions, 
   - [x] D5: Distributed queries (shard pruning, single-shard statements, partial aggregates, filter and top-N pushdown, distributed `EXPLAIN`)
   - [x] D6: Two-phase commit across shards (interactive transactions that read their own writes, shard locks, recovery by presumed abort)
   - [x] D7: Kubernetes (minikube) and Docker Compose deployments, with chaos testing in CI ([deploy/](deploy/README.md))
-  - [ ] D8: Rebalancing
+  - [x] D8: Rebalancing: replicas move to new nodes, away from removed (`.cluster remove`) or down ones, with the data available throughout
 ## Architecture
 
 See [docs/design.md](docs/design.md) for detailed architecture documentation.
